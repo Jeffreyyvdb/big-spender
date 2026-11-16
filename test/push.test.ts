@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -204,5 +204,24 @@ await import(${JSON.stringify(collector)});
 			server.closeAllConnections();
 			await new Promise((resolve) => server.close(resolve));
 		}
+	});
+});
+
+test('an empty answer falls back to the env file the collector reads, wherever it points', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await withIngestServer(box, async (url, dataDir) => {
+			const custom = join(box.home, 'custom.env');
+			await writeFile(custom, `BIG_SPENDER_INGEST_URL=${url}\nBIG_SPENDER_INGEST_TOKEN=tok\n`, {
+				mode: 0o600
+			});
+			for (const name of ['BIG_SPENDER_ENV_FILE', 'USAGE_ENV_FILE']) {
+				await rm(dataDir, { recursive: true, force: true });
+				const { ctx, err } = harness(box, { answers: ['y', '', ''], env: { [name]: custom } });
+				assert.equal(await main(['push', 'laptop'], ctx), 0, `${name}: ${err.join('\n')}`);
+				const stored = JSON.parse(await readFile(join(dataDir, 'laptop.json'), 'utf8'));
+				assert.equal(stored.deviceId, 'laptop');
+			}
+		});
 	});
 });
