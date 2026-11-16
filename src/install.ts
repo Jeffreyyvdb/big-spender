@@ -105,17 +105,23 @@ async function existingSettings(ctx: Context): Promise<Existing> {
 	};
 }
 
-export const INSTALL_USAGE = `Usage: big-spender install --device <id> [--url <ingest url>]
+export const INSTALL_USAGE = `Usage: big-spender install --device <id> [--url <ingest url>] [--rename]
 
 Copies the collector to ~/.local/share/big-spender, schedules it hourly (systemd user timer on
 Linux, launchd agent on macOS) and runs it once. The ingest token comes from the existing env
 file, BIG_SPENDER_INGEST_TOKEN, or a hidden prompt. It is never taken from a flag.
-Re-running is safe. A usage-collector install from before the rename is migrated in place.`;
+Re-running is safe. A usage-collector install from before the rename is migrated in place.
+A machine that already has a device id keeps it: --device with a different id needs --rename,
+because the server would count the same history twice, under the old id and the new one.`;
 
 export async function install(args: string[], ctx: Context): Promise<number> {
 	const { values } = parseArgs({
 		args,
-		options: { device: { type: 'string' }, url: { type: 'string' } },
+		options: {
+			device: { type: 'string' },
+			url: { type: 'string' },
+			rename: { type: 'boolean' }
+		},
 		strict: true
 	});
 	const { paths } = ctx;
@@ -124,6 +130,12 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	const deviceId = values.device ?? ctx.env.BIG_SPENDER_DEVICE_ID ?? existing.deviceId;
 	if (!DEVICE_ID.test(deviceId)) {
 		throw new UsageError('--device must be a lowercase slug such as laptop or desktop');
+	}
+
+	if (existing.deviceId && deviceId !== existing.deviceId && !values.rename) {
+		throw new UsageError(
+			`this machine already reports as "${existing.deviceId}", not "${deviceId}". Under a new id the server would count the same usage twice, because ${existing.deviceId}.json stays on the server next to the new one. Keep "${existing.deviceId}", or pass --rename if you mean to change it and will remove the old device's data on the server`
+		);
 	}
 
 	const migrating = !(await exists(paths.cacheDir)) && (await exists(paths.legacy.cacheDir));

@@ -69,6 +69,10 @@ in your shell history or process list. Then it:
 The device id is a lowercase slug (`laptop`, `desktop`, `build-box`). Run the command again any
 time to update the installed copy or change the URL; it converges to the same state.
 
+The id is fixed once a machine has one. `install --device <other>` stops with an error, because the
+server keeps the old id's `<id>.json` and would count the same 90 days again under the new id. If
+you do mean to rename the device, pass `--rename` and delete the old device's file on the server.
+
 | System | Schedule                                                                                                                                                                                                                                        |
 | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Linux  | systemd user units `big-spender.service` and `big-spender.timer` (`OnCalendar=hourly`, `Persistent=true`). Log: `journalctl --user -u big-spender`. On a headless box, `loginctl enable-linger $USER` keeps the timer running while logged out. |

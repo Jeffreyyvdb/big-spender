@@ -243,3 +243,29 @@ test('env helpers: rename keeps values and other lines, upsert edits in place', 
 	);
 	assert.equal(upsertEnv('# c\nA=1\nB=2', { A: 'x', C: '3' }), '# c\nA=x\nB=2\nC=3\n');
 });
+
+test('--device with a different id than the migrated one is refused unless --rename is passed', async () => {
+	await withSandbox(async (box) => {
+		await writeLegacy(box);
+		const before = await tree(box.home);
+
+		const refused = harness(box);
+		assert.equal(await main(['install', '--device', 'desktop'], refused.ctx), 2);
+		const message = refused.err.join('\n');
+		assert.match(message, /"laptop"/);
+		assert.match(message, /"desktop"/);
+		assert.match(message, /twice/);
+		assert.deepEqual(await tree(box.home), before);
+
+		const renamed = harness(box);
+		assert.equal(
+			await main(['install', '--device', 'desktop', '--rename'], renamed.ctx),
+			0,
+			renamed.err.join('\n')
+		);
+		const env = parseEnv(
+			await readFile(join(box.env.XDG_CONFIG_HOME, 'big-spender', 'env'), 'utf8')
+		);
+		assert.equal(env.BIG_SPENDER_DEVICE_ID, 'desktop');
+	});
+});
