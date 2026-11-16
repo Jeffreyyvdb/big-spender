@@ -1,0 +1,40 @@
+{
+	"name": "big-spender",
+	"version": "0.1.0",
+	"description": "Track what your AI coding agents would cost at API prices, across all your machines.",
+	"private": true,
+	"type": "module",
+	"license": "MIT",
+	"bin": {
+		"big-spender": "dist/cli.js"
+	},
+	"exports": {
+		"./server": {
+			"types": "./dist/server/index.d.ts",
+			"default": "./dist/server/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"templates",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"node": ">=20"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"check": "tsc",
+		"test": "node --test",
+		"format": "prettier --write ."
+	},
+	"dependencies": {
+		"zod": "^4.6.7"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.5",
+		"prettier": "^3.10.1",
+		"typescript": "^7.0.2"
+	}
+}
