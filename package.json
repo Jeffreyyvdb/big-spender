@@ -2,7 +2,26 @@
 	"name": "big-spender",
 	"version": "0.1.0",
 	"description": "Track what your AI coding agents would cost at API prices, across all your machines.",
-	"private": true,
+	"keywords": [
+		"ai",
+		"usage",
+		"cost",
+		"tokens",
+		"claude-code",
+		"codex",
+		"ccusage",
+		"self-hosted",
+		"dashboard"
+	],
+	"author": "jeffreyyvdb",
+	"homepage": "https://github.com/Jeffreyyvdb/big-spender#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Jeffreyyvdb/big-spender.git"
+	},
+	"bugs": {
+		"url": "https://github.com/Jeffreyyvdb/big-spender/issues"
+	},
 	"type": "module",
 	"license": "MIT",
 	"bin": {
@@ -27,7 +46,8 @@
 		"build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
 		"check": "tsc",
 		"test": "node --test test/*.test.ts",
-		"format": "prettier --write ."
+		"format": "prettier --write .",
+		"prepublishOnly": "npm run build && npm test"
 	},
 	"dependencies": {
 		"zod": "^4.6.7"
