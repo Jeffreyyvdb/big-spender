@@ -20,6 +20,10 @@ import { pickScheduler } from './scheduler.ts';
 // The collector removes its lock when it finishes, so one this young belongs to a live run.
 const LOCK_FRESH_MS = 30 * 60 * 1000;
 
+// Written into the old cache before its schedule is removed, so a rerun after a crash still knows
+// the old collector was scheduled. Not the old share dir: old uninstalls left that behind.
+const WAS_SCHEDULED = '.big-spender-was-scheduled';
+
 const exists = (path: string) =>
 	access(path).then(
 		() => true,
@@ -139,6 +143,7 @@ async function migrateCache(ctx: Context, plan: CachePlan, log: string[]) {
 		log.push(`moved ${paths.legacy.cacheDir} to ${paths.cacheDir}`);
 		// The old units are stopped by now, so a lock that came along belongs to a dead run.
 		await rm(paths.lock, { force: true });
+		await rm(join(paths.cacheDir, WAS_SCHEDULED), { force: true });
 	}
 }
 
@@ -193,7 +198,9 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	const scheduler = pickScheduler(ctx.env, ctx.platform, paths, ctx.templatesDir, ctx.ctl);
 	await scheduler.check();
 
-	const legacyScheduled = (await scheduler.findLegacy()).length > 0;
+	const legacySchedule = await scheduler.findLegacy();
+	const wasScheduled = join(paths.legacy.cacheDir, WAS_SCHEDULED);
+	const legacyScheduled = legacySchedule.length > 0 || (await exists(wasScheduled));
 	const cachePlan = planCache(await cacheFacts(ctx, legacyScheduled));
 	if ((cachePlan === 'move' || cachePlan === 'replace') && (await lockIsFresh(paths.legacy.lock))) {
 		throw new UsageError(
@@ -214,6 +221,9 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 
 	const log: string[] = [];
 
+	if (legacySchedule.length > 0 && (cachePlan === 'move' || cachePlan === 'replace')) {
+		await writeFile(wasScheduled, '');
+	}
 	for (const removed of await scheduler.removeLegacy()) log.push(`removed old schedule ${removed}`);
 	await migrateConfig(ctx, log);
 	await migrateCache(ctx, cachePlan, log);
