@@ -2,7 +2,6 @@ import { execFile } from 'node:child_process';
 import { readdir, readFile, rm, copyFile, mkdir, writeFile, access } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
-import { UsageError } from './context.ts';
 import type { Paths } from './paths.ts';
 
 const execFileAsync = promisify(execFile);
@@ -61,7 +60,7 @@ async function requireManager(ctl: Ctl) {
 	try {
 		await ctl('systemctl', ['--user', 'show-environment']);
 	} catch {
-		throw new UsageError(
+		throw new Error(
 			'cannot reach the systemd user manager (systemctl --user failed). Run this from a login session, or enable lingering with `loginctl enable-linger $USER`, then run install again. Nothing was changed.'
 		);
 	}
