@@ -225,3 +225,23 @@ test('an empty answer falls back to the env file the collector reads, wherever i
 		});
 	});
 });
+
+test('a token that cannot go in an HTTP header fails at once and is never printed', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await withIngestServer(box, async (url, dataDir) => {
+			const { ctx, out, err } = harness(box, { answers: ['y', url, 'sekrit-1\rsekrit-2'] });
+			assert.equal(await main(['push', 'laptop'], ctx), 1);
+			const printed = [...out, ...err].join('\n');
+			assert.doesNotMatch(printed, /sekrit/);
+			assert.doesNotMatch(printed, /retrying/);
+			assert.match(printed, /not allowed in an HTTP header/);
+			assert.equal(
+				await readdir(dataDir)
+					.catch(() => [])
+					.then((l) => l.length),
+				0
+			);
+		});
+	});
+});
