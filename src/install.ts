@@ -200,6 +200,11 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 			`the old collector is running (${paths.legacy.lock} is recent); wait for it to finish and run install again`
 		);
 	}
+	if (cachePlan === 'replace' && (await lockIsFresh(paths.lock))) {
+		throw new UsageError(
+			`big-spender is running (${paths.lock} is recent), and install would move its cache aside; wait for it to finish and run install again`
+		);
+	}
 
 	let url = values.url ?? ctx.env.BIG_SPENDER_INGEST_URL ?? existing.url;
 	let token = ctx.env.BIG_SPENDER_INGEST_TOKEN || existing.token;
