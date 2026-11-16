@@ -395,3 +395,56 @@ test('a status or push holding the new cache lock stops its replacement and chan
 		assert.deepEqual(await tree(box.home), before);
 	});
 });
+
+test('the schedule reads the env file and cache install used under custom XDG dirs, and the default unit is unchanged', async () => {
+	await withSandbox(async (box) => {
+		const config = join(box.home, 'xdg', 'config');
+		const cache = join(box.home, 'xdg', 'cache');
+		const env = { XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache };
+
+		const linux = harness(box, { answers: [URL_, 'tok'], env });
+		assert.equal(await main(['install', '--device', 'desk'], linux.ctx), 0, linux.err.join('\n'));
+		const unit = await readFile(join(config, 'systemd', 'user', 'big-spender.service'), 'utf8');
+		assert.ok(unit.includes(`\nEnvironmentFile=${join(config, 'big-spender', 'env')}\n`), unit);
+		assert.ok(unit.includes(`\nEnvironment="XDG_CONFIG_HOME=${config}"\n`), unit);
+		assert.ok(unit.includes(`\nEnvironment="XDG_CACHE_HOME=${cache}"\n`), unit);
+
+		const mac = harness(box, { env, platform: 'darwin' });
+		assert.equal(await main(['install', '--device', 'desk'], mac.ctx), 0, mac.err.join('\n'));
+		const plist = await readFile(
+			join(box.home, 'Library', 'LaunchAgents', 'local.big-spender.plist'),
+			'utf8'
+		);
+		const vars = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(plist)?.[1];
+		assert.equal(
+			vars?.replace(/\s+/g, ''),
+			`<key>XDG_CONFIG_HOME</key><string>${config}</string><key>XDG_CACHE_HOME</key><string>${cache}</string>`,
+			plist
+		);
+	});
+
+	await withSandbox(async (box) => {
+		const { ctx, err } = harness(box, {
+			answers: [URL_, 'tok'],
+			env: { XDG_CONFIG_HOME: '', XDG_CACHE_HOME: '' }
+		});
+		assert.equal(await main(['install', '--device', 'desk'], ctx), 0, err.join('\n'));
+		assert.equal(
+			await readFile(join(box.home, '.config', 'systemd', 'user', 'big-spender.service'), 'utf8'),
+			`# ~/.config/systemd/user/big-spender.service (\`big-spender install\` replaces ${process.execPath})
+[Unit]
+Description=Push AI coding usage stats to your big-spender server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Also read by the collector itself; listed here so \`systemctl --user show\` reflects it.
+EnvironmentFile=${box.home}/.config/big-spender/env
+ExecStart=${process.execPath} %h/.local/share/big-spender/collector.mjs
+Nice=10
+IOSchedulingClass=idle
+`
+		);
+	});
+});
