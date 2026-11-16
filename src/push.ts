@@ -122,10 +122,11 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		(setting(ctx.env, 'INGEST_URL') ||
 			(await prompter.ask('Ingest URL (https://…/api/usage/ingest): ')) ||
 			setting(saved, 'INGEST_URL'));
-	const token =
+	const token = (
 		setting(ctx.env, 'INGEST_TOKEN') ||
 		(await prompter.askHidden('Ingest token: ')) ||
-		setting(saved, 'INGEST_TOKEN');
+		setting(saved, 'INGEST_TOKEN')
+	).trim();
 	if (!url || !token) throw new Error('an ingest URL and token are required');
 	// fetch quotes the whole header in its error for some of these, which would print the token.
 	if (!/^[\x21-\x7e]+$/.test(token)) {
