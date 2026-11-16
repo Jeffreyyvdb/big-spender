@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, readFile, stat, utimes, writeFile } from 'node:fs/promises';
+import { access, mkdir, readdir, readFile, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { main } from '../src/cli.ts';
 import { parseEnv, renameLegacyKeys, upsertEnv } from '../src/envfile.ts';
@@ -176,18 +176,60 @@ test('install refuses to migrate while the old collector holds a recent lock', a
 	});
 });
 
-test('an existing big-spender cache is never overwritten by the old one', async () => {
+test('once big-spender is installed, its cache is never overwritten by the old one', async () => {
 	await withSandbox(async (box) => {
 		const legacy = await writeLegacy(box);
 		const fresh = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		const installed = join(box.home, '.local', 'share', 'big-spender');
 		await mkdir(fresh, { recursive: true });
+		await mkdir(installed, { recursive: true });
 		await writeFile(join(fresh, 'state.json'), 'new state');
+		await writeFile(join(installed, 'collector.mjs'), '// installed\n');
 
 		const { ctx, out } = harness(box);
 		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0);
 		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), 'new state');
 		assert.equal(await readFile(join(legacy.cache, 'state.json'), 'utf8'), STATE);
 		assert.ok(out.some((l) => l.includes('left') && l.includes('in place')));
+	});
+});
+
+test('a cache that status or push --dry-run made before the first install is set aside, not kept over the old state', async () => {
+	await withSandbox(async (box) => {
+		const legacy = await writeLegacy(box);
+		const cacheRoot = box.env.XDG_CACHE_HOME;
+		const fresh = join(cacheRoot, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'built from the last 30 days of logs');
+
+		const { ctx, out, err } = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0, err.join('\n'));
+
+		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), STATE);
+		assert.equal(await exists(legacy.cache), false);
+		const aside = (await readdir(cacheRoot)).filter((n) => n.startsWith('big-spender.pre-install-'));
+		assert.equal(aside.length, 1);
+		assert.equal(
+			await readFile(join(cacheRoot, aside[0], 'state.json'), 'utf8'),
+			'built from the last 30 days of logs'
+		);
+		assert.ok(out.some((l) => l.includes(aside[0])));
+	});
+});
+
+test('a fresh old-collector lock also stops the replacement of a cache made before install', async () => {
+	await withSandbox(async (box) => {
+		const legacy = await writeLegacy(box);
+		const fresh = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'made by status');
+		await writeFile(join(legacy.cache, 'run.lock'), '1234');
+		const before = await tree(box.home);
+
+		const busy = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], busy.ctx), 2);
+		assert.match(busy.err.join('\n'), /old collector is running/);
+		assert.deepEqual(await tree(box.home), before);
 	});
 });
 
