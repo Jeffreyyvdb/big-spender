@@ -66,7 +66,10 @@ async function requireManager(ctl: Ctl) {
 	}
 }
 
-function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
+/** XDG dirs set at install time, which the scheduled collector must see to use the same files. */
+type Xdg = [name: string, value: string][];
+
+function systemd(paths: Paths, templatesDir: string, ctl: Ctl, xdg: Xdg): Scheduler {
 	const user = ['--user'];
 	const legacyFiles = ['usage-collector.service', 'usage-collector.timer'].map((f) =>
 		join(paths.systemdDir, f)
@@ -95,7 +98,12 @@ function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 			await mkdir(paths.systemdDir, { recursive: true });
 			await writeFile(
 				join(paths.systemdDir, 'big-spender.service'),
-				await render(templatesDir, 'big-spender.service', { __NODE__: node, __HOME__: paths.home })
+				await render(templatesDir, 'big-spender.service', {
+					__NODE__: node,
+					__HOME__: paths.home,
+					__ENV_FILE__: paths.envFile,
+					'__ENVIRONMENT__\n': xdg.map(([k, v]) => `Environment="${k}=${v}"\n`).join('')
+				})
 			);
 			await copyFile(
 				join(templatesDir, 'big-spender.timer'),
@@ -118,7 +126,7 @@ function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	};
 }
 
-function launchd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
+function launchd(paths: Paths, templatesDir: string, ctl: Ctl, xdg: Xdg): Scheduler {
 	const label = 'local.big-spender';
 	const plist = join(paths.launchAgentsDir, `${label}.plist`);
 	const domain = `gui/${process.getuid?.() ?? 0}`;
@@ -155,7 +163,12 @@ function launchd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 				plist,
 				await render(templatesDir, 'local.big-spender.plist', {
 					__NODE__: node,
-					__HOME__: paths.home
+					__HOME__: paths.home,
+					'__ENVIRONMENT__\n': xdg.length
+						? `\t<key>EnvironmentVariables</key>\n\t<dict>\n${xdg
+								.map(([k, v]) => `\t\t<key>${k}</key>\n\t\t<string>${v}</string>\n`)
+								.join('')}\t</dict>\n`
+						: ''
 				})
 			);
 			await bootout(label);
@@ -178,9 +191,12 @@ export function pickScheduler(
 	templatesDir: string,
 	ctl: Ctl = makeCtl(env)
 ): Scheduler {
+	const xdg: Xdg = ['XDG_CONFIG_HOME', 'XDG_CACHE_HOME'].flatMap((k) =>
+		env[k] ? [[k, env[k]]] : []
+	);
 	const table: Partial<Record<NodeJS.Platform, () => Scheduler>> = {
-		linux: () => systemd(paths, templatesDir, ctl),
-		darwin: () => launchd(paths, templatesDir, ctl)
+		linux: () => systemd(paths, templatesDir, ctl, xdg),
+		darwin: () => launchd(paths, templatesDir, ctl, xdg)
 	};
 	const make = table[platform] ?? (env.BIG_SPENDER_SCHEDULER === 'none' ? table.linux : undefined);
 	if (!make)
