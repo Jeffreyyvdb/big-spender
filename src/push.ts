@@ -1,10 +1,10 @@
-import { execFile, spawn } from 'node:child_process';
-import { writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { UsageError, type Context } from './context.ts';
-import { setting } from './envfile.ts';
+import { parseEnv, setting } from './envfile.ts';
 import { DEVICE_ID, type UsageSnapshot } from './schema.ts';
 
 export const PUSH_USAGE = `Usage: big-spender push <device> [--dry-run] [--url <ingest url>]
@@ -20,6 +20,7 @@ $TMPDIR/big-spender-snapshot-<device>.json and never asks for the token. Both mo
 collector's local state in ~/.cache/big-spender (which logs were read), never anything remote.`;
 
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
+const POST_ATTEMPTS = 4;
 
 function runCollector(ctx: Context, extraEnv: Record<string, string>, args: string[]) {
 	return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
@@ -35,7 +36,7 @@ function runCollector(ctx: Context, extraEnv: Record<string, string>, args: stri
 	});
 }
 
-function overview(snapshot: UsageSnapshot): string[] {
+function overview(snapshot: UsageSnapshot, gzipped: number): string[] {
 	const byModel = new Map<string, { tokens: number; cost: number }>();
 	for (const r of snapshot.hourly) {
 		const key = `${r.provider}  ${r.model}`;
@@ -52,7 +53,6 @@ function overview(snapshot: UsageSnapshot): string[] {
 	const rows = [...byModel].sort((a, b) => b[1].cost - a[1].cost);
 	const width = Math.max(20, ...rows.map(([k]) => k.length));
 	const days = snapshot.hourly.map((r) => r.hour.slice(0, 10)).sort();
-	const gzipped = gzipSync(JSON.stringify(snapshot)).length;
 	const line = (label: string, tokens: number, cost: number) =>
 		`  ${label.padEnd(width)}  ${`${(tokens / 1e6).toFixed(1)}M`.padStart(10)}  ${`$${cost.toFixed(2)}`.padStart(10)}`;
 
@@ -93,7 +93,8 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 	for (const line of built.stderr.split('\n')) if (/warning/i.test(line)) ctx.err(line);
 
 	const snapshot = JSON.parse(built.stdout) as UsageSnapshot;
-	for (const line of overview(snapshot)) ctx.out(line);
+	const body = gzipSync(built.stdout);
+	for (const line of overview(snapshot, body.length)) ctx.out(line);
 
 	const blocked = snapshot.hourly.some((r) => /arn:|\//i.test(r.model));
 	if (blocked) {
@@ -115,21 +116,56 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		return 0;
 	}
 
+	const saved = parseEnv(await readFile(ctx.paths.envFile, 'utf8').catch(() => ''));
 	const url =
 		values.url ??
 		(setting(ctx.env, 'INGEST_URL') ||
-			(await prompter.ask('Ingest URL (https://…/api/usage/ingest): ')));
-	const token = setting(ctx.env, 'INGEST_TOKEN') || (await prompter.askHidden('Ingest token: '));
-	// Pass only what was given, so an empty answer still lets the collector read its env file.
-	const given: Record<string, string> = { BIG_SPENDER_DEVICE_ID: deviceId };
-	if (url) given.BIG_SPENDER_INGEST_URL = url;
-	if (token) given.BIG_SPENDER_INGEST_TOKEN = token;
+			(await prompter.ask('Ingest URL (https://…/api/usage/ingest): ')) ||
+			setting(saved, 'INGEST_URL'));
+	const token =
+		setting(ctx.env, 'INGEST_TOKEN') ||
+		(await prompter.askHidden('Ingest token: ')) ||
+		setting(saved, 'INGEST_TOKEN');
+	if (!url || !token) throw new Error('an ingest URL and token are required');
 
-	return new Promise<number>((resolve) => {
-		const child = spawn(process.execPath, [ctx.collector], {
-			env: { ...ctx.env, ...given },
-			stdio: ['ignore', 'inherit', 'inherit']
-		});
-		child.on('close', (code) => resolve(code ?? 1));
-	});
+	const result = await send(ctx, url, token, body);
+	ctx.out(`posted ${snapshot.hourly.length} rows (${body.length} bytes gzipped): ${result}`);
+	return 0;
+}
+
+/** POSTs the reviewed bytes with the collector's retry policy and returns the server's reply. */
+async function send(
+	ctx: Context,
+	url: string,
+	token: string,
+	body: Uint8Array<ArrayBuffer>
+): Promise<string> {
+	let lastErr = new Error('not sent');
+	for (let attempt = 1; attempt <= POST_ATTEMPTS; attempt++) {
+		try {
+			const res = await fetch(url, {
+				method: 'POST',
+				headers: {
+					authorization: `Bearer ${token}`,
+					'content-type': 'application/json',
+					'content-encoding': 'gzip'
+				},
+				body,
+				signal: AbortSignal.timeout(30_000)
+			});
+			const text = (await res.text()).slice(0, 300);
+			if (res.ok) return text;
+			lastErr = new Error(`HTTP ${res.status}: ${text}`);
+			// Client errors other than rate limiting won't fix themselves.
+			if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
+		} catch (err) {
+			lastErr = err instanceof Error ? err : new Error(String(err));
+		}
+		if (attempt < POST_ATTEMPTS) {
+			const wait = 2 ** attempt * 1000;
+			ctx.err(`POST failed (${lastErr.message}); retrying in ${wait / 1000}s`);
+			await new Promise((r) => setTimeout(r, wait));
+		}
+	}
+	throw lastErr;
 }
