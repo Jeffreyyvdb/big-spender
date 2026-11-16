@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, readdir, readFile, stat, utimes, writeFile } from 'node:fs/promises';
+import { access, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { main } from '../src/cli.ts';
 import { parseEnv, renameLegacyKeys, upsertEnv } from '../src/envfile.ts';
@@ -331,5 +331,51 @@ test('--device with a different id than the migrated one is refused unless --ren
 			await readFile(join(box.env.XDG_CONFIG_HOME, 'big-spender', 'env'), 'utf8')
 		);
 		assert.equal(env.BIG_SPENDER_DEVICE_ID, 'desktop');
+	});
+});
+
+test('an old cache with no schedule left only replaces the current one when its state is newer', async () => {
+	const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+	const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+	const setUp = async (
+		box: Sandbox,
+		{ scheduled, legacyAt }: { scheduled: boolean; legacyAt: Date }
+	) => {
+		const legacy = await writeLegacy(box);
+		if (!scheduled) {
+			for (const unit of ['usage-collector.service', 'usage-collector.timer']) {
+				await rm(join(legacy.units, unit));
+			}
+		}
+		await utimes(join(legacy.cache, 'state.json'), legacyAt, legacyAt);
+		const fresh = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'kept by big-spender push');
+		await utimes(join(fresh, 'state.json'), hourAgo, hourAgo);
+		return { legacy, state: join(fresh, 'state.json') };
+	};
+
+	await withSandbox(async (box) => {
+		const { legacy, state } = await setUp(box, { scheduled: false, legacyAt: dayAgo });
+		const { ctx, out, err } = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0, err.join('\n'));
+		assert.equal(await readFile(state, 'utf8'), 'kept by big-spender push');
+		assert.equal(await readFile(join(legacy.cache, 'state.json'), 'utf8'), STATE);
+		assert.ok(
+			out.some((l) => l.includes(legacy.cache) && l.includes('older')),
+			out.join('\n')
+		);
+	});
+
+	await withSandbox(async (box) => {
+		const { state } = await setUp(box, { scheduled: true, legacyAt: dayAgo });
+		assert.equal(await main(['install', '--device', 'laptop'], harness(box).ctx), 0);
+		assert.equal(await readFile(state, 'utf8'), STATE);
+	});
+
+	await withSandbox(async (box) => {
+		const { state } = await setUp(box, { scheduled: false, legacyAt: new Date() });
+		assert.equal(await main(['install', '--device', 'laptop'], harness(box).ctx), 0);
+		assert.equal(await readFile(state, 'utf8'), STATE);
 	});
 });
