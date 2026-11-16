@@ -113,6 +113,11 @@ test('a token that cannot go in an HTTP header fails at once and is never printe
 				assert.match(printed, /not allowed in an HTTP header/);
 			}
 			assert.equal(existsSync(join(dataDir, 'laptop.json')), false);
+
+			// fetch used to trim surrounding whitespace, so a token exported with a newline worked.
+			const padded = await run(COLLECTOR, [], { ...base, BIG_SPENDER_INGEST_TOKEN: ' tok\n' });
+			assert.equal(padded.code, 0, padded.stderr);
+			assert.equal(existsSync(join(dataDir, 'laptop.json')), true);
 		} finally {
 			server.closeAllConnections();
 			await new Promise((resolve) => server.close(resolve));
