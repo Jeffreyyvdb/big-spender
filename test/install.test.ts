@@ -379,3 +379,19 @@ test('an old cache with no schedule left only replaces the current one when its 
 		assert.equal(await readFile(state, 'utf8'), STATE);
 	});
 });
+
+test('a status or push holding the new cache lock stops its replacement and changes nothing', async () => {
+	await withSandbox(async (box) => {
+		await writeLegacy(box);
+		const fresh = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'being written by status');
+		await writeFile(join(fresh, 'run.lock'), '5678');
+		const before = await tree(box.home);
+
+		const busy = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], busy.ctx), 2);
+		assert.ok(busy.err.join('\n').includes(join(fresh, 'run.lock')), busy.err.join('\n'));
+		assert.deepEqual(await tree(box.home), before);
+	});
+});
