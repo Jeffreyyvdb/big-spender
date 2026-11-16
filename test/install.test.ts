@@ -62,12 +62,12 @@ OTHER_SETTING=keep me
 		);
 		assert.equal((await stat(env)).mode & 0o777, 0o600);
 
-		const state = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
-		assert.equal(await readFile(state, 'utf8'), STATE);
-		assert.equal(
-			await exists(join(box.env.XDG_CACHE_HOME, 'big-spender', 'litellm-prices.json')),
-			true
-		);
+		const cache = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		assert.deepEqual(Object.keys(await tree(cache)).sort(), [
+			'/litellm-prices.json',
+			'/state.json'
+		]);
+		assert.equal(await readFile(join(cache, 'state.json'), 'utf8'), STATE);
 
 		const share = join(box.home, '.local', 'share', 'big-spender', 'collector.mjs');
 		assert.equal(await readFile(share, 'utf8'), await readFile(ctx.collector, 'utf8'));
@@ -377,6 +377,40 @@ test('an old cache with no schedule left only replaces the current one when its 
 		const { state } = await setUp(box, { scheduled: false, legacyAt: new Date() });
 		assert.equal(await main(['install', '--device', 'laptop'], harness(box).ctx), 0);
 		assert.equal(await readFile(state, 'utf8'), STATE);
+	});
+});
+
+test('an install that died after removing the old schedule still brings the old state over on the next run', async () => {
+	await withSandbox(async (box) => {
+		const legacy = await writeLegacy(box);
+		const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+		await utimes(join(legacy.cache, 'state.json'), dayAgo, dayAgo);
+		const cacheRoot = box.env.XDG_CACHE_HOME;
+		const fresh = join(cacheRoot, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'made by status');
+
+		const dies: Ctl = async (_cmd, args) => {
+			if (args.includes('daemon-reload')) throw new Error('interrupted');
+		};
+		const first = harness(box, { ctl: dies });
+		assert.equal(await main(['install', '--device', 'laptop'], first.ctx), 1);
+		assert.equal(await exists(join(legacy.units, 'usage-collector.timer')), false);
+		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), 'made by status');
+
+		const { ctx, err } = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0, err.join('\n'));
+		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), STATE);
+		assert.deepEqual(Object.keys(await tree(fresh)).sort(), [
+			'/litellm-prices.json',
+			'/state.json'
+		]);
+		assert.equal(await exists(legacy.cache), false);
+		const aside = (await readdir(cacheRoot)).filter((n) =>
+			n.startsWith('big-spender.pre-install-')
+		);
+		assert.equal(aside.length, 1);
+		assert.equal(await readFile(join(cacheRoot, aside[0], 'state.json'), 'utf8'), 'made by status');
 	});
 });
 
