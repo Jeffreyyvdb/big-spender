@@ -77,18 +77,42 @@ async function migrateConfig(ctx: Context, log: string[]) {
 	}
 }
 
-type CachePlan = 'none' | 'move' | 'replace' | 'keep';
+type CachePlan = 'none' | 'move' | 'replace' | 'keep' | 'keep-older';
+
+type CacheFacts = {
+	legacyCache: boolean;
+	newCache: boolean;
+	installed: boolean;
+	legacyScheduled: boolean;
+	legacyStateNewer: boolean;
+};
 
 /**
- * What to do with the old collector's cache. `status` and `push --dry-run` create a cache of
- * their own from the logs still on disk, which lacks the days only the old state.json kept, so
- * before the first install the old cache wins and the new one is set aside.
+ * What to do with the old collector's cache. `status` and `push` create a cache of their own
+ * from the logs still on disk, which lacks the days only the old state.json kept, so while the
+ * old collector is still scheduled, or wrote its state last, the old cache wins and the new one
+ * is set aside. Otherwise the new cache is the current one and the old one is left alone.
  */
-async function planCache(ctx: Context): Promise<CachePlan> {
+function planCache(f: CacheFacts): CachePlan {
+	if (!f.legacyCache) return 'none';
+	if (!f.newCache) return 'move';
+	if (f.installed) return 'keep';
+	return f.legacyScheduled || f.legacyStateNewer ? 'replace' : 'keep-older';
+}
+
+const mtime = async (path: string) => (await stat(path).catch(() => null))?.mtimeMs ?? -Infinity;
+
+async function cacheFacts(ctx: Context, legacyScheduled: boolean): Promise<CacheFacts> {
 	const { paths } = ctx;
-	if (!(await exists(paths.legacy.cacheDir))) return 'none';
-	if (!(await exists(paths.cacheDir))) return 'move';
-	return (await exists(paths.collector)) ? 'keep' : 'replace';
+	return {
+		legacyCache: await exists(paths.legacy.cacheDir),
+		newCache: await exists(paths.cacheDir),
+		installed: await exists(paths.collector),
+		legacyScheduled,
+		legacyStateNewer:
+			(await mtime(join(paths.legacy.cacheDir, 'state.json'))) >
+			(await mtime(join(paths.cacheDir, 'state.json')))
+	};
 }
 
 async function migrateCache(ctx: Context, plan: CachePlan, log: string[]) {
@@ -96,6 +120,11 @@ async function migrateCache(ctx: Context, plan: CachePlan, log: string[]) {
 	if (plan === 'keep') {
 		log.push(
 			`left ${paths.legacy.cacheDir} in place: ${paths.cacheDir} already exists, so the old state was not moved`
+		);
+	}
+	if (plan === 'keep-older') {
+		log.push(
+			`left ${paths.legacy.cacheDir} in place: it is older than ${paths.cacheDir}, which stays the current cache`
 		);
 	}
 	if (plan === 'replace') {
@@ -164,7 +193,8 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	const scheduler = pickScheduler(ctx.env, ctx.platform, paths, ctx.templatesDir, ctx.ctl);
 	await scheduler.check();
 
-	const cachePlan = await planCache(ctx);
+	const legacyScheduled = (await scheduler.findLegacy()).length > 0;
+	const cachePlan = planCache(await cacheFacts(ctx, legacyScheduled));
 	if ((cachePlan === 'move' || cachePlan === 'replace') && (await lockIsFresh(paths.legacy.lock))) {
 		throw new UsageError(
 			`the old collector is running (${paths.legacy.lock} is recent); wait for it to finish and run install again`

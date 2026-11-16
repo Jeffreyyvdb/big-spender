@@ -12,6 +12,8 @@ const LEGACY_SCRIPT = '.local/share/usage-collector/collector.mjs';
 export type Scheduler = {
 	/** Fails with a clear message if the schedule cannot be managed from here. Changes nothing. */
 	check(): Promise<void>;
+	/** The schedule files the site's usage-collector installed that are still here. Changes nothing. */
+	findLegacy(): Promise<string[]>;
 	/** Removes schedules the site's usage-collector installed. Returns what it removed. */
 	removeLegacy(): Promise<string[]>;
 	/** Writes the schedule from the templates and enables it. */
@@ -70,13 +72,16 @@ function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	const legacyFiles = ['usage-collector.service', 'usage-collector.timer'].map((f) =>
 		join(paths.systemdDir, f)
 	);
+	const findLegacy = async () =>
+		(await Promise.all(legacyFiles.map(async (f) => ((await exists(f)) ? f : null)))).filter(
+			(f): f is string => f !== null
+		);
 	return {
 		describe: 'systemd user timer (hourly). Log: journalctl --user -u big-spender',
 		check: () => requireManager(ctl),
+		findLegacy,
 		async removeLegacy() {
-			const present = (
-				await Promise.all(legacyFiles.map(async (f) => ((await exists(f)) ? f : null)))
-			).filter((f): f is string => f !== null);
+			const present = await findLegacy();
 			await ctl('systemctl', [...user, 'disable', '--now', 'usage-collector.timer'], {
 				tolerate: true
 			});
@@ -120,23 +125,29 @@ function launchd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	const domain = `gui/${process.getuid?.() ?? 0}`;
 	const bootout = (name: string) =>
 		ctl('launchctl', ['bootout', `${domain}/${name}`], { tolerate: true });
+	const findLegacy = async () => {
+		const found: string[] = [];
+		const names = await readdir(paths.launchAgentsDir).catch(() => [] as string[]);
+		for (const name of names.filter((n) => n.endsWith('.usage-collector.plist'))) {
+			const file = join(paths.launchAgentsDir, name);
+			const isOurs =
+				name === 'local.usage-collector.plist' ||
+				(await readFile(file, 'utf8').catch(() => '')).includes(LEGACY_SCRIPT);
+			if (isOurs) found.push(file);
+		}
+		return found;
+	};
 	return {
 		check: async () => {},
 		describe: `launchd agent (hourly + at login). Log: ${join(paths.logsDir, 'big-spender.log')}`,
+		findLegacy,
 		async removeLegacy() {
-			const removed: string[] = [];
-			const names = await readdir(paths.launchAgentsDir).catch(() => [] as string[]);
-			for (const name of names.filter((n) => n.endsWith('.usage-collector.plist'))) {
-				const file = join(paths.launchAgentsDir, name);
-				const isOurs =
-					name === 'local.usage-collector.plist' ||
-					(await readFile(file, 'utf8').catch(() => '')).includes(LEGACY_SCRIPT);
-				if (!isOurs) continue;
-				await bootout(basename(name, '.plist'));
+			const found = await findLegacy();
+			for (const file of found) {
+				await bootout(basename(file, '.plist'));
 				await rm(file, { force: true });
-				removed.push(file);
 			}
-			return removed;
+			return found;
 		},
 		async install(node) {
 			await mkdir(paths.launchAgentsDir, { recursive: true });
