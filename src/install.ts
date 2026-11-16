@@ -138,6 +138,9 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 		);
 	}
 
+	const scheduler = pickScheduler(ctx.env, ctx.platform, paths, ctx.templatesDir, ctx.ctl);
+	await scheduler.check();
+
 	const migrating = !(await exists(paths.cacheDir)) && (await exists(paths.legacy.cacheDir));
 	if (migrating && (await lockIsFresh(paths.legacy.lock))) {
 		throw new UsageError(
@@ -151,7 +154,6 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	if (!token) token = await ctx.prompter().askHidden('Ingest token: ');
 	if (!url || !token) throw new UsageError('an ingest URL and token are required');
 
-	const scheduler = pickScheduler(ctx.env, ctx.platform, paths, ctx.templatesDir);
 	const log: string[] = [];
 
 	for (const removed of await scheduler.removeLegacy()) log.push(`removed old schedule ${removed}`);
@@ -197,7 +199,7 @@ export const UNINSTALL_USAGE =
 
 export async function uninstall(args: string[], ctx: Context): Promise<number> {
 	parseArgs({ args, options: {}, strict: true });
-	const scheduler = pickScheduler(ctx.env, ctx.platform, ctx.paths, ctx.templatesDir);
+	const scheduler = pickScheduler(ctx.env, ctx.platform, ctx.paths, ctx.templatesDir, ctx.ctl);
 	await scheduler.removeLegacy();
 	await scheduler.uninstall();
 	ctx.out(

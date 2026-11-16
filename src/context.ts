@@ -1,5 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import { resolvePaths, type Paths } from './paths.ts';
+import type { Ctl } from './scheduler.ts';
 import { createPrompter, type Prompter } from './prompt.ts';
 
 /** Everything a command reads from its surroundings, so tests can hand it a throwaway HOME. */
@@ -11,6 +12,8 @@ export type Context = {
 	collector: string;
 	templatesDir: string;
 	prompter: () => Prompter;
+	/** Replaces systemctl and launchctl, so tests can watch and fail the calls. */
+	ctl?: Ctl;
 	/** Releases the prompter if one was opened, so stdin does not keep the process alive. */
 	dispose(): void;
 	out(line: string): void;

@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { readdir, readFile, rm, copyFile, mkdir, writeFile, access } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
+import { UsageError } from './context.ts';
 import type { Paths } from './paths.ts';
 
 const execFileAsync = promisify(execFile);
@@ -9,6 +10,8 @@ const execFileAsync = promisify(execFile);
 const LEGACY_SCRIPT = '.local/share/usage-collector/collector.mjs';
 
 export type Scheduler = {
+	/** Fails with a clear message if the schedule cannot be managed from here. Changes nothing. */
+	check(): Promise<void>;
 	/** Removes schedules the site's usage-collector installed. Returns what it removed. */
 	removeLegacy(): Promise<string[]>;
 	/** Writes the schedule from the templates and enables it. */
@@ -19,7 +22,7 @@ export type Scheduler = {
 	describe: string;
 };
 
-type Ctl = (cmd: string, args: string[], opts?: { tolerate?: boolean }) => Promise<void>;
+export type Ctl = (cmd: string, args: string[], opts?: { tolerate?: boolean }) => Promise<void>;
 
 /**
  * The only place that talks to systemctl and launchctl. BIG_SPENDER_SCHEDULER=none turns every
@@ -48,6 +51,20 @@ async function render(templatesDir: string, name: string, vars: Record<string, s
 	return text;
 }
 
+/**
+ * Without a user manager (no login session, no lingering) disable and stop fail quietly, and
+ * deleting the unit files afterwards would leave a timer nobody can stop and no way to retry.
+ */
+async function requireManager(ctl: Ctl) {
+	try {
+		await ctl('systemctl', ['--user', 'show-environment']);
+	} catch {
+		throw new UsageError(
+			'cannot reach the systemd user manager (systemctl --user failed). Run this from a login session, or enable lingering with `loginctl enable-linger $USER`, then run install again. Nothing was changed.'
+		);
+	}
+}
+
 function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	const user = ['--user'];
 	const legacyFiles = ['usage-collector.service', 'usage-collector.timer'].map((f) =>
@@ -55,15 +72,17 @@ function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	);
 	return {
 		describe: 'systemd user timer (hourly). Log: journalctl --user -u big-spender',
+		check: () => requireManager(ctl),
 		async removeLegacy() {
 			const present = (
 				await Promise.all(legacyFiles.map(async (f) => ((await exists(f)) ? f : null)))
 			).filter((f): f is string => f !== null);
-			if (!present.length) return [];
 			await ctl('systemctl', [...user, 'disable', '--now', 'usage-collector.timer'], {
 				tolerate: true
 			});
 			await ctl('systemctl', [...user, 'stop', 'usage-collector.service'], { tolerate: true });
+			if (!present.length) return [];
+			await requireManager(ctl);
 			for (const f of present) await rm(f, { force: true });
 			await ctl('systemctl', [...user, 'daemon-reload']);
 			return present;
@@ -102,6 +121,7 @@ function launchd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	const bootout = (name: string) =>
 		ctl('launchctl', ['bootout', `${domain}/${name}`], { tolerate: true });
 	return {
+		check: async () => {},
 		describe: `launchd agent (hourly + at login). Log: ${join(paths.logsDir, 'big-spender.log')}`,
 		async removeLegacy() {
 			const removed: string[] = [];
@@ -145,9 +165,9 @@ export function pickScheduler(
 	env: NodeJS.ProcessEnv,
 	platform: NodeJS.Platform,
 	paths: Paths,
-	templatesDir: string
+	templatesDir: string,
+	ctl: Ctl = makeCtl(env)
 ): Scheduler {
-	const ctl = makeCtl(env);
 	const table: Partial<Record<NodeJS.Platform, () => Scheduler>> = {
 		linux: () => systemd(paths, templatesDir, ctl),
 		darwin: () => launchd(paths, templatesDir, ctl)

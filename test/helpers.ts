@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import type { Context } from '../src/context.ts';
 import { resolvePaths } from '../src/paths.ts';
 import type { Prompter } from '../src/prompt.ts';
+import type { Ctl } from '../src/scheduler.ts';
 import type { UsageRow, UsageSnapshot } from '../src/schema.ts';
 
 export function row(hour: string, model: string, cost: number): UsageRow {
@@ -97,8 +98,14 @@ export function harness(
 	{
 		answers = [],
 		platform = 'linux',
-		env = {}
-	}: { answers?: string[]; platform?: NodeJS.Platform; env?: Record<string, string> } = {}
+		env = {},
+		ctl
+	}: {
+		answers?: string[];
+		platform?: NodeJS.Platform;
+		env?: Record<string, string>;
+		ctl?: Ctl;
+	} = {}
 ): Harness {
 	const out: string[] = [];
 	const err: string[] = [];
@@ -122,6 +129,7 @@ export function harness(
 			collector: fileURLToPath(new URL('../src/collector.mjs', import.meta.url)),
 			templatesDir: fileURLToPath(new URL('../templates', import.meta.url)),
 			prompter: () => prompter,
+			ctl,
 			dispose() {},
 			out: (line) => out.push(line),
 			err: (line) => err.push(line)
