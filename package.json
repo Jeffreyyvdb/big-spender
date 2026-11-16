@@ -24,7 +24,7 @@
 		"node": ">=20"
 	},
 	"scripts": {
-		"build": "tsc -p tsconfig.build.json",
+		"build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
 		"check": "tsc",
 		"test": "node --test test/*.test.ts",
 		"format": "prettier --write ."

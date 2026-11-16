@@ -1,0 +1,12 @@
+# ~/.config/systemd/user/big-spender.timer
+[Unit]
+Description=Hourly AI coding usage push
+
+[Timer]
+OnCalendar=hourly
+# Run at boot/login if a run was missed while the machine was off.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,13 @@
+# ~/.config/systemd/user/big-spender.service (`big-spender install` replaces __NODE__)
+[Unit]
+Description=Push AI coding usage stats to your big-spender server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Also read by the collector itself; listed here so `systemctl --user show` reflects it.
+EnvironmentFile=%h/.config/big-spender/env
+ExecStart=__NODE__ %h/.local/share/big-spender/collector.mjs
+Nice=10
+IOSchedulingClass=idle

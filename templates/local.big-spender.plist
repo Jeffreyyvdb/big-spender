@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ~/Library/LaunchAgents/local.big-spender.plist
+  `big-spender install` replaces __HOME__ and __NODE__. Secrets live in ~/.config/big-spender/env
+  (chmod 600), not in this file.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.big-spender</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__NODE__</string>
+		<string>__HOME__/.local/share/big-spender/collector.mjs</string>
+	</array>
+	<!--
+	  Wall-clock schedule, not StartInterval: StartInterval counts only awake time, so a laptop
+	  that sleeps with the lid closed can go hours without a run. A calendar slot missed during
+	  sleep fires once on wake instead.
+	-->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/big-spender.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/big-spender.log</string>
+</dict>
+</plist>
