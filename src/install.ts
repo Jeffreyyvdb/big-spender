@@ -165,10 +165,7 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	await scheduler.check();
 
 	const cachePlan = await planCache(ctx);
-	if (
-		(cachePlan === 'move' || cachePlan === 'replace') &&
-		(await lockIsFresh(paths.legacy.lock))
-	) {
+	if ((cachePlan === 'move' || cachePlan === 'replace') && (await lockIsFresh(paths.legacy.lock))) {
 		throw new UsageError(
 			`the old collector is running (${paths.legacy.lock} is recent); wait for it to finish and run install again`
 		);

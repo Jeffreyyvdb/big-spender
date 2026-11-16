@@ -208,7 +208,9 @@ test('a cache that status or push --dry-run made before the first install is set
 
 		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), STATE);
 		assert.equal(await exists(legacy.cache), false);
-		const aside = (await readdir(cacheRoot)).filter((n) => n.startsWith('big-spender.pre-install-'));
+		const aside = (await readdir(cacheRoot)).filter((n) =>
+			n.startsWith('big-spender.pre-install-')
+		);
 		assert.equal(aside.length, 1);
 		assert.equal(
 			await readFile(join(cacheRoot, aside[0], 'state.json'), 'utf8'),
