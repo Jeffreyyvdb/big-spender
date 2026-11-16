@@ -116,7 +116,7 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		return 0;
 	}
 
-	const saved = parseEnv(await readFile(ctx.paths.envFile, 'utf8').catch(() => ''));
+	const saved = parseEnv(await readFile(ctx.paths.collectorEnvFile, 'utf8').catch(() => ''));
 	const url =
 		values.url ??
 		(setting(ctx.env, 'INGEST_URL') ||
