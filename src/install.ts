@@ -128,7 +128,7 @@ async function migrateCache(ctx: Context, plan: CachePlan, log: string[]) {
 	}
 	if (plan === 'keep-older') {
 		log.push(
-			`left ${paths.legacy.cacheDir} in place: it is older than ${paths.cacheDir}, which stays the current cache`
+			`left ${paths.legacy.cacheDir} in place: it has no newer state than ${paths.cacheDir}, which stays the current cache`
 		);
 	}
 	if (plan === 'replace') {

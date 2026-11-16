@@ -362,7 +362,7 @@ test('an old cache with no schedule left only replaces the current one when its 
 		assert.equal(await readFile(state, 'utf8'), 'kept by big-spender push');
 		assert.equal(await readFile(join(legacy.cache, 'state.json'), 'utf8'), STATE);
 		assert.ok(
-			out.some((l) => l.includes(legacy.cache) && l.includes('older')),
+			out.some((l) => l.includes(legacy.cache) && l.includes('no newer state')),
 			out.join('\n')
 		);
 	});
