@@ -4,6 +4,7 @@ import { access, mkdir, readdir, readFile, stat, utimes, writeFile } from 'node:
 import { join } from 'node:path';
 import { main } from '../src/cli.ts';
 import { parseEnv, renameLegacyKeys, upsertEnv } from '../src/envfile.ts';
+import type { Ctl } from '../src/scheduler.ts';
 import { harness, tree, withSandbox, type Sandbox } from './helpers.ts';
 
 const URL_ = 'https://example.com/api/usage/ingest';
@@ -230,6 +231,25 @@ test('a fresh old-collector lock also stops the replacement of a cache made befo
 		assert.equal(await main(['install', '--device', 'laptop'], busy.ctx), 2);
 		assert.match(busy.err.join('\n'), /old collector is running/);
 		assert.deepEqual(await tree(box.home), before);
+	});
+});
+
+test('a lock left by a run the old timer started while install was stopping it does not block the new collector', async () => {
+	await withSandbox(async (box) => {
+		const legacy = await writeLegacy(box);
+		const lock = join(legacy.cache, 'run.lock');
+		const ctl: Ctl = async (_cmd, args) => {
+			if (args.includes('disable') && args.includes('usage-collector.timer')) {
+				await writeFile(lock, '4321');
+			}
+		};
+
+		const { ctx, err } = harness(box, { ctl });
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0, err.join('\n'));
+
+		const cache = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		assert.equal(await readFile(join(cache, 'state.json'), 'utf8'), STATE);
+		assert.equal(await exists(join(cache, 'run.lock')), false);
 	});
 });
 

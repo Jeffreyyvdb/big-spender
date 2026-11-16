@@ -108,6 +108,8 @@ async function migrateCache(ctx: Context, plan: CachePlan, log: string[]) {
 	if (plan === 'move' || plan === 'replace') {
 		await rename(paths.legacy.cacheDir, paths.cacheDir);
 		log.push(`moved ${paths.legacy.cacheDir} to ${paths.cacheDir}`);
+		// The old units are stopped by now, so a lock that came along belongs to a dead run.
+		await rm(paths.lock, { force: true });
 	}
 }
 

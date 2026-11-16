@@ -8,6 +8,7 @@ export type Paths = {
 	envFile: string;
 	configDir: string;
 	cacheDir: string;
+	lock: string;
 	shareDir: string;
 	collector: string;
 	systemdDir: string;
@@ -29,6 +30,7 @@ export function resolvePaths(env: NodeJS.ProcessEnv = process.env, home = homedi
 		envFile: join(configDir, 'env'),
 		configDir,
 		cacheDir: join(cache, 'big-spender'),
+		lock: join(cache, 'big-spender', 'run.lock'),
 		shareDir,
 		collector: join(shareDir, 'collector.mjs'),
 		systemdDir: join(config, 'systemd', 'user'),
