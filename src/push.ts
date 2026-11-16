@@ -127,6 +127,12 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		(await prompter.askHidden('Ingest token: ')) ||
 		setting(saved, 'INGEST_TOKEN');
 	if (!url || !token) throw new Error('an ingest URL and token are required');
+	// fetch quotes the whole header in its error for some of these, which would print the token.
+	if (!/^[\x21-\x7e]+$/.test(token)) {
+		throw new Error(
+			'the ingest token contains characters that are not allowed in an HTTP header; check it for spaces or a stray newline'
+		);
+	}
 
 	const result = await send(ctx, url, token, body);
 	ctx.out(`posted ${snapshot.hourly.length} rows (${body.length} bytes gzipped): ${result}`);

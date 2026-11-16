@@ -236,7 +236,8 @@ State from an older collector is fixed in place on the first run of a newer one 
 re-read of the Claude logs to pick up missed output tokens), so updating never needs `--reset`.
 
 A machine that was off catches up on its next run. A failed post retries with backoff and exits
-non-zero; the token is never logged.
+non-zero; the token is never logged. A token with a space, a control character or anything else an
+HTTP header cannot carry fails at once, without a retry, in both the collector and `push`.
 
 ## Coming from the earlier standalone script
 
