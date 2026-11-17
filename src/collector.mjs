@@ -685,9 +685,15 @@ function printSummary(snapshot, sessions24h, nowMs) {
 
 async function post(snapshot) {
 	const url = setting('INGEST_URL');
-	const token = setting('INGEST_TOKEN');
+	const token = setting('INGEST_TOKEN').trim();
 	if (!url || !token) {
 		throw new Error('BIG_SPENDER_INGEST_URL and BIG_SPENDER_INGEST_TOKEN must be set');
+	}
+	// fetch quotes the whole header in its error for some of these, which would print the token.
+	if (!/^[\x21-\x7e]+$/.test(token)) {
+		throw new Error(
+			'the ingest token contains characters that are not allowed in an HTTP header; check it for spaces or a stray newline'
+		);
 	}
 	const body = gzipSync(JSON.stringify(snapshot));
 	let lastErr;

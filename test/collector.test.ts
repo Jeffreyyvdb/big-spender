@@ -83,3 +83,44 @@ test('a real device id is required to post', async () => {
 		assert.match(res.stderr, /BIG_SPENDER_DEVICE_ID must be a lowercase slug/);
 	});
 });
+
+test('a token that cannot go in an HTTP header fails at once and is never printed', async () => {
+	await withSandbox(async ({ env }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		const dataDir = join(env.HOME, 'data');
+		const bs = createBigSpender({ dataDir, ingestToken: 'tok', devices: { devices: {} } });
+		const server = createHttpServer(bs);
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		try {
+			const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/usage/ingest`;
+			const configDir = join(env.XDG_CONFIG_HOME, 'big-spender');
+			await mkdir(configDir, { recursive: true });
+			const base = { ...env, BIG_SPENDER_DEVICE_ID: 'laptop', BIG_SPENDER_INGEST_URL: url };
+
+			await writeFile(join(configDir, 'env'), 'BIG_SPENDER_INGEST_TOKEN=sekrit-1\x01sekrit-2\n', {
+				mode: 0o600
+			});
+			const fromFile = await run(COLLECTOR, [], base);
+			const fromEnv = await run(COLLECTOR, [], {
+				...base,
+				BIG_SPENDER_INGEST_TOKEN: 'sekrit-1\rsekrit-2'
+			});
+			for (const res of [fromEnv, fromFile]) {
+				assert.equal(res.code, 1);
+				const printed = res.stdout + res.stderr;
+				assert.doesNotMatch(printed, /sekrit/);
+				assert.doesNotMatch(printed, /retrying/);
+				assert.match(printed, /not allowed in an HTTP header/);
+			}
+			assert.equal(existsSync(join(dataDir, 'laptop.json')), false);
+
+			// fetch used to trim surrounding whitespace, so a token exported with a newline worked.
+			const padded = await run(COLLECTOR, [], { ...base, BIG_SPENDER_INGEST_TOKEN: ' tok\n' });
+			assert.equal(padded.code, 0, padded.stderr);
+			assert.equal(existsSync(join(dataDir, 'laptop.json')), true);
+		} finally {
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
+	});
+});

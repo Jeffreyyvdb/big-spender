@@ -186,10 +186,10 @@ big-spender push laptop             # same review, then asks before sending
 
 It builds the snapshot and lists the model names it would publish. It stops if a name looks like a
 cloud resource id or gateway path (it contains `arn:` or `/`), such as a Bedrock inference-profile
-ARN with an account id in it. It asks before sending and takes the URL from `--url`,
-`BIG_SPENDER_INGEST_URL` or a prompt, and the token from `BIG_SPENDER_INGEST_TOKEN` or a hidden
-prompt. Neither is stored. Nothing is scheduled, so the server shows that device's usage as of its
-last push.
+ARN with an account id in it. It asks before sending, sends exactly the JSON it showed, and takes
+the URL from `--url`, `BIG_SPENDER_INGEST_URL` or a prompt, and the token from
+`BIG_SPENDER_INGEST_TOKEN` or a hidden prompt. Neither is stored. Nothing is scheduled, so the
+server shows that device's usage as of its last push.
 
 `--dry-run` writes the JSON that would be sent to `$TMPDIR/big-spender-snapshot-<device>.json`.
 
@@ -236,16 +236,20 @@ State from an older collector is fixed in place on the first run of a newer one 
 re-read of the Claude logs to pick up missed output tokens), so updating never needs `--reset`.
 
 A machine that was off catches up on its next run. A failed post retries with backoff and exits
-non-zero; the token is never logged.
+non-zero; the token is never logged. A token with a space, a control character or anything else an
+HTTP header cannot carry fails at once, without a retry, in both the collector and `push`.
 
 ## Coming from the earlier standalone script
 
 `big-spender install` migrates an install of the earlier `usage-collector` script in place: it
-removes the old systemd units or LaunchAgent, moves its config and state (so history is kept
-byte for byte), renames the `USAGE_*` keys in the env file to `BIG_SPENDER_*`, and deletes the old
-copy of the script. If the old collector is running at that moment it waits for you to run install
-again. The collector still reads `USAGE_DEVICE_ID`, `USAGE_INGEST_URL` and `USAGE_INGEST_TOKEN`
-when the `BIG_SPENDER_*` name is unset, so a machine you have not updated keeps working.
+removes the old systemd units or LaunchAgent, moves its config and state (so history is kept byte
+for byte), renames the `USAGE_*` keys in the env file to `BIG_SPENDER_*`, and deletes the old copy
+of the script. If `status` or `push` already made a new cache, the old state replaces it only while
+the old collector is still scheduled or wrote its state last; otherwise the old cache is left in
+place and the newer one kept. If the old collector, or a `status` or `push` whose cache would be
+replaced, is running at that moment, install changes nothing and asks you to run it again. The
+collector still reads `USAGE_DEVICE_ID`, `USAGE_INGEST_URL` and `USAGE_INGEST_TOKEN` when the
+`BIG_SPENDER_*` name is unset, so a machine you have not updated keeps working.
 
 ## Development
 

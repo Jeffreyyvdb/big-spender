@@ -6,6 +6,8 @@ export type Paths = {
 	home: string;
 	tmpDir: string;
 	envFile: string;
+	/** The env file the collector reads: envFile, unless BIG_SPENDER_ENV_FILE or USAGE_ENV_FILE names another. */
+	collectorEnvFile: string;
 	configDir: string;
 	cacheDir: string;
 	lock: string;
@@ -24,10 +26,12 @@ export function resolvePaths(env: NodeJS.ProcessEnv = process.env, home = homedi
 	const configDir = join(config, 'big-spender');
 	const shareDir = join(share, 'big-spender');
 	const legacyCacheDir = join(cache, 'usage-collector');
+	const envFile = join(configDir, 'env');
 	return {
 		home,
 		tmpDir: env.TMPDIR || env.TEMP || '/tmp',
-		envFile: join(configDir, 'env'),
+		envFile,
+		collectorEnvFile: env.BIG_SPENDER_ENV_FILE || env.USAGE_ENV_FILE || envFile,
 		configDir,
 		cacheDir: join(cache, 'big-spender'),
 		lock: join(cache, 'big-spender', 'run.lock'),

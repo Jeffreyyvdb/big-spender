@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, readdir, readFile, stat, utimes, writeFile } from 'node:fs/promises';
+import { access, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { main } from '../src/cli.ts';
 import { parseEnv, renameLegacyKeys, upsertEnv } from '../src/envfile.ts';
@@ -62,12 +62,12 @@ OTHER_SETTING=keep me
 		);
 		assert.equal((await stat(env)).mode & 0o777, 0o600);
 
-		const state = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
-		assert.equal(await readFile(state, 'utf8'), STATE);
-		assert.equal(
-			await exists(join(box.env.XDG_CACHE_HOME, 'big-spender', 'litellm-prices.json')),
-			true
-		);
+		const cache = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		assert.deepEqual(Object.keys(await tree(cache)).sort(), [
+			'/litellm-prices.json',
+			'/state.json'
+		]);
+		assert.equal(await readFile(join(cache, 'state.json'), 'utf8'), STATE);
 
 		const share = join(box.home, '.local', 'share', 'big-spender', 'collector.mjs');
 		assert.equal(await readFile(share, 'utf8'), await readFile(ctx.collector, 'utf8'));
@@ -331,5 +331,154 @@ test('--device with a different id than the migrated one is refused unless --ren
 			await readFile(join(box.env.XDG_CONFIG_HOME, 'big-spender', 'env'), 'utf8')
 		);
 		assert.equal(env.BIG_SPENDER_DEVICE_ID, 'desktop');
+	});
+});
+
+test('an old cache with no schedule left only replaces the current one when its state is newer', async () => {
+	const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+	const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+	const setUp = async (
+		box: Sandbox,
+		{ scheduled, legacyAt }: { scheduled: boolean; legacyAt: Date }
+	) => {
+		const legacy = await writeLegacy(box);
+		if (!scheduled) {
+			for (const unit of ['usage-collector.service', 'usage-collector.timer']) {
+				await rm(join(legacy.units, unit));
+			}
+		}
+		await utimes(join(legacy.cache, 'state.json'), legacyAt, legacyAt);
+		const fresh = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'kept by big-spender push');
+		await utimes(join(fresh, 'state.json'), hourAgo, hourAgo);
+		return { legacy, state: join(fresh, 'state.json') };
+	};
+
+	await withSandbox(async (box) => {
+		const { legacy, state } = await setUp(box, { scheduled: false, legacyAt: dayAgo });
+		const { ctx, out, err } = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0, err.join('\n'));
+		assert.equal(await readFile(state, 'utf8'), 'kept by big-spender push');
+		assert.equal(await readFile(join(legacy.cache, 'state.json'), 'utf8'), STATE);
+		assert.ok(
+			out.some((l) => l.includes(legacy.cache) && l.includes('no newer state')),
+			out.join('\n')
+		);
+	});
+
+	await withSandbox(async (box) => {
+		const { state } = await setUp(box, { scheduled: true, legacyAt: dayAgo });
+		assert.equal(await main(['install', '--device', 'laptop'], harness(box).ctx), 0);
+		assert.equal(await readFile(state, 'utf8'), STATE);
+	});
+
+	await withSandbox(async (box) => {
+		const { state } = await setUp(box, { scheduled: false, legacyAt: new Date() });
+		assert.equal(await main(['install', '--device', 'laptop'], harness(box).ctx), 0);
+		assert.equal(await readFile(state, 'utf8'), STATE);
+	});
+});
+
+test('an install that died after removing the old schedule still brings the old state over on the next run', async () => {
+	await withSandbox(async (box) => {
+		const legacy = await writeLegacy(box);
+		const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+		await utimes(join(legacy.cache, 'state.json'), dayAgo, dayAgo);
+		const cacheRoot = box.env.XDG_CACHE_HOME;
+		const fresh = join(cacheRoot, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'made by status');
+
+		const dies: Ctl = async (_cmd, args) => {
+			if (args.includes('daemon-reload')) throw new Error('interrupted');
+		};
+		const first = harness(box, { ctl: dies });
+		assert.equal(await main(['install', '--device', 'laptop'], first.ctx), 1);
+		assert.equal(await exists(join(legacy.units, 'usage-collector.timer')), false);
+		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), 'made by status');
+
+		const { ctx, err } = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 0, err.join('\n'));
+		assert.equal(await readFile(join(fresh, 'state.json'), 'utf8'), STATE);
+		assert.deepEqual(Object.keys(await tree(fresh)).sort(), [
+			'/litellm-prices.json',
+			'/state.json'
+		]);
+		assert.equal(await exists(legacy.cache), false);
+		const aside = (await readdir(cacheRoot)).filter((n) =>
+			n.startsWith('big-spender.pre-install-')
+		);
+		assert.equal(aside.length, 1);
+		assert.equal(await readFile(join(cacheRoot, aside[0], 'state.json'), 'utf8'), 'made by status');
+	});
+});
+
+test('a status or push holding the new cache lock stops its replacement and changes nothing', async () => {
+	await withSandbox(async (box) => {
+		await writeLegacy(box);
+		const fresh = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(fresh, { recursive: true });
+		await writeFile(join(fresh, 'state.json'), 'being written by status');
+		await writeFile(join(fresh, 'run.lock'), '5678');
+		const before = await tree(box.home);
+
+		const busy = harness(box);
+		assert.equal(await main(['install', '--device', 'laptop'], busy.ctx), 2);
+		assert.ok(busy.err.join('\n').includes(join(fresh, 'run.lock')), busy.err.join('\n'));
+		assert.deepEqual(await tree(box.home), before);
+	});
+});
+
+test('the schedule reads the env file and cache install used under custom XDG dirs, and the default unit is unchanged', async () => {
+	await withSandbox(async (box) => {
+		const config = join(box.home, 'xdg', 'config');
+		const cache = join(box.home, 'xdg', 'cache');
+		const env = { XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache };
+
+		const linux = harness(box, { answers: [URL_, 'tok'], env });
+		assert.equal(await main(['install', '--device', 'desk'], linux.ctx), 0, linux.err.join('\n'));
+		const unit = await readFile(join(config, 'systemd', 'user', 'big-spender.service'), 'utf8');
+		assert.ok(unit.includes(`\nEnvironmentFile=${join(config, 'big-spender', 'env')}\n`), unit);
+		assert.ok(unit.includes(`\nEnvironment="XDG_CONFIG_HOME=${config}"\n`), unit);
+		assert.ok(unit.includes(`\nEnvironment="XDG_CACHE_HOME=${cache}"\n`), unit);
+
+		const mac = harness(box, { env, platform: 'darwin' });
+		assert.equal(await main(['install', '--device', 'desk'], mac.ctx), 0, mac.err.join('\n'));
+		const plist = await readFile(
+			join(box.home, 'Library', 'LaunchAgents', 'local.big-spender.plist'),
+			'utf8'
+		);
+		const vars = /<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/.exec(plist)?.[1];
+		assert.equal(
+			vars?.replace(/\s+/g, ''),
+			`<key>XDG_CONFIG_HOME</key><string>${config}</string><key>XDG_CACHE_HOME</key><string>${cache}</string>`,
+			plist
+		);
+	});
+
+	await withSandbox(async (box) => {
+		const { ctx, err } = harness(box, {
+			answers: [URL_, 'tok'],
+			env: { XDG_CONFIG_HOME: '', XDG_CACHE_HOME: '' }
+		});
+		assert.equal(await main(['install', '--device', 'desk'], ctx), 0, err.join('\n'));
+		assert.equal(
+			await readFile(join(box.home, '.config', 'systemd', 'user', 'big-spender.service'), 'utf8'),
+			`# ~/.config/systemd/user/big-spender.service (\`big-spender install\` replaces ${process.execPath})
+[Unit]
+Description=Push AI coding usage stats to your big-spender server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Also read by the collector itself; listed here so \`systemctl --user show\` reflects it.
+EnvironmentFile=${box.home}/.config/big-spender/env
+ExecStart=${process.execPath} %h/.local/share/big-spender/collector.mjs
+Nice=10
+IOSchedulingClass=idle
+`
+		);
 	});
 });

@@ -7,7 +7,8 @@ After=network-online.target
 [Service]
 Type=oneshot
 # Also read by the collector itself; listed here so `systemctl --user show` reflects it.
-EnvironmentFile=%h/.config/big-spender/env
+EnvironmentFile=__ENV_FILE__
+__ENVIRONMENT__
 ExecStart=__NODE__ %h/.local/share/big-spender/collector.mjs
 Nice=10
 IOSchedulingClass=idle

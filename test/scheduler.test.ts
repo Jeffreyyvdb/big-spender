@@ -48,15 +48,16 @@ test('systemd: legacy disable and stop run even with no unit files, and a missin
 	});
 });
 
-test('install checks for a systemd user manager first and changes nothing when there is none', async () => {
+test('install checks for a systemd user manager first, changes nothing when there is none, and prints no usage text', async () => {
 	await withSandbox(async (box) => {
 		await mkdir(join(box.env.XDG_CONFIG_HOME, 'systemd', 'user'), { recursive: true });
 		const { ctl, calls } = fakeCtl(NO_BUS);
 		const { ctx, err } = harness(box, { answers: ['https://example.com/ingest', 'tok'], ctl });
 		const before = await tree(box.home);
 
-		assert.equal(await main(['install', '--device', 'laptop'], ctx), 2);
+		assert.equal(await main(['install', '--device', 'laptop'], ctx), 1);
 		assert.match(err.join('\n'), /loginctl enable-linger/);
+		assert.doesNotMatch(err.join('\n'), /Usage:/);
 		assert.deepEqual(await tree(box.home), before);
 		assert.deepEqual(calls, ['--user show-environment']);
 	});

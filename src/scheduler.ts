@@ -2,7 +2,6 @@ import { execFile } from 'node:child_process';
 import { readdir, readFile, rm, copyFile, mkdir, writeFile, access } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
-import { UsageError } from './context.ts';
 import type { Paths } from './paths.ts';
 
 const execFileAsync = promisify(execFile);
@@ -12,6 +11,8 @@ const LEGACY_SCRIPT = '.local/share/usage-collector/collector.mjs';
 export type Scheduler = {
 	/** Fails with a clear message if the schedule cannot be managed from here. Changes nothing. */
 	check(): Promise<void>;
+	/** The schedule files the site's usage-collector installed that are still here. Changes nothing. */
+	findLegacy(): Promise<string[]>;
 	/** Removes schedules the site's usage-collector installed. Returns what it removed. */
 	removeLegacy(): Promise<string[]>;
 	/** Writes the schedule from the templates and enables it. */
@@ -59,24 +60,30 @@ async function requireManager(ctl: Ctl) {
 	try {
 		await ctl('systemctl', ['--user', 'show-environment']);
 	} catch {
-		throw new UsageError(
+		throw new Error(
 			'cannot reach the systemd user manager (systemctl --user failed). Run this from a login session, or enable lingering with `loginctl enable-linger $USER`, then run install again. Nothing was changed.'
 		);
 	}
 }
 
-function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
+/** XDG dirs set at install time, which the scheduled collector must see to use the same files. */
+type Xdg = [name: string, value: string][];
+
+function systemd(paths: Paths, templatesDir: string, ctl: Ctl, xdg: Xdg): Scheduler {
 	const user = ['--user'];
 	const legacyFiles = ['usage-collector.service', 'usage-collector.timer'].map((f) =>
 		join(paths.systemdDir, f)
 	);
+	const findLegacy = async () =>
+		(await Promise.all(legacyFiles.map(async (f) => ((await exists(f)) ? f : null)))).filter(
+			(f): f is string => f !== null
+		);
 	return {
 		describe: 'systemd user timer (hourly). Log: journalctl --user -u big-spender',
 		check: () => requireManager(ctl),
+		findLegacy,
 		async removeLegacy() {
-			const present = (
-				await Promise.all(legacyFiles.map(async (f) => ((await exists(f)) ? f : null)))
-			).filter((f): f is string => f !== null);
+			const present = await findLegacy();
 			await ctl('systemctl', [...user, 'disable', '--now', 'usage-collector.timer'], {
 				tolerate: true
 			});
@@ -91,7 +98,12 @@ function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 			await mkdir(paths.systemdDir, { recursive: true });
 			await writeFile(
 				join(paths.systemdDir, 'big-spender.service'),
-				await render(templatesDir, 'big-spender.service', { __NODE__: node, __HOME__: paths.home })
+				await render(templatesDir, 'big-spender.service', {
+					__NODE__: node,
+					__HOME__: paths.home,
+					__ENV_FILE__: paths.envFile,
+					'__ENVIRONMENT__\n': xdg.map(([k, v]) => `Environment="${k}=${v}"\n`).join('')
+				})
 			);
 			await copyFile(
 				join(templatesDir, 'big-spender.timer'),
@@ -114,29 +126,35 @@ function systemd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 	};
 }
 
-function launchd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
+function launchd(paths: Paths, templatesDir: string, ctl: Ctl, xdg: Xdg): Scheduler {
 	const label = 'local.big-spender';
 	const plist = join(paths.launchAgentsDir, `${label}.plist`);
 	const domain = `gui/${process.getuid?.() ?? 0}`;
 	const bootout = (name: string) =>
 		ctl('launchctl', ['bootout', `${domain}/${name}`], { tolerate: true });
+	const findLegacy = async () => {
+		const found: string[] = [];
+		const names = await readdir(paths.launchAgentsDir).catch(() => [] as string[]);
+		for (const name of names.filter((n) => n.endsWith('.usage-collector.plist'))) {
+			const file = join(paths.launchAgentsDir, name);
+			const isOurs =
+				name === 'local.usage-collector.plist' ||
+				(await readFile(file, 'utf8').catch(() => '')).includes(LEGACY_SCRIPT);
+			if (isOurs) found.push(file);
+		}
+		return found;
+	};
 	return {
 		check: async () => {},
 		describe: `launchd agent (hourly + at login). Log: ${join(paths.logsDir, 'big-spender.log')}`,
+		findLegacy,
 		async removeLegacy() {
-			const removed: string[] = [];
-			const names = await readdir(paths.launchAgentsDir).catch(() => [] as string[]);
-			for (const name of names.filter((n) => n.endsWith('.usage-collector.plist'))) {
-				const file = join(paths.launchAgentsDir, name);
-				const isOurs =
-					name === 'local.usage-collector.plist' ||
-					(await readFile(file, 'utf8').catch(() => '')).includes(LEGACY_SCRIPT);
-				if (!isOurs) continue;
-				await bootout(basename(name, '.plist'));
+			const found = await findLegacy();
+			for (const file of found) {
+				await bootout(basename(file, '.plist'));
 				await rm(file, { force: true });
-				removed.push(file);
 			}
-			return removed;
+			return found;
 		},
 		async install(node) {
 			await mkdir(paths.launchAgentsDir, { recursive: true });
@@ -145,7 +163,12 @@ function launchd(paths: Paths, templatesDir: string, ctl: Ctl): Scheduler {
 				plist,
 				await render(templatesDir, 'local.big-spender.plist', {
 					__NODE__: node,
-					__HOME__: paths.home
+					__HOME__: paths.home,
+					'__ENVIRONMENT__\n': xdg.length
+						? `\t<key>EnvironmentVariables</key>\n\t<dict>\n${xdg
+								.map(([k, v]) => `\t\t<key>${k}</key>\n\t\t<string>${v}</string>\n`)
+								.join('')}\t</dict>\n`
+						: ''
 				})
 			);
 			await bootout(label);
@@ -168,9 +191,12 @@ export function pickScheduler(
 	templatesDir: string,
 	ctl: Ctl = makeCtl(env)
 ): Scheduler {
+	const xdg: Xdg = ['XDG_CONFIG_HOME', 'XDG_CACHE_HOME'].flatMap((k) =>
+		env[k] ? [[k, env[k]]] : []
+	);
 	const table: Partial<Record<NodeJS.Platform, () => Scheduler>> = {
-		linux: () => systemd(paths, templatesDir, ctl),
-		darwin: () => launchd(paths, templatesDir, ctl)
+		linux: () => systemd(paths, templatesDir, ctl, xdg),
+		darwin: () => launchd(paths, templatesDir, ctl, xdg)
 	};
 	const make = table[platform] ?? (env.BIG_SPENDER_SCHEDULER === 'none' ? table.linux : undefined);
 	if (!make)
