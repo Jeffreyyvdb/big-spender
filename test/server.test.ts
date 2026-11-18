@@ -351,3 +351,18 @@ test('the summary is cached for five minutes and dropped by an ingest', async ()
 		assert.equal(await bs.summary(NOW + 6 * 60_000 + 2), fresh);
 	});
 });
+
+test('saves that overlap still merge one after another', async () => {
+	await withTempDir(async (dir) => {
+		const store = fileStore(dir);
+		await Promise.all([
+			store.save(withRows([dayRow('2026-09-20', 'm', 3)], '2026-11-14T10:00:00Z')),
+			store.save(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T22:00:00Z'))
+		]);
+		const [stored] = await fileStore(dir).list();
+		assert.deepEqual(
+			stored.hourly.map((r) => r.hour),
+			['2026-09-20T00:00:00Z', '2026-11-13T00:00:00Z']
+		);
+	});
+});

@@ -41,12 +41,17 @@ export function fileStore(dir: string): SnapshotStore {
 	const root = resolve(dir);
 	let loading: Promise<Map<string, UsageSnapshot>> | null = null;
 	const snapshots = () => (loading ??= loadFromDisk(root));
+	let previousSave: Promise<unknown> = Promise.resolve();
 
 	return {
 		async list() {
 			return [...(await snapshots()).values()];
 		},
-		save
+		save(snap) {
+			const run = previousSave.then(() => save(snap));
+			previousSave = run.catch(() => {});
+			return run;
+		}
 	};
 
 	async function save(snap: UsageSnapshot): Promise<SaveResult> {
