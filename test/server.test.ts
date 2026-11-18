@@ -132,6 +132,18 @@ test('an invalid snapshot is 422 with at most the first five issues', async () =
 	});
 });
 
+test('a snapshot dated before 2020 is 422, so the all-time range stays small', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		const res = await bs.ingest(
+			postJson({ ...snapshot('mac'), coverageStart: '0000-01-01T00:00:00Z' })
+		);
+		assert.equal(res.status, 422);
+		assert.deepEqual(await readdir(dir), []);
+		assert.equal((await bs.summary(NOW)).ranges.all.series.length, 1);
+	});
+});
+
 test('an older snapshot than the stored one is stale and changes nothing', async () => {
 	await withTempDir(async (dir) => {
 		const bs = setup(dir);

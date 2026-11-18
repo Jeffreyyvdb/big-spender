@@ -120,8 +120,9 @@ test('range windows: every range is bucketed by UTC day, never by hour', () => {
 	);
 	const r = summarize([device], NOW, CONFIG).ranges;
 
-	assert.deepEqual(Object.keys(r), ['7d', '30d', '90d']);
-	for (const range of Object.values(r)) {
+	assert.deepEqual(Object.keys(r), ['7d', '30d', '90d', 'all']);
+	for (const range of [r['7d'], r['30d'], r['90d']]) {
+		assert.equal(range.bucket, 'day');
 		for (const p of range.series) assert.match(p.start, /T00:00:00\.000Z$/);
 	}
 	assert.equal(r['7d'].totalCost, 3);
@@ -153,6 +154,13 @@ test('schema rejects anything beyond numbers, models, timestamps and device id',
 	assert.equal(usageSnapshotSchema.safeParse(badModel).success, false);
 
 	assert.equal(usageSnapshotSchema.safeParse({ ...ok, deviceId: '../etc' }).success, false);
+
+	const ancient = { ...ok, coverageStart: '0000-01-01T00:00:00Z' };
+	assert.equal(usageSnapshotSchema.safeParse(ancient).success, false);
+	const ancientRow = { ...ok, hourly: [{ ...ok.hourly[0], hour: '2019-12-31T23:00:00Z' }] };
+	assert.equal(usageSnapshotSchema.safeParse(ancientRow).success, false);
+	const floor = { ...ok, coverageStart: '2020-01-01T00:00:00Z' };
+	assert.equal(usageSnapshotSchema.safeParse(floor).success, true);
 });
 
 test('an offline device adds no sessions to a range it has no usage in', () => {
@@ -246,4 +254,69 @@ test('a device id that matches an Object property is still an unlisted device', 
 		s.ranges['7d'].devices.map((d) => [d.name, d.cost]),
 		[['Other', 1]]
 	);
+});
+
+test('all time starts on the Monday on or before the oldest stored day and is bucketed by ISO week', () => {
+	// coverageStart is Sunday 2026-08-16, but a kept day row goes back to Saturday 2026-08-01.
+	const device = snap(
+		'mac',
+		[
+			row('2026-08-01T00:00:00Z', 'claude-opus-5-5', 7, { granularity: 'day' }),
+			row('2026-08-03T00:00:00Z', 'claude-opus-5-5', 1, { granularity: 'day' }),
+			row('2026-11-09T05:00:00Z', 'claude-opus-5-5', 2),
+			row('2026-11-14T21:00:00Z', 'claude-opus-5-5', 3)
+		],
+		1
+	);
+	const all = summarize([device], NOW, CONFIG).ranges.all;
+
+	assert.equal(all.bucket, 'week');
+	assert.equal(all.from, '2026-07-27T00:00:00.000Z');
+	assert.equal(all.to, '2026-11-15T00:00:00.000Z');
+	assert.equal(all.series.length, 16);
+	for (const [i, p] of all.series.entries()) {
+		assert.equal(new Date(p.start).getUTCDay(), 1, `point ${i} starts on a Monday`);
+		assert.match(p.start, /T00:00:00\.000Z$/);
+		assert.equal(Date.parse(p.start), Date.parse(all.from) + i * 7 * 86_400_000);
+	}
+	assert.equal(all.series[0].cost, 7);
+	assert.equal(all.series[1].cost, 1);
+	assert.equal(all.series.at(-1)?.start, '2026-11-09T00:00:00.000Z');
+	assert.equal(all.series.at(-1)?.cost, 5);
+	assert.equal(all.totalCost, 13);
+	assert.equal(all.devices[0].series.length, 16);
+	assert.deepEqual(
+		all.devices[0].series,
+		all.series.map((p) => p.cost)
+	);
+	assert.equal(all.providers[0].series.cost.length, 16);
+	assert.equal(all.providers[0].series.tokens.length, 16);
+	assert.equal(summarize([device], NOW, CONFIG).ranges['90d'].totalCost, 5);
+});
+
+test('all time starts at coverageStart when no row is older', () => {
+	const device = snap('mac', [row('2026-11-14T21:00:00Z', 'claude-opus-5-5', 3)], 1);
+	device.coverageStart = '2026-09-07T00:00:00Z'; // a Monday
+	const all = summarize([device], NOW, CONFIG).ranges.all;
+	assert.equal(all.from, '2026-09-07T00:00:00.000Z');
+	assert.equal(all.series.length, 10);
+});
+
+test('all time has no session count, the day ranges keep theirs', () => {
+	const device = snap('mac', [row('2026-11-14T21:00:00Z', 'claude-opus-5-5', 3)], 4);
+	const r = summarize([device], NOW, CONFIG).ranges;
+	assert.equal(r.all.sessions, null);
+	assert.equal(r.all.providers[0].sessions, null);
+	assert.equal(r.all.providers.length, 1);
+	assert.equal(r['90d'].sessions, 4);
+	assert.equal(r['90d'].providers[0].sessions, 4);
+});
+
+test('all time with no devices is one partial week ending today', () => {
+	const all = summarize([], NOW, CONFIG).ranges.all;
+	assert.equal(all.from, '2026-11-09T00:00:00.000Z');
+	assert.equal(all.to, '2026-11-15T00:00:00.000Z');
+	assert.equal(all.series.length, 1);
+	assert.equal(all.totalCost, 0);
+	assert.equal(all.sessions, null);
 });

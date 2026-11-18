@@ -19,7 +19,8 @@ their counts are sent. The server rejects any snapshot with extra fields, so not
 stored or served even by a modified collector.
 
 The server never publishes a device's report time (it would show when each machine is online), and
-every range is bucketed by UTC day, never by hour. Device ids are published only if you leave
+nothing is bucketed finer than a UTC day: 7, 30 and 90 days are per day, all time is per ISO week
+(Monday UTC). Device ids are published only if you leave
 `unknownDevices` at its default, see [Device names and colours](#device-names-and-colours).
 
 Before the first send you can see exactly what would leave the machine with
@@ -90,7 +91,7 @@ Remove the schedule with `big-spender uninstall`. The env file and the state are
 | Route                    | What it does                                                                                                                                 |
 | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `POST /api/usage/ingest` | Collectors post a snapshot here (gzip or plain JSON, bearer token).                                                                          |
-| `GET /api/usage`         | Merged totals for 7, 30 and 90 days as JSON, with `cache-control: public, max-age=300, stale-while-revalidate=900`.                          |
+| `GET /api/usage`         | Merged totals for 7, 30 and 90 days and all time as JSON, with `cache-control: public, max-age=300, stale-while-revalidate=900`.             |
 | `GET /`                  | A plain server-rendered page: totals per range, devices with colour swatches, top models. No JavaScript, no external assets, light and dark. |
 | `GET /healthz`           | `ok`, for load balancers and Docker.                                                                                                         |
 
@@ -107,13 +108,15 @@ Configuration comes from flags or environment variables (flags win):
 The data directory holds one `<device>.json` file per device, written atomically. Put it on a
 persistent volume. Each snapshot is merged into the device's stored history. A day the snapshot
 reports replaces that day for each provider and model. Days it does not report are kept as day
-rows, so the server keeps usage from beyond the collector's 90-day window. The public ranges still
-end at 90 days. A device file holds at most 50,000 rows. Past that, the oldest kept days are dropped
+rows, so the server keeps usage from beyond the collector's 90-day window, and the all-time range
+shows it. All time has no session count (`sessions: null`): collectors count distinct sessions
+on the device for 7, 30 and 90 days only. A device file holds at most 50,000 rows. Past that, the oldest kept days are dropped
 and the server logs a warning. A snapshot older than the stored one is ignored (`"result":
 "stale"`), so retries and duplicate posts are harmless. Files in the directory that are not valid snapshots are ignored with a warning.
 
 Ingest limits: request bodies up to 2 MB, 16 MB after decompression, `gzip` or `identity` encoding
-only. An invalid snapshot gets `422` with the first five problems.
+only. An invalid snapshot gets `422` with the first five problems. Dates before 2020-01-01 are
+invalid.
 
 ### Device names and colours
 
