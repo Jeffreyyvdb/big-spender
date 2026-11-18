@@ -107,10 +107,10 @@ Configuration comes from flags or environment variables (flags win):
 The data directory holds one `<device>.json` file per device, written atomically. Put it on a
 persistent volume. Each snapshot is merged into the device's stored history. A day the snapshot
 reports replaces that day for each provider and model. Days it does not report are kept as day
-rows, so usage stays visible beyond the collector's 90-day window. A device file holds at most
-50,000 rows. Past that, the oldest kept days are dropped and the server logs a warning. A snapshot
-older than the stored one is ignored (`"result": "stale"`), so retries and duplicate posts are
-harmless. Files in the directory that are not valid snapshots are ignored with a warning.
+rows, so the server keeps usage from beyond the collector's 90-day window. The public ranges still
+end at 90 days. A device file holds at most 50,000 rows. Past that, the oldest kept days are dropped
+and the server logs a warning. A snapshot older than the stored one is ignored (`"result":
+"stale"`), so retries and duplicate posts are harmless. Files in the directory that are not valid snapshots are ignored with a warning.
 
 Ingest limits: request bodies up to 2 MB, 16 MB after decompression, `gzip` or `identity` encoding
 only. An invalid snapshot gets `422` with the first five problems.
