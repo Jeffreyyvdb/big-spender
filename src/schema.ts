@@ -11,8 +11,9 @@ const isoDate = z.iso.datetime({ offset: true });
 export const MAX_ROWS = 50_000;
 export const DEVICE_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
 export const PROVIDERS = ['claude', 'codex'] as const;
-// Public ranges. All are day-granular: an hourly view would show when each machine is in use.
-export const RANGES = ['7d', '30d', '90d'] as const;
+// Public ranges. 7d, 30d and 90d are bucketed by UTC day, `all` by ISO week. Nothing is finer
+// than a day: an hourly view would show when each machine is in use.
+export const RANGES = ['7d', '30d', '90d', 'all'] as const;
 
 export const usageRowSchema = z.strictObject({
 	hour: isoDate,

@@ -17,7 +17,12 @@ const tokens = (n: number) =>
 
 const percent = (share: number) => `${(share * 100).toFixed(1)}%`;
 
-const LABELS: Record<UsageRange, string> = { '7d': '7 days', '30d': '30 days', '90d': '90 days' };
+const LABELS: Record<UsageRange, string> = {
+	'7d': 'Last 7 days',
+	'30d': 'Last 30 days',
+	'90d': 'Last 90 days',
+	all: 'All time'
+};
 const TOP_MODELS = 8;
 
 const STYLE = `
@@ -46,14 +51,14 @@ th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
 `;
 
 function totalsCard(r: RangeSummary): string {
-	return `<section class="card"><h3>Last ${LABELS[r.range]}</h3>
+	return `<section class="card"><h3>${LABELS[r.range]}</h3>
 <p class="cost">${usd(r.totalCost)}</p>
-<p>${r.sessions.toLocaleString('en-US')} sessions · ${tokens(r.tokens.processed)} tokens</p>
+<p>${r.sessions === null ? '' : `${r.sessions.toLocaleString('en-US')} sessions · `}${tokens(r.tokens.processed)} tokens</p>
 <p>${usd(r.cacheSavings)} saved by caching</p></section>`;
 }
 
 function devicesTable(summary: UsageSummary): string {
-	const widest = summary.ranges['90d'];
+	const widest = summary.ranges.all;
 	if (!widest.devices.length) return '<p class="empty">No devices have reported yet.</p>';
 	const rows = widest.devices.map((d) => {
 		const cells = RANGES.map((range) => {

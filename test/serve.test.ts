@@ -57,8 +57,8 @@ test('ingest, JSON summary and HTML page over HTTP', async () => {
 			const summary = (await api.json()) as {
 				ranges: Record<string, { devices: { name: string }[] }>;
 			};
-			assert.deepEqual(Object.keys(summary.ranges), ['7d', '30d', '90d']);
-			assert.equal(summary.ranges['90d'].devices[0].name, 'Mac <b>book</b>');
+			assert.deepEqual(Object.keys(summary.ranges), ['7d', '30d', '90d', 'all']);
+			assert.equal(summary.ranges.all.devices[0].name, 'Mac <b>book</b>');
 
 			const page = await fetch(`${base}/`);
 			const html = await page.text();
@@ -67,6 +67,8 @@ test('ingest, JSON summary and HTML page over HTTP', async () => {
 			assert.match(html, /background:#7fa034/);
 			assert.match(html, /Mac &#60;b&#62;book&#60;\/b&#62;/);
 			assert.match(html, /claude-opus-5-5/);
+			assert.match(html, /<h3>All time<\/h3>/);
+			assert.match(html, /<th>All time<\/th>/);
 			assert.doesNotMatch(html, /<script|https?:\/\/(?!www\.w3)/);
 		})
 	);

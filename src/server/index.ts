@@ -17,6 +17,7 @@ export {
 export { OTHER, PALETTE, resolveDevices, type DeviceConfig, type DeviceInfo } from '../devices.ts';
 export {
 	summarize,
+	type Bucket,
 	type CostByType,
 	type DeviceLine,
 	type ModelLine,
