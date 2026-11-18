@@ -62,6 +62,10 @@ export function fileStore(dir: string): SnapshotStore {
 		}
 
 		const { snapshot, droppedDays } = mergeSnapshots(current, snap);
+		// loadFromDisk skips an invalid file, which would lose the whole history.
+		if (!usageSnapshotSchema.safeParse(snapshot).success) {
+			throw new Error(`${snap.deviceId}: merged history is invalid, the stored file is kept`);
+		}
 		if (droppedDays > 0) {
 			console.warn(
 				`[big-spender] ${snap.deviceId}: history is full, dropped the oldest ${droppedDays} day(s)`

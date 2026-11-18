@@ -273,6 +273,21 @@ test('kept hourly rows become one day row with summed cost and tokens', async ()
 	});
 });
 
+test('history whose roll-up would pass a field cap still loads after a restart', async () => {
+	await withTempDir(async (dir) => {
+		const big = { ...row('2026-11-10T03:00:00Z', 'm', 1), inputTokens: 1e15 };
+		await fileStore(dir).save(
+			withRows([big, { ...big, hour: '2026-11-10T04:00:00Z' }], '2026-11-14T10:00:00Z')
+		);
+		await fileStore(dir).save(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T22:00:00Z'));
+		const [reloaded] = await fileStore(dir).list();
+		assert.deepEqual(
+			reloaded.hourly.map((r) => r.hour),
+			['2026-11-10T03:00:00Z', '2026-11-10T04:00:00Z', '2026-11-13T00:00:00Z']
+		);
+	});
+});
+
 test('over the row cap the store drops the oldest kept days and warns', async (t) => {
 	await withTempDir(async (dir) => {
 		const warn = t.mock.method(console, 'warn', () => {});

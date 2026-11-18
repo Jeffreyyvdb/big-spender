@@ -196,3 +196,40 @@ test('over the row cap the oldest kept days go and every new row stays', () => {
 	assert.equal(snapshot.coverageStart, firstKeptDay);
 	assert.ok(usageSnapshotSchema.safeParse(snapshot).success);
 });
+
+test('a roll-up that would pass a field cap keeps the stored rows', () => {
+	const big = { inputTokens: 1e15 };
+	const stored = snap([
+		row('2026-11-10T03:00:00Z', 'm', 1, big),
+		row('2026-11-10T04:00:00Z', 'm', 1, big)
+	]);
+	const next = snap([row('2026-11-13T00:00:00Z', 'm', 1, { granularity: 'day' })]);
+	const { snapshot } = mergeSnapshots(stored, next);
+	assert.deepEqual(snapshot.hourly.slice(0, 2), stored.hourly);
+	assert.ok(usageSnapshotSchema.safeParse(snapshot).success);
+});
+
+test('a kept row whose UTC day is past the schema date range is kept as is', () => {
+	const late = row('9999-12-31T23:30:00-01:00', 'm', 1);
+	const next = snap([row('2026-11-13T00:00:00Z', 'm', 1, { granularity: 'day' })]);
+	const { snapshot } = mergeSnapshots(snap([late]), next);
+	assert.deepEqual(snapshot.hourly.at(-1), late);
+	assert.ok(usageSnapshotSchema.safeParse(snapshot).success);
+});
+
+test('trimming never moves coverageStart past the new snapshot coverageStart', () => {
+	const day = (d: string, model: string) => row(`${d}T00:00:00Z`, model, 1, { granularity: 'day' });
+	const stored = snap([day('2026-01-01', 'a'), day('2026-11-13', 'b')], {
+		coverageStart: '2026-01-01T00:00:00Z'
+	});
+	const start = Date.parse('2026-11-13T00:00:00Z');
+	const next = snap(
+		Array.from({ length: MAX_ROWS - 1 }, (_, i) =>
+			row(new Date(start + i * 1000).toISOString(), 'a', 1)
+		),
+		{ coverageStart: '2026-08-16T00:00:00Z' }
+	);
+	const { snapshot, droppedDays } = mergeSnapshots(stored, next);
+	assert.equal(droppedDays, 1);
+	assert.equal(snapshot.coverageStart, '2026-08-16T00:00:00.000Z');
+});

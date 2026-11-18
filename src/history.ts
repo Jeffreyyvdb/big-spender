@@ -1,4 +1,4 @@
-import { MAX_ROWS, type UsageRow, type UsageSnapshot } from './schema.ts';
+import { MAX_ROWS, usageRowSchema, type UsageRow, type UsageSnapshot } from './schema.ts';
 
 const DAY_MS = 86_400_000;
 
@@ -26,12 +26,12 @@ function group(rows: UsageRow[]): Map<string, UsageRow[]> {
 	return out;
 }
 
-function rollUp(rows: UsageRow[]): UsageRow {
+function rollUp(rows: UsageRow[]): UsageRow[] {
 	const [first] = rows;
-	if (rows.length === 1 && first.granularity === 'day') return first;
+	if (rows.length === 1 && first.granularity === 'day') return rows;
 	const sum = (pick: (r: UsageRow) => number) => rows.reduce((total, r) => total + pick(r), 0);
 	const sessionsAtLeast = Math.max(...rows.map((r) => r.sessions));
-	return {
+	const day: UsageRow = {
 		hour: new Date(dayOf(first) * DAY_MS).toISOString(),
 		granularity: 'day',
 		provider: first.provider,
@@ -50,6 +50,8 @@ function rollUp(rows: UsageRow[]): UsageRow {
 		},
 		cacheSavingsUsd: round(sum((r) => r.cacheSavingsUsd))
 	};
+	// A sum can pass a field's cap, and a day can start outside the schema's date range.
+	return usageRowSchema.safeParse(day).success ? [day] : rows;
 }
 
 function dropOldestDays(rows: UsageRow[], excess: number): { rows: UsageRow[]; days: number } {
@@ -73,7 +75,7 @@ export function mergeSnapshots(
 	const reported = new Set(fresh.map(keyOf));
 	const kept = [...group(stored.hourly)]
 		.filter(([key]) => !reported.has(key))
-		.map(([, rows]) => rollUp(rows))
+		.flatMap(([, rows]) => rollUp(rows))
 		.sort(compareRows);
 
 	let coverage =
@@ -86,7 +88,8 @@ export function mergeSnapshots(
 	const hourly = [...trimmed.rows, ...fresh].sort(compareRows);
 	if (droppedDays > 0) {
 		const earliest = dayOf(hourly[0]) * DAY_MS;
-		if (earliest > Date.parse(coverage)) coverage = new Date(earliest).toISOString();
+		const latest = Math.min(earliest, Date.parse(next.coverageStart));
+		if (latest > Date.parse(coverage)) coverage = new Date(latest).toISOString();
 	}
 	return { snapshot: { ...next, coverageStart: coverage, hourly }, droppedDays };
 }
