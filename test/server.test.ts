@@ -4,8 +4,10 @@ import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { createBigSpender } from '../src/server/index.ts';
+import { fileStore } from '../src/store.ts';
 import type { DeviceConfig } from '../src/devices.ts';
-import { snapshot, withTempDir } from './helpers.ts';
+import { MAX_ROWS, usageSnapshotSchema, type UsageRow, type UsageSnapshot } from '../src/schema.ts';
+import { row, snapshot, withTempDir } from './helpers.ts';
 
 const TOKEN = 'secret-token';
 const NOW = Date.parse('2026-11-14T22:30:00Z');
@@ -143,6 +145,156 @@ test('an older snapshot than the stored one is stale and changes nothing', async
 
 		const same = await bs.ingest(postJson(snapshot('mac', '2026-11-14T22:00:00Z', 6)));
 		assert.equal(((await same.json()) as { result: string }).result, 'stored');
+	});
+});
+
+const dayRow = (day: string, model: string, cost: number): UsageRow => ({
+	...row(`${day}T00:00:00Z`, model, cost),
+	granularity: 'day'
+});
+
+const withRows = (hourly: UsageRow[], generatedAt: string, extra: Partial<UsageSnapshot> = {}) => ({
+	...snapshot('mac', generatedAt),
+	hourly,
+	...extra
+});
+
+test('a day older than the new snapshot window survives and counts in the 90d total', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(postJson(withRows([dayRow('2026-09-20', 'm', 3)], '2026-11-14T10:00:00Z')));
+		await bs.ingest(postJson(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T22:00:00Z')));
+		const ranges = (await bs.summary(NOW)).ranges;
+		assert.equal(ranges['90d'].totalCost, 8);
+		assert.equal(ranges['30d'].totalCost, 5);
+	});
+});
+
+test('re-pushing the same snapshot leaves the file bytes identical', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(postJson(withRows([dayRow('2026-09-20', 'm', 3)], '2026-11-14T10:00:00Z')));
+		const next = withRows([row('2026-11-13T05:00:00Z', 'm', 5)], '2026-11-14T22:00:00Z');
+		await bs.ingest(postJson(next));
+		const first = await readFile(join(dir, 'mac.json'), 'utf8');
+		await bs.ingest(postJson(next));
+		assert.equal(await readFile(join(dir, 'mac.json'), 'utf8'), first);
+	});
+});
+
+test('a correction replaces the day instead of adding to it', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(postJson(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T10:00:00Z')));
+		await bs.ingest(postJson(withRows([dayRow('2026-11-13', 'm', 2)], '2026-11-14T22:00:00Z')));
+		assert.equal((await bs.summary(NOW)).ranges['7d'].totalCost, 2);
+	});
+});
+
+test('a snapshot with fewer days does not erase stored days', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		const days = (from: number, to: number) =>
+			Array.from({ length: to - from + 1 }, (_, i) =>
+				dayRow(
+					new Date(Date.parse('2026-09-01T00:00:00Z') + (from + i) * 86_400_000)
+						.toISOString()
+						.slice(0, 10),
+					'm',
+					1
+				)
+			);
+		await bs.ingest(postJson(withRows(days(0, 59), '2026-11-14T10:00:00Z')));
+		await bs.ingest(postJson(withRows(days(0, 29), '2026-11-14T22:00:00Z')));
+		const stored = JSON.parse(await readFile(join(dir, 'mac.json'), 'utf8'));
+		assert.equal(stored.hourly.length, 60);
+		assert.equal((await bs.summary(NOW)).ranges['90d'].totalCost, 60);
+	});
+});
+
+test('a day that moves from hourly rows to a daily row is not double counted', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(
+			postJson(
+				withRows(
+					[row('2026-11-12T03:00:00Z', 'm', 2), row('2026-11-12T15:00:00Z', 'm', 2)],
+					'2026-11-14T10:00:00Z'
+				)
+			)
+		);
+		await bs.ingest(postJson(withRows([dayRow('2026-11-12', 'm', 6)], '2026-11-14T22:00:00Z')));
+		assert.equal((await bs.summary(NOW)).ranges['7d'].totalCost, 6);
+	});
+});
+
+test('a stale snapshot leaves the merged history unchanged', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(postJson(withRows([dayRow('2026-09-20', 'm', 3)], '2026-11-14T10:00:00Z')));
+		await bs.ingest(postJson(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T22:00:00Z')));
+		const before = await readFile(join(dir, 'mac.json'), 'utf8');
+		const stale = await bs.ingest(
+			postJson(withRows([dayRow('2026-11-13', 'm', 99)], '2026-11-14T12:00:00Z'))
+		);
+		assert.equal(((await stale.json()) as { result: string }).result, 'stale');
+		assert.equal(await readFile(join(dir, 'mac.json'), 'utf8'), before);
+	});
+});
+
+test('the merged history reloads from disk', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(postJson(withRows([dayRow('2026-09-20', 'm', 3)], '2026-11-14T10:00:00Z')));
+		await bs.ingest(postJson(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T22:00:00Z')));
+		assert.equal((await setup(dir).summary(NOW)).ranges['90d'].totalCost, 8);
+	});
+});
+
+test('kept hourly rows become one day row with summed cost and tokens', async () => {
+	await withTempDir(async (dir) => {
+		const bs = setup(dir);
+		await bs.ingest(
+			postJson(
+				withRows(
+					[row('2026-09-20T03:00:00Z', 'm', 1), row('2026-09-20T09:00:00Z', 'm', 3)],
+					'2026-11-14T10:00:00Z'
+				)
+			)
+		);
+		await bs.ingest(postJson(withRows([dayRow('2026-11-13', 'm', 5)], '2026-11-14T22:00:00Z')));
+		const stored = JSON.parse(await readFile(join(dir, 'mac.json'), 'utf8')) as UsageSnapshot;
+		const [kept] = stored.hourly;
+		assert.equal(stored.hourly.length, 2);
+		assert.equal(kept.granularity, 'day');
+		assert.equal(kept.hour, '2026-09-20T00:00:00.000Z');
+		assert.equal(kept.inputTokens, 20);
+		assert.equal(kept.costUsd.cacheRead, 2);
+	});
+});
+
+test('over the row cap the store drops the oldest kept days and warns', async (t) => {
+	await withTempDir(async (dir) => {
+		const warn = t.mock.method(console, 'warn', () => {});
+		const store = fileStore(dir);
+		const old = Array.from({ length: 5 }, (_, d) => dayRow(`2026-01-0${d + 1}`, 'm', 1));
+		await store.save(withRows(old, '2026-11-14T10:00:00Z'));
+
+		const base = Date.parse('2026-11-13T00:00:00Z');
+		const fresh = Array.from({ length: MAX_ROWS - 3 }, (_, i) =>
+			row(new Date(base + i * 1000).toISOString(), 'm', 1)
+		);
+		const result = await store.save(
+			withRows(fresh, '2026-11-14T22:00:00Z', { coverageStart: '2026-11-13T00:00:00Z' })
+		);
+		assert.equal(result, 'stored');
+
+		const stored = JSON.parse(await readFile(join(dir, 'mac.json'), 'utf8'));
+		assert.ok(usageSnapshotSchema.safeParse(stored).success);
+		assert.equal(stored.hourly.length, MAX_ROWS);
+		assert.equal(stored.hourly[0].hour, '2026-01-03T00:00:00Z');
+		assert.equal(warn.mock.callCount(), 1);
+		assert.match(String(warn.mock.calls[0].arguments[0]), /mac.*2 day/);
 	});
 });
 

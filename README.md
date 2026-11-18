@@ -4,9 +4,10 @@ See what your AI coding agents would cost at API prices, summed across all your 
 
 Each machine runs a small collector every hour. It reads that machine's Claude Code and Codex
 session logs, works out hourly token and cost totals at [LiteLLM](https://github.com/BerriAI/litellm)
-API prices, and posts one snapshot (the last 90 days) to a server you run. The server keeps the
-latest snapshot per device, adds the devices together, and serves the totals as JSON and as a plain
-HTML page. You can also embed the server side in your own app and draw the numbers however you like.
+API prices, and posts one snapshot (the last 90 days) to a server you run. The server merges each
+snapshot into that device's stored history, adds the devices together, and serves the totals as
+JSON and as a plain HTML page. You can also embed the server side in your own app and draw the
+numbers however you like.
 
 The collector has no dependencies and needs Node 20 or newer. The package depends on `zod` only.
 
@@ -104,9 +105,12 @@ Configuration comes from flags or environment variables (flags win):
 |             | `BIG_SPENDER_INGEST_TOKEN` | none: ingest is off and answers `503`                |
 
 The data directory holds one `<device>.json` file per device, written atomically. Put it on a
-persistent volume. A snapshot older than the stored one is ignored (`"result": "stale"`), so retries
-and duplicate posts are harmless. Files in the directory that are not valid snapshots are ignored
-with a warning.
+persistent volume. Each snapshot is merged into the device's stored history. A day the snapshot
+reports replaces that day for each provider and model. Days it does not report are kept as day
+rows, so usage stays visible beyond the collector's 90-day window. A device file holds at most
+50,000 rows. Past that, the oldest kept days are dropped and the server logs a warning. A snapshot
+older than the stored one is ignored (`"result": "stale"`), so retries and duplicate posts are
+harmless. Files in the directory that are not valid snapshots are ignored with a warning.
 
 Ingest limits: request bodies up to 2 MB, 16 MB after decompression, `gzip` or `identity` encoding
 only. An invalid snapshot gets `422` with the first five problems.

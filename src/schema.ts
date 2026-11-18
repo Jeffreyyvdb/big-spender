@@ -8,6 +8,7 @@ const tokens = z.number().int().nonnegative().max(1e15);
 const usd = z.number().nonnegative().max(1e9);
 const isoDate = z.iso.datetime({ offset: true });
 
+export const MAX_ROWS = 50_000;
 export const DEVICE_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
 export const PROVIDERS = ['claude', 'codex'] as const;
 // Public ranges. All are day-granular: an hourly view would show when each machine is in use.
@@ -47,7 +48,7 @@ export const usageSnapshotSchema = z.strictObject({
 		.string()
 		.max(80)
 		.regex(/^[A-Za-z0-9@._:/-]+$/),
-	hourly: z.array(usageRowSchema).max(50_000),
+	hourly: z.array(usageRowSchema).max(MAX_ROWS),
 	sessionsTotal: z.number().int().nonnegative(),
 	// Distinct sessions per range, counted on the device (session ids are never sent).
 	sessionCounts: z
