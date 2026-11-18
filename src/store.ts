@@ -1,15 +1,12 @@
 import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { mergeSnapshots } from './history.ts';
 import { DEVICE_ID, usageSnapshotSchema, type UsageSnapshot } from './schema.ts';
 
 export type SaveResult = 'stored' | 'stale';
 
 export type SnapshotStore = {
 	list(): Promise<UsageSnapshot[]>;
-	/**
-	 * Overwrites the device's snapshot. A snapshot older than the stored one is ignored, so
-	 * retries and duplicate posts are harmless.
-	 */
 	save(snapshot: UsageSnapshot): Promise<SaveResult>;
 };
 
@@ -40,31 +37,48 @@ async function loadFromDisk(dir: string): Promise<Map<string, UsageSnapshot>> {
 	return out;
 }
 
-/** Latest snapshot per device, one JSON file each, in `dir`. Put it on a persistent volume. */
 export function fileStore(dir: string): SnapshotStore {
 	const root = resolve(dir);
 	let loading: Promise<Map<string, UsageSnapshot>> | null = null;
 	const snapshots = () => (loading ??= loadFromDisk(root));
+	let previousSave: Promise<unknown> = Promise.resolve();
 
 	return {
 		async list() {
 			return [...(await snapshots()).values()];
 		},
-		async save(snap) {
-			const all = await snapshots();
-			const current = all.get(snap.deviceId);
-			if (current && Date.parse(current.generatedAt) > Date.parse(snap.generatedAt)) {
-				return 'stale';
-			}
-
-			await mkdir(root, { recursive: true });
-			const file = join(root, `${snap.deviceId}.json`);
-			const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-			await writeFile(tmp, JSON.stringify(snap));
-			await rename(tmp, file);
-
-			all.set(snap.deviceId, snap);
-			return 'stored';
+		save(snap) {
+			const run = previousSave.then(() => save(snap));
+			previousSave = run.catch(() => {});
+			return run;
 		}
 	};
+
+	async function save(snap: UsageSnapshot): Promise<SaveResult> {
+		const all = await snapshots();
+		const current = all.get(snap.deviceId);
+		if (current && Date.parse(current.generatedAt) > Date.parse(snap.generatedAt)) {
+			return 'stale';
+		}
+
+		const { snapshot, droppedDays } = mergeSnapshots(current, snap);
+		// loadFromDisk skips an invalid file, which would lose the whole history.
+		if (!usageSnapshotSchema.safeParse(snapshot).success) {
+			throw new Error(`${snap.deviceId}: merged history is invalid, the stored file is kept`);
+		}
+		if (droppedDays > 0) {
+			console.warn(
+				`[big-spender] ${snap.deviceId}: history is full, dropped the oldest ${droppedDays} day(s)`
+			);
+		}
+
+		await mkdir(root, { recursive: true });
+		const file = join(root, `${snap.deviceId}.json`);
+		const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+		await writeFile(tmp, JSON.stringify(snapshot));
+		await rename(tmp, file);
+
+		all.set(snap.deviceId, snapshot);
+		return 'stored';
+	}
 }
