@@ -1,0 +1,50 @@
+version: 2
+updates:
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 10
+    # Defense against supply-chain attacks: only propose versions that have been
+    # on the registry long enough for malicious releases to be caught and pulled.
+    # Security updates are not subject to the cooldown.
+    cooldown:
+      default-days: 5
+      semver-major-days: 7
+      semver-minor-days: 5
+      semver-patch-days: 3
+      include:
+        - '*'
+    # `fix(deps)` on a runtime dependency cuts a patch release; `chore(deps)`
+    # on a dev dependency releases nothing.
+    commit-message:
+      prefix: 'fix(deps)'
+      prefix-development: 'chore(deps)'
+      include: 'scope'
+    # Patch and minor bumps come in one PR per dependency type; majors stay separate.
+    groups:
+      production-deps:
+        dependency-type: 'production'
+        update-types:
+          - 'patch'
+          - 'minor'
+      development-deps:
+        dependency-type: 'development'
+        update-types:
+          - 'patch'
+          - 'minor'
+
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    # This ecosystem only supports `default-days`.
+    cooldown:
+      default-days: 5
+    commit-message:
+      prefix: 'chore(ci)'
+      include: 'scope'
+    groups:
+      github-actions:
+        patterns:
+          - '*'
