@@ -154,6 +154,13 @@ test('schema rejects anything beyond numbers, models, timestamps and device id',
 	assert.equal(usageSnapshotSchema.safeParse(badModel).success, false);
 
 	assert.equal(usageSnapshotSchema.safeParse({ ...ok, deviceId: '../etc' }).success, false);
+
+	const ancient = { ...ok, coverageStart: '0000-01-01T00:00:00Z' };
+	assert.equal(usageSnapshotSchema.safeParse(ancient).success, false);
+	const ancientRow = { ...ok, hourly: [{ ...ok.hourly[0], hour: '2019-12-31T23:00:00Z' }] };
+	assert.equal(usageSnapshotSchema.safeParse(ancientRow).success, false);
+	const floor = { ...ok, coverageStart: '2020-01-01T00:00:00Z' };
+	assert.equal(usageSnapshotSchema.safeParse(floor).success, true);
 });
 
 test('an offline device adds no sessions to a range it has no usage in', () => {

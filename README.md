@@ -115,7 +115,8 @@ and the server logs a warning. A snapshot older than the stored one is ignored (
 "stale"`), so retries and duplicate posts are harmless. Files in the directory that are not valid snapshots are ignored with a warning.
 
 Ingest limits: request bodies up to 2 MB, 16 MB after decompression, `gzip` or `identity` encoding
-only. An invalid snapshot gets `422` with the first five problems.
+only. An invalid snapshot gets `422` with the first five problems. Dates before 2020-01-01 are
+invalid.
 
 ### Device names and colours
 

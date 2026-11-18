@@ -6,7 +6,12 @@ import { z } from 'zod';
 
 const tokens = z.number().int().nonnegative().max(1e15);
 const usd = z.number().nonnegative().max(1e9);
-const isoDate = z.iso.datetime({ offset: true });
+// No AI coding agent usage predates 2020. The floor also bounds the all-time range: it is
+// bucketed by week from the oldest date, so year 0 would mean 100,000+ points per series.
+export const EARLIEST_DATE = '2020-01-01T00:00:00Z';
+const isoDate = z.iso
+	.datetime({ offset: true })
+	.refine((s) => Date.parse(s) >= Date.parse(EARLIEST_DATE), `must be ${EARLIEST_DATE} or later`);
 
 export const MAX_ROWS = 50_000;
 export const DEVICE_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
