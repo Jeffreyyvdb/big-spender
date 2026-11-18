@@ -1,0 +1,47 @@
+name: Release
+
+# Every push to main runs semantic-release. It reads the Conventional Commits since
+# the last `v*` tag, and when they call for a release it publishes the package to npm,
+# then creates the tag and a GitHub Release. `chore:`/`docs:`/`test:` etc. release nothing.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag, create the GitHub Release
+      issues: write # comment on released issues
+      pull-requests: write # comment on released PRs
+      id-token: write # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # semantic-release walks the tags
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+      # No NPM_TOKEN: @semantic-release/npm exchanges the job's OIDC token for a
+      # short-lived publish token, which works once npmjs.com lists this workflow
+      # as the package's trusted publisher. Provenance is attached automatically.
+      - run: npx semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
