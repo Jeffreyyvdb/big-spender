@@ -248,21 +248,32 @@ own storage or charts.
 ## Usage limits
 
 Besides cost, the collector records when you run out of your Claude and Codex subscription
-allowance, so you can judge whether a plan fits how you work. It reads only what the agents already
-write to their local logs. It reads no credentials and makes no new network calls.
+allowance, so you can judge whether a plan fits how you work. It reads what the agents write to
+their local logs, and it polls their usage endpoints (see [Polling](#polling-usage-endpoints)).
 
 - **Claude Code.** A refused request is logged as an `assistant` line with `error: "rate_limit"`
   and a `quotaLimits` object that names the window (`five_hour`, `seven_day`, a model-specific
   weekly window such as `seven_day_opus`) and when it resets. Retries repeat the line, so one
-  blocked window becomes one record. Claude Code logs nothing when a request is allowed, so
-  utilisation below 100% is unknown for Claude.
+  blocked window becomes one record. Claude Code logs nothing when a request is allowed, so the logs
+  alone say nothing about utilisation below 100%; polling fills that in.
 - **Codex.** `token_count` events carry `rate_limits` with the used percentage and reset time of the
-  5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). Codex
-  is the only source of utilisation below 100%. A window counts as hit when its share reaches 100%.
+  5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). A
+  window counts as hit when its share reaches 100%. A refused turn is logged too, but names no
+  window and no reset. It starts the lockout of each Codex window seen full (by a poll or any log
+  line) that was open at that moment, so the lockout begins at the first logged refusal instead of
+  at the next poll. When no open window was seen full, a lockout that began and
+  ended between two runs can still be placed by elimination. Usage in a window instance only rises
+  until it resets, so a poll that read an instance below 100% after the refusal proves it was not
+  the one blocking. This needs a successful poll in the same run that read both Codex windows, and
+  every limit it reports must have an instance on file that was open at the refusal. If exactly one open window is then left,
+  it gets the hit at the refusal. The gap that remains is a refusal whose window no reading ever
+  saw, one where several windows stay possible, and any refusal read while polling is off or
+  failing. These change nothing.
 
 A record is one window instance, identified by provider, window name and reset time rounded down
 to the minute. Reports whose resets are at most two minutes apart are the same window, because one
-window's reported reset can drift by a few seconds. It holds the peak percentage seen and the time of the first refusal. Limits belong
+window's reported reset can drift by a few seconds. A push sends at most the 5,000 newest records,
+the most the server accepts. It holds the peak percentage seen and the time of the first refusal. Limits belong
 to the account, not the machine, so merging keeps the highest peak and the earliest refusal, and
 two machines that report the same window count once. Records are kept for 90 days on the collector and up to 5,000 windows on the
 server, like day rows.
@@ -277,9 +288,27 @@ finer than a UTC day, no device names, no report times. It is separate from `/ap
 shape did not change. `big-spender status` also lists the limits hit in the last 7 days, to the
 minute, because that output never leaves the machine.
 
-Polling the Anthropic or OpenAI usage endpoints would show utilisation for Claude too, but it needs
-your OAuth credentials, so it is not done. The record shape already has room for it: a polled
-percentage is just another peak for the same window.
+### Polling usage endpoints
+
+Logs only show a limit when a request is refused, which hides how much of a window you leave
+unused. So each run also asks Anthropic and OpenAI how full your windows are right now, the same
+numbers `/usage` in Claude Code and Codex show. Claude is polled at `api.anthropic.com` and Codex at
+`chatgpt.com`, with the login the agent already keeps: `~/.claude/.credentials.json`
+(`$CLAUDE_CONFIG_DIR` if set) and `~/.codex/auth.json` (`$CODEX_HOME` if set). The collector opens
+those files read-only, never refreshes them and sends the token only to that provider. If a token
+has expired, that provider is skipped with one warning until you run the agent again. A missing
+file means that provider is not polled, without a warning. A failed poll never fails the run.
+
+Each reading is a peak for the same window record the logs feed. Windows are named `five_hour` and
+`seven_day`, plus one `seven_day_<model>` per model-specific weekly (`seven_day_fable`,
+`seven_day_opus`). Codex's extra limits become `<window>_<limit name>`. Only the window name, reset
+time and percentage are stored or sent.
+
+Claude Code logs a refusal of Fable's weekly as `seven_day_overage_included` and labels it "Fable
+limit". The endpoint reports the same limit as `seven_day_fable`, so the collector records those
+refusals as `seven_day_fable`, and they join the polled readings in one record.
+
+To turn polling off, set `BIG_SPENDER_POLL_LIMITS=off` in the env file.
 
 An older server rejects the unknown `limits` field with a 422. The collector and `push` then send
 the snapshot again without it and print a warning on each run, so usage keeps arriving. Upgrade the server to store

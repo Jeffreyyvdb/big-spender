@@ -18,7 +18,8 @@
 //   node collector.mjs --reset      # forget local state and rescan everything
 //
 // Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
-// BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_EXPERIMENTAL (see templates/env.example).
+// BIG_SPENDER_CURSOR_API_KEY, BIG_SPENDER_EXPERIMENTAL and BIG_SPENDER_POLL_LIMITS=off (see
+// templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
@@ -72,13 +73,14 @@ const ENV_FILE =
 
 const log = (...m) => console.error('[big-spender]', ...m);
 
-// The override exists for tests. It only points at this machine, so the Cursor API key and
-// access token can't be sent anywhere but Cursor.
-function cursorApiUrl(override) {
-	if (!override) return 'https://api2.cursor.sh';
+// The overrides exist for tests. They only point at this machine, so keys and tokens can't be
+// sent anywhere but the service they belong to.
+function localOverride(name, defaultUrl) {
+	const override = process.env[name];
+	if (!override) return defaultUrl;
 	const { hostname } = new URL(override);
 	if (!['127.0.0.1', 'localhost', '[::1]'].includes(hostname)) {
-		throw new Error('BIG_SPENDER_CURSOR_API_URL may only point at this machine');
+		throw new Error(`${name} may only point at this machine`);
 	}
 	return override.replace(/\/$/, '');
 }
@@ -151,6 +153,8 @@ async function acquireLock() {
 const FIX_CLAUDE_OUTPUT = 'claude-final-output';
 // Limit windows are read from log lines older versions skipped, so those logs are re-read once.
 const FIX_LIMITS = 'usage-limits';
+// Codex refusals are read from the logs too, so those logs are re-read once.
+const FIX_CODEX_REFUSALS = 'codex-refusals';
 
 /** @returns {Promise<State>} */
 async function loadState() {
@@ -160,7 +164,7 @@ async function loadState() {
 		seen: {},
 		buckets: {},
 		limits: {},
-		fixes: [FIX_CLAUDE_OUTPUT, FIX_LIMITS]
+		fixes: [FIX_CLAUDE_OUTPUT, FIX_LIMITS, FIX_CODEX_REFUSALS]
 	};
 	if (RESET) return empty;
 	try {
@@ -177,6 +181,10 @@ async function loadState() {
 		if (!s.fixes.includes(FIX_LIMITS)) {
 			s.fixes.push(FIX_LIMITS);
 			s.rescan = [...new Set([...(s.rescan ?? []), 'claude', 'codex'])];
+		}
+		if (!s.fixes.includes(FIX_CODEX_REFUSALS)) {
+			s.fixes.push(FIX_CODEX_REFUSALS);
+			s.rescan = [...new Set([...(s.rescan ?? []), 'codex'])];
 		}
 		return s;
 	} catch {
@@ -253,23 +261,28 @@ const MINUTE_MS = 60_000;
 const RESET_SLACK_MS = 2 * MINUTE_MS;
 // Times outside this range are malformed (milliseconds read as seconds, say) and are skipped,
 // never thrown, so a bad limit line cannot stop the usage on the lines after it.
+// The server rejects a push with more limit records than this (MAX_LIMIT_WINDOWS in src/schema.ts),
+// and it keeps the newest, so a push sends the newest.
+const MAX_LIMIT_WINDOWS = 5_000;
 const LIMIT_TIMES_FROM = Date.parse('2020-01-01T00:00:00Z');
 const LIMIT_TIMES_TO = Date.parse('2100-01-01T00:00:00Z');
 const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
 
 /**
+ * Returns the window name and reset time the record ended up with, or nothing when it was rejected.
  * @param {State} state
  * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
  */
 function addLimit(state, w) {
+	const { window } = w;
 	let resetsAtMs = Math.floor(w.resetsAtMs / MINUTE_MS) * MINUTE_MS;
-	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(w.window)) return;
+	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(window)) return;
 	if (w.hitMs !== undefined && !plausibleTime(w.hitMs)) return;
 	state.limits ??= {};
 	let prev;
 	for (const [key, l] of Object.entries(state.limits)) {
 		const gap = Math.abs(Date.parse(l.resetsAt) - resetsAtMs);
-		if (l.provider !== w.provider || l.window !== w.window || gap > RESET_SLACK_MS) continue;
+		if (l.provider !== w.provider || l.window !== window || gap > RESET_SLACK_MS) continue;
 		if (prev && gap >= Math.abs(Date.parse(prev[1].resetsAt) - resetsAtMs)) continue;
 		prev = [key, l];
 	}
@@ -279,14 +292,20 @@ function addLimit(state, w) {
 	}
 	const hits = [prev?.[1].hitAt && Date.parse(prev[1].hitAt), w.hitMs].filter(Number.isFinite);
 	const percent = Math.min(100, Math.max(0, w.percent));
-	state.limits[`${w.provider}|${w.window}|${resetsAtMs}`] = {
+	state.limits[`${w.provider}|${window}|${resetsAtMs}`] = {
 		provider: w.provider,
-		window: w.window,
+		window,
 		resetsAt: new Date(resetsAtMs).toISOString(),
 		peakPercent: Math.max(prev?.[1].peakPercent ?? 0, percent),
 		...(hits.length ? { hitAt: new Date(Math.min(...hits)).toISOString() } : {})
 	};
+	return { window, resetsAtMs };
 }
+
+// Claude Code logs Fable's weekly as seven_day_overage_included and labels it "Fable limit". The
+// usage endpoint calls the same limit seven_day_fable, and the server merges pushes by name, so the
+// name has to be right when the record is created or the limit would show as two rows.
+const CLAUDE_LOG_WINDOWS = { seven_day_overage_included: 'seven_day_fable' };
 
 // Claude Code logs a refused request as a synthetic assistant line carrying quotaLimits.
 // One blocked window repeats on every retry; the key makes the repeats one record.
@@ -295,12 +314,13 @@ function claudeLimit(state, o) {
 	if (q?.status !== 'rejected' || typeof q.rateLimitType !== 'string') return;
 	const ts = Date.parse(o.timestamp);
 	if (!Number.isFinite(ts) || !(q.resetsAt > 0)) return;
+	const raw = q.rateLimitType
+		.toLowerCase()
+		.replace(/[^a-z0-9_]/g, '_')
+		.slice(0, 40);
 	addLimit(state, {
 		provider: 'claude',
-		window: q.rateLimitType
-			.toLowerCase()
-			.replace(/[^a-z0-9_]/g, '_')
-			.slice(0, 40),
+		window: CLAUDE_LOG_WINDOWS[raw] ?? raw,
 		resetsAtMs: q.resetsAt * 1000,
 		percent: 100,
 		hitMs: ts
@@ -333,6 +353,265 @@ function codexLimits(state, o, rateLimits) {
 			...(hit ? { hitMs: ts } : {})
 		});
 	}
+}
+
+// A window's length in ms from its name: a CODEX_WINDOW_NAMES base or `<N>m`, then an optional
+// `_<suffix>` for an additional limit.
+function codexWindowMs(window) {
+	for (const [minutes, base] of Object.entries(CODEX_WINDOW_NAMES)) {
+		if (window === base || window.startsWith(`${base}_`)) return Number(minutes) * MINUTE_MS;
+	}
+	const m = /^(\d+)m(_|$)/.exec(window);
+	return m ? Number(m[1]) * MINUTE_MS : NaN;
+}
+
+// A refused Codex turn names no window and no reset, so it starts the lockout of every window
+// already seen full that was open at the time. With none seen full, it falls to elimination.
+// Usage within an instance only rises until its reset, so this run's poll reading below 100%
+// (taken after the refusal) proves the instance was not full at ts. That only settles it when
+// the poll read both Codex windows, every limit it reports had an instance on file at ts, and
+// exactly one is not ruled out. polled holds this run's Codex poll readings; it is empty when
+// the poll was off or failed. Runs after the whole scan, once every log reading is on file.
+function codexRefusal(state, ts, polled) {
+	const open = Object.values(state.limits ?? {}).filter((l) => {
+		const resetsAtMs = Date.parse(l.resetsAt);
+		return l.provider === 'codex' && ts > resetsAtMs - codexWindowMs(l.window) && ts <= resetsAtMs;
+	});
+	const full = open.filter((l) => l.peakPercent >= 100);
+	const readBelowFull = (l) =>
+		polled.some(
+			(r) =>
+				r.percent < 100 &&
+				r.window === l.window &&
+				Math.abs(r.resetsAtMs - Date.parse(l.resetsAt)) <= RESET_SLACK_MS
+		);
+	// A window the poll reports as null (not in use now) may have blocked and reset since, so
+	// elimination needs a reading of both Codex windows.
+	const polledNames = new Set(polled.map((r) => r.window));
+	const accountedFor =
+		Object.values(CODEX_WINDOW_NAMES).every((n) => polledNames.has(n)) &&
+		[...polledNames].every((n) => open.some((l) => l.window === n));
+	const left = accountedFor ? open.filter((l) => !readBelowFull(l)) : [];
+	const blockers = full.length ? full : left.length === 1 ? left : [];
+	for (const l of blockers) {
+		addLimit(state, {
+			provider: 'codex',
+			window: l.window,
+			resetsAtMs: Date.parse(l.resetsAt),
+			percent: 100,
+			hitMs: ts
+		});
+	}
+}
+
+const isCodexRefusal = (p) => {
+	const err = p.type === 'task_complete' ? p.error : p.type === 'error' ? p : null;
+	if (!err || typeof err !== 'object') return false;
+	return (
+		err.codex_error_info === 'usage_limit_exceeded' ||
+		(typeof err.message === 'string' && /usage limit/i.test(err.message))
+	);
+};
+
+// ---------------------------------------------------------------------------
+// Limit polling
+//
+// Logs only show a limit when a request is refused. Each provider's own usage endpoint also
+// reports how full every window is right now, so polling it sees the unused part too. The login
+// files the agents keep are opened read-only and never refreshed; the token goes to the
+// provider's own host and nowhere else.
+
+const slug = (s) =>
+	s
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '');
+
+const claudeResetMs = (resetsAt) => (typeof resetsAt === 'string' ? Date.parse(resetsAt) : NaN);
+
+function claudeWindows(body) {
+	const out = [];
+	const add = (window, percent, resetsAtMs) => {
+		if (Number.isFinite(percent) && Number.isFinite(resetsAtMs)) {
+			out.push({ window: window.slice(0, 40), percent, resetsAtMs });
+		}
+	};
+	for (const [key, w] of Object.entries(body)) {
+		if (/^(five_hour|seven_day)(_[a-z0-9_]+)?$/.test(key) && w && typeof w === 'object') {
+			add(key, w.utilization, claudeResetMs(w.resets_at));
+		}
+	}
+	for (const l of Array.isArray(body.limits) ? body.limits : []) {
+		const model = l?.scope?.model?.display_name;
+		if (l?.kind === 'weekly_scoped' && typeof model === 'string' && slug(model)) {
+			add(`seven_day_${slug(model)}`, l.percent, claudeResetMs(l.resets_at));
+		}
+	}
+	return out;
+}
+
+const CODEX_SLOTS = ['primary_window', 'secondary_window'];
+
+function codexWindows(body, nowMs) {
+	const out = [];
+	const add = (rateLimit, suffix) => {
+		for (const slot of CODEX_SLOTS) {
+			const w = rateLimit?.[slot];
+			if (!w || typeof w.used_percent !== 'number') continue;
+			const minutes = w.limit_window_seconds / 60;
+			const resetsAtMs =
+				w.reset_at > 0 ? w.reset_at * 1000 : nowMs + Number(w.reset_after_seconds) * 1000;
+			if (!Number.isFinite(minutes) || !Number.isFinite(resetsAtMs)) continue;
+			const base = CODEX_WINDOW_NAMES[minutes] ?? `${minutes}m`;
+			out.push({
+				window: (suffix ? `${base}_${suffix}` : base).slice(0, 40),
+				percent: w.used_percent,
+				resetsAtMs
+			});
+		}
+	};
+	add(body.rate_limit, '');
+	for (const extra of Array.isArray(body.additional_rate_limits)
+		? body.additional_rate_limits
+		: []) {
+		const name = typeof extra?.limit_name === 'string' ? slug(extra.limit_name) : '';
+		if (name) add(extra.rate_limit, name);
+	}
+	return out;
+}
+
+// The access token is a JWT; its payload says when it expires. One that can't be decoded is sent
+// anyway and the endpoint decides.
+function jwtExpiresMs(token) {
+	try {
+		const exp = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).exp;
+		return typeof exp === 'number' ? exp * 1000 : NaN;
+	} catch {
+		return NaN;
+	}
+}
+
+// headers() returns the request headers, or a string saying why this provider is skipped.
+const LIMIT_POLLERS = {
+	claude: {
+		credentialsPath: () =>
+			join(process.env.CLAUDE_CONFIG_DIR || join(HOME, '.claude'), '.credentials.json'),
+		url: 'https://api.anthropic.com/api/oauth/usage?skip_spend=1',
+		urlEnv: 'BIG_SPENDER_CLAUDE_USAGE_URL',
+		headers: (creds, nowMs) => {
+			const oauth = creds?.claudeAiOauth;
+			if (typeof oauth?.accessToken !== 'string' || !oauth.accessToken) {
+				return 'not signed in with a Claude subscription';
+			}
+			if (typeof oauth.expiresAt === 'number' && oauth.expiresAt <= nowMs) {
+				return 'the login token expired; run Claude Code once to refresh it';
+			}
+			return {
+				authorization: `Bearer ${oauth.accessToken}`,
+				'anthropic-beta': 'oauth-2025-04-20',
+				'user-agent': 'big-spender'
+			};
+		},
+		windows: claudeWindows
+	},
+	codex: {
+		credentialsPath: () => join(process.env.CODEX_HOME || join(HOME, '.codex'), 'auth.json'),
+		url: 'https://chatgpt.com/backend-api/wham/usage',
+		urlEnv: 'BIG_SPENDER_CODEX_USAGE_URL',
+		headers: (creds, nowMs) => {
+			const { access_token: token, account_id: accountId } = creds?.tokens ?? {};
+			if (typeof token !== 'string' || !token) return 'not signed in with ChatGPT';
+			if (typeof accountId !== 'string' || !accountId) return 'no ChatGPT account id in the login';
+			if (jwtExpiresMs(token) <= nowMs) {
+				return 'the login token expired; run Codex once to refresh it';
+			}
+			return {
+				authorization: `Bearer ${token}`,
+				'chatgpt-account-id': accountId,
+				'user-agent': 'big-spender'
+			};
+		},
+		windows: codexWindows
+	}
+};
+
+async function pollLimit(state, provider, poller, nowMs, polled) {
+	const path = poller.credentialsPath();
+	if (!existsSync(path)) return;
+	let creds;
+	try {
+		creds = JSON.parse(readFileSync(path, 'utf8'));
+	} catch {
+		// JSON.parse quotes part of the text in its error, which here would be a token.
+		throw new Error('could not read the login file');
+	}
+	const headers = poller.headers(creds, nowMs);
+	if (typeof headers === 'string') throw new Error(headers);
+	for (const value of Object.values(headers))
+		assertHeaderSafe(value.replace(/^Bearer /, ''), `the ${provider} login token`);
+
+	let res;
+	try {
+		res = await fetch(localOverride(poller.urlEnv, poller.url), {
+			headers,
+			redirect: 'error',
+			signal: AbortSignal.timeout(10_000)
+		});
+	} catch (err) {
+		throw new Error(`request failed (${err?.name ?? 'error'})`);
+	}
+	if (!res.ok) {
+		const hint =
+			res.status === 401 || res.status === 403
+				? '; the login token was refused, run the agent once to refresh it'
+				: '';
+		throw new Error(`HTTP ${res.status}${hint}`);
+	}
+	let body;
+	try {
+		body = await res.json();
+	} catch {
+		body = null;
+	}
+	if (!body || typeof body !== 'object' || Array.isArray(body)) {
+		throw new Error('the answer was not a JSON object');
+	}
+
+	const seen = [];
+	for (const w of poller.windows(body, nowMs)) {
+		const stored = addLimit(state, {
+			provider,
+			window: w.window,
+			// The Claude endpoint's reset time jitters by a fraction of a second (14:59:59.7 for a
+			// 15:00 reset), and addLimit floors and keeps the earliest, so round to the real minute.
+			resetsAtMs: Math.round(w.resetsAtMs / MINUTE_MS) * MINUTE_MS,
+			percent: w.percent,
+			...(w.percent >= 100 ? { hitMs: nowMs } : {})
+		});
+		if (stored) polled.push({ ...stored, percent: w.percent });
+		seen.push(`${w.window} ${Math.round(w.percent)}%`);
+	}
+	log(`polled ${provider} usage: ${seen.join(', ') || 'no windows in use'}`);
+}
+
+/**
+ * A failed poll only costs a warning: it never fails the run or the push. Returns this run's
+ * Codex readings.
+ */
+async function pollLimits(state, nowMs) {
+	/** @type {{ window: string, resetsAtMs: number, percent: number }[]} */
+	const polled = [];
+	if (['off', '0', 'false', 'no'].includes(setting('POLL_LIMITS').toLowerCase())) return polled;
+	for (const [provider, poller] of Object.entries(LIMIT_POLLERS)) {
+		const readings = [];
+		try {
+			await pollLimit(state, provider, poller, nowMs, readings);
+			if (provider === 'codex') polled.push(...readings);
+		} catch (err) {
+			log(`warning: ${provider} usage not polled: ${err?.message ?? 'failed'}`);
+		}
+	}
+	return polled;
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +840,7 @@ function claudeLineHandler(state, resolvePrice, cutoffMs) {
 
 // Codex: token_count events carry per-request usage in info.last_token_usage.
 // input_tokens includes cached_input_tokens. output_tokens includes reasoning.
-function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSession) {
+function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSession, refusals) {
 	return (line) => {
 		const o = parseJson(line);
 		if (!o) return;
@@ -572,6 +851,11 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 		}
 		if (o.type === 'turn_context' && typeof p?.model === 'string') {
 			fileState.model = p.model;
+			return;
+		}
+		if (o.type === 'event_msg' && p && isCodexRefusal(p)) {
+			const ts = Date.parse(o.timestamp);
+			if (Number.isFinite(ts)) refusals.push(ts);
 			return;
 		}
 		if (o.type !== 'event_msg' || p?.type !== 'token_count') return;
@@ -2144,7 +2428,7 @@ async function readOpenCode(paths, ctx, provider) {
 }
 
 /**
- * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
+ * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, codexRefusals: number[], seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
  *   paths: string[],
  *   envPaths: () => string[],
@@ -2187,7 +2471,8 @@ const SOURCES = {
 				file,
 				ctx.resolvePrice,
 				ctx.cutoffMs,
-				path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path
+				path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path,
+				ctx.codexRefusals
 			)
 		),
 		priceKeys: litellmKeys('openai')
@@ -2290,11 +2575,21 @@ function enabledSources() {
 }
 
 /** @param {[string, Source][]} sources */
-async function scan(state, resolvePrice, cutoffMs, sources) {
+async function scan(state, resolvePrice, cutoffMs, sources, polled) {
 	/** @type {ReadContext} */
-	const ctx = { state, resolvePrice, cutoffMs, seenPaths: new Set(), filesRead: 0, parsedBytes: 0 };
+	const ctx = {
+		state,
+		resolvePrice,
+		cutoffMs,
+		codexRefusals: [],
+		seenPaths: new Set(),
+		filesRead: 0,
+		parsedBytes: 0
+	};
 	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
 	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
+	// After every file: a full reading of the refused window can come later in the logs.
+	for (const ts of ctx.codexRefusals) codexRefusal(state, ts, polled);
 	for (const path of Object.keys(state.files)) {
 		if (!ctx.seenPaths.has(path)) delete state.files[path];
 	}
@@ -2424,7 +2719,8 @@ function buildSnapshot(
 				a.resetsAt.localeCompare(b.resetsAt) ||
 				a.provider.localeCompare(b.provider) ||
 				a.window.localeCompare(b.window)
-		);
+		)
+		.slice(-MAX_LIMIT_WINDOWS);
 	if (limits.length) snapshot.limits = limits;
 	return { snapshot, sessions24h };
 }
@@ -2499,14 +2795,21 @@ function printSummary(snapshot, sessions24h, nowMs) {
 // local logs and sent under its own device id: the same account on two machines is one history.
 
 async function cursorRequest(path, bearer, body, headers = {}) {
-	const res = await fetch(`${cursorApiUrl(process.env.BIG_SPENDER_CURSOR_API_URL)}${path}`, {
-		method: 'POST',
-		headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json', ...headers },
-		body: JSON.stringify(body),
-		// Never forward the key or token to another host.
-		redirect: 'error',
-		signal: AbortSignal.timeout(30_000)
-	});
+	const res = await fetch(
+		`${localOverride('BIG_SPENDER_CURSOR_API_URL', 'https://api2.cursor.sh')}${path}`,
+		{
+			method: 'POST',
+			headers: {
+				authorization: `Bearer ${bearer}`,
+				'content-type': 'application/json',
+				...headers
+			},
+			body: JSON.stringify(body),
+			// Never forward the key or token to another host.
+			redirect: 'error',
+			signal: AbortSignal.timeout(30_000)
+		}
+	);
 	if (!res.ok) {
 		const hint =
 			res.status === 401 || res.status === 403 ? '; check BIG_SPENDER_CURSOR_API_KEY' : '';
@@ -2776,7 +3079,8 @@ async function main() {
 		pruneState(state, coverageStartMs);
 		const sources = enabledSources();
 		const enabled = new Set(sources.map(([id]) => id));
-		await scan(state, resolvePrice, coverageStartMs, sources);
+		const polled = await pollLimits(state, nowMs);
+		await scan(state, resolvePrice, coverageStartMs, sources, polled);
 		await saveState(state);
 
 		const buckets = Object.fromEntries(
