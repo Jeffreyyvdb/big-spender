@@ -32,7 +32,8 @@ try {
 			...process.env,
 			XDG_CACHE_HOME: cache,
 			BIG_SPENDER_ENV_FILE: join(dir, 'no-env-file'),
-			BIG_SPENDER_DEVICE_ID: 'parity'
+			BIG_SPENDER_DEVICE_ID: 'parity',
+			BIG_SPENDER_CURSOR_API_KEY: ''
 		};
 		const { stdout } = await execFileAsync(process.execPath, [collector, '--dry-run'], {
 			env,

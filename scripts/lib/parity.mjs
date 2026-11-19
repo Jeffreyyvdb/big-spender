@@ -41,25 +41,25 @@ export async function exportSite(repo = process.env.SITE_REPO) {
 export async function dryRun(collector, kind, deviceId, { pricingFrom } = {}) {
 	const realHome = process.env.HOME;
 	const root = await mkdtemp(join(tmpdir(), `big-spender-${kind}-`));
-	const home = join(root, 'home');
-	const cache = join(root, 'cache');
-	const config = join(root, 'config');
-	await mkdir(home, { recursive: true });
-	const cacheName = kind === 'site' ? 'usage-collector' : 'big-spender';
-	if (pricingFrom) {
-		await mkdir(join(cache, cacheName), { recursive: true });
-		await cp(pricingFrom, join(cache, cacheName, 'litellm-prices.json'));
-	}
-	const env = {
-		PATH: process.env.PATH,
-		HOME: home,
-		XDG_CACHE_HOME: cache,
-		XDG_CONFIG_HOME: config,
-		CLAUDE_CONFIG_DIR: join(realHome, '.claude'),
-		CODEX_HOME: join(realHome, '.codex'),
-		[kind === 'site' ? 'USAGE_DEVICE_ID' : 'BIG_SPENDER_DEVICE_ID']: deviceId
-	};
 	try {
+		const home = join(root, 'home');
+		const cache = join(root, 'cache');
+		const config = join(root, 'config');
+		await mkdir(home, { recursive: true });
+		const cacheName = kind === 'site' ? 'usage-collector' : 'big-spender';
+		if (pricingFrom) {
+			await mkdir(join(cache, cacheName), { recursive: true });
+			await cp(pricingFrom, join(cache, cacheName, 'litellm-prices.json'));
+		}
+		const env = {
+			PATH: process.env.PATH,
+			HOME: home,
+			XDG_CACHE_HOME: cache,
+			XDG_CONFIG_HOME: config,
+			CLAUDE_CONFIG_DIR: join(realHome, '.claude'),
+			CODEX_HOME: join(realHome, '.codex'),
+			[kind === 'site' ? 'USAGE_DEVICE_ID' : 'BIG_SPENDER_DEVICE_ID']: deviceId
+		};
 		const { stdout, stderr } = await execFileAsync(process.execPath, [collector, '--dry-run'], {
 			env,
 			maxBuffer: 512 * 1024 * 1024
@@ -80,9 +80,10 @@ const PRICING_URL =
 export async function fetchPricing() {
 	const res = await fetch(PRICING_URL, { signal: AbortSignal.timeout(30_000) });
 	if (!res.ok) throw new Error(`pricing fetch failed: HTTP ${res.status}`);
+	const models = await res.json();
 	const dir = await mkdtemp(join(tmpdir(), 'big-spender-pricing-'));
 	const file = join(dir, 'litellm-prices.json');
-	await writeFile(file, JSON.stringify({ fetchedAt: Date.now(), models: await res.json() }));
+	await writeFile(file, JSON.stringify({ fetchedAt: Date.now(), models }));
 	return file;
 }
 
