@@ -25,7 +25,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
 const SCHEMA_VERSION = 1;
@@ -120,8 +120,8 @@ async function acquireLock() {
 /**
  * @typedef {{ input: number, cacheRead: number, cacheWrite: number, output: number, savings: number }} Cost
  * @typedef {{ input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number, sessions: string[], cost?: Cost }} Bucket
- * A JSONL file's read position. Readers may keep their own fields on it (Codex: model, sessionId, lastTotal).
- * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number }} FileState
+ * A JSONL file's read position. Readers may keep their own fields on it (Codex: model, sessionId, lastTotal; pi: forkCalls).
+ * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number, forkCalls?: string[] }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
@@ -476,6 +476,163 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 	};
 }
 
+const expandHome = (p) => (p === '~' || p.startsWith('~/') ? join(HOME, p.slice(1)) : p);
+
+// pi's own env vars, then ccusage's PI_AGENT_DIR (a comma-separated list of sessions dirs).
+const piEnvPaths = () => [
+	...(process.env.PI_CODING_AGENT_DIR
+		? [join(expandHome(process.env.PI_CODING_AGENT_DIR), 'sessions')]
+		: []),
+	...(process.env.PI_CODING_AGENT_SESSION_DIR
+		? [expandHome(process.env.PI_CODING_AGENT_SESSION_DIR)]
+		: []),
+	...(process.env.PI_AGENT_DIR ?? '')
+		.split(',')
+		.map((p) => p.trim())
+		.filter(Boolean)
+];
+const piPaths = () => [join(HOME, '.pi', 'agent', 'sessions'), ...piEnvPaths()];
+
+// The pi-subagents extension writes debug copies of calls that a session file already has.
+const isSubagentCopy = (path) => path.split(sep).includes('subagent-artifacts');
+
+// pi's input excludes cached tokens and its output includes reasoning.
+function piUsage(o) {
+	const msg = o.message;
+	if ((o.type !== undefined && o.type !== 'message') || msg?.role !== 'assistant') return null;
+	const u = msg.usage;
+	if (!u) return null;
+	const ts = Date.parse(o.timestamp);
+	if (!Number.isFinite(ts)) return null;
+	// Token counts are integers; ccusage reads anything else as 0, and the schema rejects it.
+	const count = (v) => (Number.isInteger(v) ? num(v) : 0);
+	const input = count(u.input);
+	const cacheRead = count(u.cacheRead);
+	const cacheWrite = count(u.cacheWrite);
+	// pi reports the part of cacheWrite written with 1-hour retention (Anthropic only).
+	const cacheWrite1h = Math.min(count(u.cacheWrite1h), cacheWrite);
+	let output = count(u.output);
+	const parts = input + output + cacheRead + cacheWrite;
+	const total = Math.max(parts, count(u.totalTokens));
+	if (total === 0) return null;
+	// When output is 0, tokens the total has beyond the parts count as output, as ccusage does.
+	if (output === 0) output = total - parts;
+	const model = typeof msg.model === 'string' && msg.model ? msg.model : 'unknown';
+	const fingerprint = [
+		ts,
+		model,
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		total,
+		num(u.cost?.total)
+	].join('|');
+	return { ts, model, input, output, cacheRead, cacheWrite, cacheWrite1h, fingerprint };
+}
+
+function piCallsIn(path, untilMs) {
+	const calls = [];
+	let text;
+	try {
+		text = readFileSync(path, 'utf8');
+	} catch {
+		return calls;
+	}
+	for (const line of text.split('\n')) {
+		if (!line.includes('"usage"')) continue;
+		const o = parseJson(line);
+		const u = o && piUsage(o);
+		if (u && u.ts <= untilMs) calls.push(shortHash(u.fingerprint));
+	}
+	return calls;
+}
+
+// LiteLLM's prefixes for the providers pi talks to.
+const PI_PRICE_PREFIXES = [
+	'anthropic',
+	'openai',
+	'gemini',
+	'openrouter',
+	'xai',
+	'groq',
+	'cerebras',
+	'mistral',
+	'deepseek',
+	'fireworks_ai',
+	'together_ai',
+	'zai',
+	'moonshot',
+	'minimax'
+];
+
+// Local models can have a file path as their id; only the file name leaves the machine.
+const piModel = (model) => {
+	const isPath =
+		/^([/~.]|[A-Za-z]:)|\\|:\/|\/\//.test(model) ||
+		/\.(gguf|ggml|bin|safetensors|pth?|onnx)$/i.test(model);
+	const name = isPath ? (model.split(/[/\\]/).filter(Boolean).at(-1) ?? 'unknown') : model;
+	return name.replace(/[^A-Za-z0-9._:/@-]/g, '-').slice(0, 100);
+};
+
+// A pi fork starts with a copy of its parent's calls up to the fork point. They are matched
+// against every call in the parent up to then, not only its current branch, so the result does
+// not depend on where the parent's leaf was when the fork was read.
+function piLineHandler(state, file, path, resolvePrice, cutoffMs) {
+	if (isSubagentCopy(path)) return () => {};
+	/** @type {Set<string> | undefined} */
+	let parentCalls;
+	return (line) => {
+		if (!line.includes('"usage"') && !line.includes('"session"')) return;
+		const o = parseJson(line);
+		if (!o) return;
+		if (o.type === 'session') {
+			if (typeof o.id === 'string' && o.id) file.sessionId = o.id;
+			const forkMs = Date.parse(o.timestamp);
+			if (typeof o.parentSession !== 'string' || !o.parentSession || !Number.isFinite(forkMs)) {
+				return;
+			}
+			const parent = resolve(dirname(path), o.parentSession);
+			const inStore = piPaths().some((root) => parent.startsWith(resolve(root) + sep));
+			if (parent === path || !inStore || isSubagentCopy(parent)) return;
+			// Kept in state, so a fork read across runs still matches if the parent changes or goes.
+			const calls = piCallsIn(parent, forkMs);
+			if (calls.length) file.forkCalls = calls;
+			return;
+		}
+		const u = piUsage(o);
+		if (!u) return;
+		const session = file.sessionId ?? path;
+		// No entry ids in the key: pi rewrites a file in place when it migrates an older version.
+		const dedupe = `p:${shortHash(`${session}:${u.fingerprint}`)}`;
+		if (file.forkCalls) {
+			parentCalls ??= new Set(file.forkCalls);
+			if (parentCalls.has(shortHash(u.fingerprint))) {
+				// Seen, so a re-read after the fork is rewritten still skips it.
+				state.seen[dedupe] = u.ts;
+				return;
+			}
+			delete file.forkCalls;
+		}
+		if (u.ts < cutoffMs) return;
+		if (state.seen[dedupe] !== undefined) return;
+		state.seen[dedupe] = u.ts;
+		const model = piModel(u.model);
+		addRecord(state, {
+			ts: u.ts,
+			provider: 'pi',
+			model,
+			tier: tierFor(resolvePrice('pi', model), u.input + u.cacheRead + u.cacheWrite),
+			session: shortHash(`pi:${session}`),
+			input: u.input,
+			cacheRead: u.cacheRead,
+			cacheWrite5m: u.cacheWrite - u.cacheWrite1h,
+			cacheWrite1h: u.cacheWrite1h,
+			output: u.output
+		});
+	};
+}
+
 /**
  * A reader for JSONL logs that only grow: walks `*.jsonl` under each path and parses only the
  * bytes added since the last run. `lines` builds the line handler for one file.
@@ -585,6 +742,25 @@ const SOURCES = {
 			)
 		),
 		priceKeys: litellmKeys('openai')
+	},
+	pi: {
+		paths: [join(HOME, '.pi', 'agent', 'sessions')],
+		envPaths: piEnvPaths,
+		read: jsonlReader((ctx, file, path) =>
+			piLineHandler(ctx.state, file, path, ctx.resolvePrice, ctx.cutoffMs)
+		),
+		// pi logs each backend's own model id. OpenRouter's carry a vendor and dotted versions
+		// (`anthropic/claude-sonnet-4.5`) that LiteLLM may only know as `claude-sonnet-4-5`.
+		priceKeys: (model) => {
+			const bare = model.replace(/^[^/]+\//, '');
+			return [
+				...new Set(
+					[model, bare, bare.replace(/(\d)\.(\d)/g, '$1-$2')].flatMap((m) =>
+						PI_PRICE_PREFIXES.flatMap((p) => litellmKeys(p)(m))
+					)
+				)
+			];
+		}
 	}
 };
 
