@@ -287,12 +287,24 @@ about 15 to 20 percent less.
 | Codex       | `~/.codex/sessions/**/rollout-*.jsonl`, `$CODEX_HOME/sessions`                              | `event_msg` / `token_count` with `info.last_token_usage`; skipped when `total_token_usage` did not change. Model from the latest `turn_context`. `cached_input_tokens` is part of `input_tokens`; reasoning is part of `output_tokens`.                                                                                                                                                                   |
 | Cursor      | Cursor's API, `DashboardService/GetFilteredUsageEvents`, with `BIG_SPENDER_CURSOR_API_KEY`  | Events with token counts only. Cost is Cursor's `totalCents`. Events have no unique id and pages can overlap, so a time window with more than 1,000 events is split in half instead of paged. `cacheWriteTokens` count as 5-minute cache writes. Sessions are hashed `conversationId`s. Model names are lowercased, and anything outside `a-z 0-9 . _ : @ -` becomes `-`.                                 |
 
-**Pricing.** Claude Code and Codex use LiteLLM `model_prices_and_context_window.json`, cached for 24 hours in
-`~/.cache/big-spender/`. Lookup tries the exact model, then `anthropic/` or `openai/` prefixes, then
-without a date suffix. Unknown models count with cost 0 and log a warning. Long-context tiers
+**Pricing.** Claude Code and Codex use LiteLLM `model_prices_and_context_window.json`, cached for 24
+hours in `~/.cache/big-spender/`. Each source lists the LiteLLM keys to try for a model. Claude Code
+and Codex try the exact model, then the `anthropic/` or `openai/` prefix, then without a date suffix.
+Unknown models count with cost 0 and log a warning. Long-context tiers
 (`*_above_<N>k_tokens`) are applied per request; 1-hour cache writes use
 `cache_creation_input_token_cost_above_1hr`. Cache savings are cache-read tokens times (input price
 minus cache-read price).
+
+**Adding a provider.** Add an entry to `SOURCES` in `src/collector.mjs`, the provider id to
+`PROVIDERS` in `src/schema.ts`, a row to the table above, and a test with a fixture log. The entry
+says where the data lives, how it is read, and which LiteLLM keys price its models. Append-only JSONL
+uses `jsonlReader`, which parses only new bytes. Other formats are read whole on every run and skip
+what they counted before through `state.seen`. A SQLite file opens with `openSqlite`, which skips the
+source with one warning on a Node without `node:sqlite`. Add the matching ccusage agent to `AGENTS`
+in `scripts/parity-ccusage.mjs` and run `node scripts/parity-ccusage.mjs <provider>`: tokens must
+match ccusage exactly. `node scripts/parity-ref.mjs` shows that the other providers did not change.
+Deploy the server before the collectors, because a server rejects rows from a provider it does not
+list.
 
 **Incremental.** `~/.cache/big-spender/state.json` keeps per-file byte offsets plus the hourly
 aggregates, so each run parses only new bytes but still sends the full 90-day snapshot. Rows older
