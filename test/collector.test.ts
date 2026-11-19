@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBigSpender } from '../src/server/index.ts';
+import { usageSnapshotSchema } from '../src/schema.ts';
 import { createHttpServer } from '../src/serve.ts';
 import { run, seedPricing, withSandbox } from './helpers.ts';
 
@@ -122,5 +124,73 @@ test('a token that cannot go in an HTTP header fails at once and is never printe
 			server.closeAllConnections();
 			await new Promise((resolve) => server.close(resolve));
 		}
+	});
+});
+
+const HOUR_MS = 3_600_000;
+
+async function writeClaudeMessage(home: string, ts: number, outputs: number[]) {
+	const dir = join(home, '.claude', 'projects', 'p');
+	await mkdir(dir, { recursive: true });
+	const path = join(dir, 'session.jsonl');
+	const lines = outputs.map((output) => ({
+		type: 'assistant',
+		timestamp: new Date(ts).toISOString(),
+		requestId: 'req-1',
+		sessionId: 'session-1',
+		message: {
+			id: 'msg-1',
+			model: 'claude-test',
+			usage: { input_tokens: 1000, output_tokens: output }
+		}
+	}));
+	await writeFile(path, lines.map((l) => `${JSON.stringify(l)}\n`).join(''));
+	return path;
+}
+
+test('state from before the output fix re-reads the Claude logs once and adds the missed output', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const cache = join(env.XDG_CACHE_HOME, 'big-spender');
+		await seedPricing(cache);
+		const ts = Math.floor(Date.now() / HOUR_MS) * HOUR_MS - HOUR_MS;
+		const path = await writeClaudeMessage(home, ts, [10, 500]);
+		const st = await stat(path);
+		const dedupe = `c:${createHash('sha256').update('msg-1:req-1').digest('base64url').slice(0, 16)}`;
+		await writeFile(
+			join(cache, 'state.json'),
+			JSON.stringify({
+				version: 1,
+				files: { [path]: { size: st.size, mtimeMs: st.mtimeMs, offset: st.size } },
+				seen: { [dedupe]: ts },
+				buckets: {
+					[`${ts}|claude|claude-test|0`]: {
+						input: 1000,
+						cacheRead: 0,
+						cacheWrite5m: 0,
+						cacheWrite1h: 0,
+						output: 10,
+						sessions: ['s']
+					}
+				}
+			})
+		);
+
+		for (const pass of ['fixing run', 'next run']) {
+			const res = await run(COLLECTOR, ['--dry-run'], env);
+			assert.equal(res.code, 0, res.stderr);
+			const [row] = JSON.parse(res.stdout).hourly;
+			assert.deepEqual([row.inputTokens, row.outputTokens], [1000, 500], pass);
+		}
+	});
+});
+
+test('a device that used only Claude sends claude and codex session counts and no others', async () => {
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeMessage(home, Date.now() - HOUR_MS, [500]);
+		const res = await run(COLLECTOR, ['--dry-run'], { ...env, BIG_SPENDER_DEVICE_ID: 'laptop' });
+		assert.equal(res.code, 0, res.stderr);
+		const snapshot = usageSnapshotSchema.parse(JSON.parse(res.stdout));
+		assert.deepEqual(snapshot.sessionCounts?.['7d'], { claude: 1, codex: 0, all: 1 });
 	});
 });
