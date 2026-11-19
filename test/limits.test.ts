@@ -60,14 +60,22 @@ test('merging keeps the highest peak and earliest hit, and is idempotent', () =>
 	assert.deepEqual(mergeLimits(merged, merged, [a, b, c]), merged);
 });
 
-test('windows with different providers, names or reset minutes stay apart', () => {
+test('windows with different providers, names or resets more than two minutes apart stay apart', () => {
 	const merged = mergeLimits([
 		win(),
 		win({ provider: 'codex' }),
 		win({ window: 'seven_day' }),
-		win({ resetsAt: '2026-11-14T20:01:00.000Z' })
+		win({ resetsAt: '2026-11-14T20:03:00.000Z' })
 	]);
 	assert.equal(merged.length, 4);
+});
+
+test('reports of one window whose reset crosses a minute boundary merge into the earlier reset', () => {
+	const early = win({ resetsAt: '2026-11-14T19:59:59.000Z', hitAt: '2026-11-14T17:40:00.000Z' });
+	const late = win({ resetsAt: '2026-11-14T20:00:01.000Z' });
+	const expected = [win({ resetsAt: '2026-11-14T19:59:00.000Z' })];
+	assert.deepEqual(mergeLimits([late], [early]), expected);
+	assert.deepEqual(mergeLimits(expected, [early, late]), expected);
 });
 
 test('the stored history keeps windows the new snapshot no longer reports', () => {
@@ -84,7 +92,7 @@ test('the stored history keeps windows the new snapshot no longer reports', () =
 
 test('past the cap the oldest windows are dropped', () => {
 	const many = Array.from({ length: MAX_LIMIT_WINDOWS + 3 }, (_, i) =>
-		win({ resetsAt: new Date(Date.parse('2026-01-01T00:00:00Z') + i * 60_000).toISOString() })
+		win({ resetsAt: new Date(Date.parse('2026-01-01T00:00:00Z') + i * 600_000).toISOString() })
 	);
 	const merged = mergeLimits(many);
 	assert.equal(merged.length, MAX_LIMIT_WINDOWS);
@@ -179,7 +187,11 @@ test('limits() leaves out windows older than 90 days and the public summary is u
 test('GET /api/usage/limits answers JSON', async () => {
 	await withTempDir(async (dir) => {
 		const bs = createBigSpender({ dataDir: dir, ingestToken: TOKEN, devices: DEVICES });
-		await ingest(bs, withLimits('mac', [win({ resetsAt: new Date().toISOString() })]));
+		// No hit: an unhit window counts on its reset day, so this one stays in range whenever it runs.
+		await ingest(
+			bs,
+			withLimits('mac', [win({ resetsAt: new Date().toISOString(), hitAt: undefined })])
+		);
 		const server = createHttpServer(bs);
 		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 		try {

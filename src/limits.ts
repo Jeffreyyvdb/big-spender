@@ -14,30 +14,55 @@ const DAY_MS = 86_400_000;
 const RANGE_DAYS = 90;
 
 const minuteOf = (iso: string) => Math.floor(Date.parse(iso) / MINUTE_MS) * MINUTE_MS;
-const keyOf = (w: LimitWindow) => `${w.provider}|${w.window}|${minuteOf(w.resetsAt)}`;
+// Reports of one window can put its reset seconds apart, across a minute boundary.
+const RESET_SLACK_MS = 2 * MINUTE_MS;
 
 /**
- * Merges window lists into one record per window instance, keyed by provider, window and the
- * reset time rounded down to the minute. A key seen twice keeps the highest peak and the
- * earliest hit, so merging is idempotent and one account's window reported by two devices
- * counts once. Sorted by reset time; past the cap the oldest are dropped.
+ * Merges window lists into one record per window instance: same provider and window, with resets
+ * at most RESET_SLACK_MS after the earliest reset of the group (rounded down to the minute), which
+ * the record keeps. A group keeps the highest peak and the earliest hit, so merging is idempotent
+ * and one account's window reported by two devices counts once. Sorted by reset time; past the
+ * cap the oldest are dropped.
  */
 export function mergeLimits(...lists: (LimitWindow[] | undefined)[]): LimitWindow[] {
-	const byKey = new Map<string, LimitWindow>();
-	for (const w of lists.flatMap((list) => list ?? [])) {
-		const key = keyOf(w);
-		const prev = byKey.get(key);
-		const hits = [prev?.hitAt, w.hitAt].filter((t): t is string => t !== undefined);
-		const hitAt = hits.sort((a, b) => Date.parse(a) - Date.parse(b))[0];
-		byKey.set(key, {
+	const all = lists
+		.flatMap((list) => list ?? [])
+		.map((w): LimitWindow => ({
 			provider: w.provider,
 			window: w.window,
 			resetsAt: new Date(minuteOf(w.resetsAt)).toISOString(),
-			peakPercent: Math.max(prev?.peakPercent ?? 0, w.peakPercent),
+			peakPercent: w.peakPercent,
+			...(w.hitAt ? { hitAt: w.hitAt } : {})
+		}))
+		.sort(
+			(a, b) =>
+				a.provider.localeCompare(b.provider) ||
+				a.window.localeCompare(b.window) ||
+				Date.parse(a.resetsAt) - Date.parse(b.resetsAt)
+		);
+	const merged: LimitWindow[] = [];
+	for (const w of all) {
+		const group = merged.at(-1);
+		if (
+			!group ||
+			group.provider !== w.provider ||
+			group.window !== w.window ||
+			Date.parse(w.resetsAt) - Date.parse(group.resetsAt) > RESET_SLACK_MS
+		) {
+			merged.push(w);
+			continue;
+		}
+		const hits = [group.hitAt, w.hitAt].filter((t): t is string => t !== undefined);
+		const hitAt = hits.sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+		merged[merged.length - 1] = {
+			provider: group.provider,
+			window: group.window,
+			resetsAt: group.resetsAt,
+			peakPercent: Math.max(group.peakPercent, w.peakPercent),
 			...(hitAt ? { hitAt } : {})
-		});
+		};
 	}
-	const sorted = [...byKey.values()].sort(
+	const sorted = merged.sort(
 		(a, b) =>
 			Date.parse(a.resetsAt) - Date.parse(b.resetsAt) ||
 			a.provider.localeCompare(b.provider) ||

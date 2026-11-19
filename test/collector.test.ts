@@ -248,7 +248,7 @@ async function writeLimitLogs(home: string): Promise<Fixture> {
 	const t = (hoursAgo: number, extraMs = 0) => hourStart - hoursAgo * HOUR_MS + extraMs;
 	const fiveHourReset = t(-2);
 	const weeklyReset = t(-30);
-	const codexWeekly = t(-70, 12_000);
+	const codexWeekly = t(-70, 50_000);
 	const reject = (ms: number, type: string, resetsAt: number) =>
 		JSON.stringify({
 			type: 'assistant',
@@ -260,6 +260,8 @@ async function writeLimitLogs(home: string): Promise<Fixture> {
 			quotaLimits: { status: 'rejected', resetsAt: resetsAt / 1000, rateLimitType: type }
 		});
 	const claudeLines = [
+		// A reset in milliseconds where seconds belong: skipped, and the usage after it still counts.
+		reject(t(6), 'five_hour', fiveHourReset * 1000),
 		JSON.stringify({
 			type: 'assistant',
 			timestamp: iso(t(5)),
@@ -314,7 +316,8 @@ async function writeLimitLogs(home: string): Promise<Fixture> {
 			t(6),
 			rate(
 				{ used_percent: 100, window_minutes: 300, resets_at: t(-1) / 1000 + 20 },
-				{ used_percent: 66.5, window_minutes: 10080, resets_at: codexWeekly / 1000 + 5 }
+				// 15 s later: past the minute boundary, still the same window.
+				{ used_percent: 66.5, window_minutes: 10080, resets_at: codexWeekly / 1000 + 15 }
 			)
 		)
 	];

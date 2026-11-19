@@ -150,18 +150,21 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		);
 	}
 
+	let sent = body;
 	let result: string;
 	try {
 		result = await send(ctx, url, token, body);
 	} catch (err) {
-		// A server from before limits existed rejects the unknown key with a 422 naming it.
+		// A server from before limits existed rejects the unknown key with a 422 naming it. Any
+		// other limits error is a real bug and must not silently drop the windows.
 		const message = err instanceof Error ? err.message : '';
-		if (!snapshot.limits || !/^HTTP 422\b.*limits/.test(message)) throw err;
+		if (!snapshot.limits || !/^HTTP 422\b.*Unrecognized key.{0,20}limits/.test(message)) throw err;
 		ctx.err('warning: the server is too old to store limit data; sending usage without it');
 		const { limits: _, ...usageOnly } = snapshot;
-		result = await send(ctx, url, token, gzipSync(JSON.stringify(usageOnly)));
+		sent = gzipSync(JSON.stringify(usageOnly));
+		result = await send(ctx, url, token, sent);
 	}
-	ctx.out(`posted ${snapshot.hourly.length} rows (${body.length} bytes gzipped): ${result}`);
+	ctx.out(`posted ${snapshot.hourly.length} rows (${sent.length} bytes gzipped): ${result}`);
 	return 0;
 }
 

@@ -219,27 +219,45 @@ function pruneState(state, cutoffMs) {
 	}
 }
 
-// Same rule as mergeLimits in src/limits.ts (this file ships alone, so it cannot import it):
-// one record per (provider, window, reset minute), highest peak, earliest hit.
+// Same rule as mergeLimits in src/limits.ts (this file ships alone, so it cannot import it): one
+// record per window instance, highest peak, earliest hit. Reports of one window can put its reset
+// seconds apart, across a minute boundary, so a reset within RESET_SLACK_MS of a known one of the
+// same window is that one, and the record keeps the earlier reset.
 const MINUTE_MS = 60_000;
+const RESET_SLACK_MS = 2 * MINUTE_MS;
+// Times outside this range are malformed (milliseconds read as seconds, say) and are skipped,
+// never thrown, so a bad limit line cannot stop the usage on the lines after it.
+const LIMIT_TIMES_FROM = Date.parse('2020-01-01T00:00:00Z');
+const LIMIT_TIMES_TO = Date.parse('2100-01-01T00:00:00Z');
+const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
 
 /**
  * @param {State} state
  * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
  */
 function addLimit(state, w) {
-	const resetsAtMs = Math.floor(w.resetsAtMs / MINUTE_MS) * MINUTE_MS;
-	if (!Number.isFinite(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(w.window)) return;
-	const key = `${w.provider}|${w.window}|${resetsAtMs}`;
+	let resetsAtMs = Math.floor(w.resetsAtMs / MINUTE_MS) * MINUTE_MS;
+	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(w.window)) return;
+	if (w.hitMs !== undefined && !plausibleTime(w.hitMs)) return;
 	state.limits ??= {};
-	const prev = state.limits[key];
-	const hits = [prev?.hitAt && Date.parse(prev.hitAt), w.hitMs].filter(Number.isFinite);
+	let prev;
+	for (const [key, l] of Object.entries(state.limits)) {
+		const gap = Math.abs(Date.parse(l.resetsAt) - resetsAtMs);
+		if (l.provider !== w.provider || l.window !== w.window || gap > RESET_SLACK_MS) continue;
+		if (prev && gap >= Math.abs(Date.parse(prev[1].resetsAt) - resetsAtMs)) continue;
+		prev = [key, l];
+	}
+	if (prev) {
+		delete state.limits[prev[0]];
+		resetsAtMs = Math.min(resetsAtMs, Date.parse(prev[1].resetsAt));
+	}
+	const hits = [prev?.[1].hitAt && Date.parse(prev[1].hitAt), w.hitMs].filter(Number.isFinite);
 	const percent = Math.min(100, Math.max(0, w.percent));
-	state.limits[key] = {
+	state.limits[`${w.provider}|${w.window}|${resetsAtMs}`] = {
 		provider: w.provider,
 		window: w.window,
 		resetsAt: new Date(resetsAtMs).toISOString(),
-		peakPercent: Math.max(prev?.peakPercent ?? 0, percent),
+		peakPercent: Math.max(prev?.[1].peakPercent ?? 0, percent),
 		...(hits.length ? { hitAt: new Date(Math.min(...hits)).toISOString() } : {})
 	};
 }
@@ -269,7 +287,6 @@ const CODEX_WINDOW_NAMES = { 300: 'five_hour', 10080: 'seven_day' };
 function codexLimits(state, o, rateLimits) {
 	const ts = Date.parse(o.timestamp);
 	if (!Number.isFinite(ts) || !rateLimits) return;
-	const reached = String(rateLimits.rate_limit_reached_type ?? '').toLowerCase();
 	for (const slot of ['primary', 'secondary']) {
 		const w = rateLimits[slot];
 		if (!w || typeof w.used_percent !== 'number') continue;
@@ -281,7 +298,7 @@ function codexLimits(state, o, rateLimits) {
 				: typeof w.resets_in_seconds === 'number'
 					? ts + w.resets_in_seconds * 1000
 					: NaN;
-		const hit = w.used_percent >= 100 || (reached !== '' && reached.includes(slot));
+		const hit = w.used_percent >= 100;
 		addLimit(state, {
 			provider: 'codex',
 			window,
@@ -1075,12 +1092,15 @@ function assertHeaderSafe(secret, name) {
 	}
 }
 
+// The 422 a server without limit support sends: its strict schema names the key it doesn't know.
+// Any other limits error is a real bug and must not silently drop the windows.
+const OLD_SERVER_422 = /Unrecognized key.{0,20}limits/;
+
 async function post(snapshot) {
 	try {
 		return await postOnce(snapshot);
 	} catch (err) {
-		// A server from before limits existed rejects the unknown key with a 422 naming it.
-		if (err.status !== 422 || !snapshot.limits || !/limits/.test(err.message)) throw err;
+		if (err.status !== 422 || !snapshot.limits || !OLD_SERVER_422.test(err.message)) throw err;
 		log('warning: the server is too old to store limit data; sending usage without it');
 		const { limits, ...usageOnly } = snapshot;
 		return await postOnce(usageOnly);

@@ -258,11 +258,11 @@ write to their local logs. It reads no credentials and makes no new network call
   utilisation below 100% is unknown for Claude.
 - **Codex.** `token_count` events carry `rate_limits` with the used percentage and reset time of the
   5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). Codex
-  is the only source of utilisation below 100%. A window counts as hit when its share reaches 100%
-  or Codex names it in `rate_limit_reached_type`.
+  is the only source of utilisation below 100%. A window counts as hit when its share reaches 100%.
 
 A record is one window instance, identified by provider, window name and reset time rounded down
-to the minute. It holds the peak percentage seen and the time of the first refusal. Limits belong
+to the minute. Reports whose resets are at most two minutes apart are the same window, because one
+window's reported reset can drift by a few seconds. It holds the peak percentage seen and the time of the first refusal. Limits belong
 to the account, not the machine, so merging keeps the highest peak and the earliest refusal, and
 two machines that report the same window count once. Records are kept for 90 days on the collector and up to 5,000 windows on the
 server, like day rows.
