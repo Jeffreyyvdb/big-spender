@@ -18,7 +18,8 @@
 //   node collector.mjs --reset      # forget local state and rescan everything
 //
 // Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
-// BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_EXPERIMENTAL (see templates/env.example).
+// BIG_SPENDER_CURSOR_API_KEY, BIG_SPENDER_EXPERIMENTAL and BIG_SPENDER_POLL_LIMITS=off (see
+// templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
@@ -330,6 +331,138 @@ function codexLimits(state, o, rateLimits) {
 			percent: hit ? 100 : w.used_percent,
 			...(hit ? { hitMs: ts } : {})
 		});
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Limit polling
+//
+// Logs only show a limit when a request is refused. Each provider's own usage endpoint also
+// reports how full every window is right now, so polling it sees the unused part too. The login
+// files the agents keep are opened read-only and never refreshed; the token goes to the
+// provider's own host and nowhere else.
+
+const slug = (s) =>
+	s
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, '_')
+		.replace(/^_+|_+$/g, '');
+
+const claudeResetMs = (resetsAt) => (typeof resetsAt === 'string' ? Date.parse(resetsAt) : NaN);
+
+function claudeWindows(body) {
+	const out = [];
+	const add = (window, percent, resetsAtMs) => {
+		if (Number.isFinite(percent) && Number.isFinite(resetsAtMs)) {
+			out.push({ window: window.slice(0, 40), percent, resetsAtMs });
+		}
+	};
+	for (const [key, w] of Object.entries(body)) {
+		if (/^(five_hour|seven_day)(_[a-z0-9_]+)?$/.test(key) && w && typeof w === 'object') {
+			add(key, w.utilization, claudeResetMs(w.resets_at));
+		}
+	}
+	for (const l of Array.isArray(body.limits) ? body.limits : []) {
+		const model = l?.scope?.model?.display_name;
+		if (l?.kind === 'weekly_scoped' && typeof model === 'string' && slug(model)) {
+			add(`seven_day_${slug(model)}`, l.percent, claudeResetMs(l.resets_at));
+		}
+	}
+	return out;
+}
+
+// headers() returns the request headers, or a string saying why this provider is skipped.
+const LIMIT_POLLERS = {
+	claude: {
+		credentialsPath: () =>
+			join(process.env.CLAUDE_CONFIG_DIR || join(HOME, '.claude'), '.credentials.json'),
+		url: 'https://api.anthropic.com/api/oauth/usage?skip_spend=1',
+		urlEnv: 'BIG_SPENDER_CLAUDE_USAGE_URL',
+		headers: (creds, nowMs) => {
+			const oauth = creds?.claudeAiOauth;
+			if (typeof oauth?.accessToken !== 'string' || !oauth.accessToken) {
+				return 'not signed in with a Claude subscription';
+			}
+			if (typeof oauth.expiresAt === 'number' && oauth.expiresAt <= nowMs) {
+				return 'the login token expired; run Claude Code once to refresh it';
+			}
+			return {
+				authorization: `Bearer ${oauth.accessToken}`,
+				'anthropic-beta': 'oauth-2025-04-20',
+				'user-agent': 'big-spender'
+			};
+		},
+		windows: claudeWindows
+	}
+};
+
+async function pollLimit(state, provider, poller, nowMs) {
+	const path = poller.credentialsPath();
+	if (!existsSync(path)) return;
+	let creds;
+	try {
+		creds = JSON.parse(readFileSync(path, 'utf8'));
+	} catch {
+		// JSON.parse quotes part of the text in its error, which here would be a token.
+		throw new Error('could not read the login file');
+	}
+	const headers = poller.headers(creds, nowMs);
+	if (typeof headers === 'string') throw new Error(headers);
+	for (const value of Object.values(headers))
+		assertHeaderSafe(value.replace(/^Bearer /, ''), `the ${provider} login token`);
+
+	let res;
+	try {
+		res = await fetch(localOverride(poller.urlEnv, poller.url), {
+			headers,
+			redirect: 'error',
+			signal: AbortSignal.timeout(10_000)
+		});
+	} catch (err) {
+		throw new Error(`request failed (${err?.name ?? 'error'})`);
+	}
+	if (!res.ok) {
+		const hint =
+			res.status === 401 || res.status === 403
+				? '; the login token was refused, run the agent once to refresh it'
+				: '';
+		throw new Error(`HTTP ${res.status}${hint}`);
+	}
+	let body;
+	try {
+		body = await res.json();
+	} catch {
+		body = null;
+	}
+	if (!body || typeof body !== 'object' || Array.isArray(body)) {
+		throw new Error('the answer was not a JSON object');
+	}
+
+	const seen = [];
+	for (const w of poller.windows(body, nowMs)) {
+		addLimit(state, {
+			provider,
+			window: w.window,
+			// The Claude endpoint's reset time jitters by a fraction of a second (14:59:59.7 for a
+			// 15:00 reset), and addLimit floors and keeps the earliest, so round to the real minute.
+			resetsAtMs: Math.round(w.resetsAtMs / MINUTE_MS) * MINUTE_MS,
+			percent: w.percent,
+			...(w.percent >= 100 ? { hitMs: nowMs } : {})
+		});
+		seen.push(`${w.window} ${Math.round(w.percent)}%`);
+	}
+	log(`polled ${provider} usage: ${seen.join(', ') || 'no windows in use'}`);
+}
+
+/** A failed poll only costs a warning: it never fails the run or the push. */
+async function pollLimits(state, nowMs) {
+	if (['off', '0', 'false', 'no'].includes(setting('POLL_LIMITS').toLowerCase())) return;
+	for (const [provider, poller] of Object.entries(LIMIT_POLLERS)) {
+		try {
+			await pollLimit(state, provider, poller, nowMs);
+		} catch (err) {
+			log(`warning: ${provider} usage not polled: ${err?.message ?? 'failed'}`);
+		}
 	}
 }
 
@@ -2304,6 +2437,7 @@ async function main() {
 		const sources = enabledSources();
 		const enabled = new Set(sources.map(([id]) => id));
 		await scan(state, resolvePrice, coverageStartMs, sources);
+		await pollLimits(state, nowMs);
 		await saveState(state);
 
 		const buckets = Object.fromEntries(
