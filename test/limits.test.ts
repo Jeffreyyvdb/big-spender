@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { mergeSnapshots } from '../src/history.ts';
 import { mergeLimits } from '../src/limits.ts';
@@ -10,6 +11,7 @@ import {
 	type LimitWindow,
 	type UsageSnapshot
 } from '../src/schema.ts';
+import { createHttpServer } from '../src/serve.ts';
 import { createBigSpender } from '../src/server/index.ts';
 import { snapshot, withTempDir } from './helpers.ts';
 
@@ -106,5 +108,94 @@ test('a server rejects an unknown key inside a window', async () => {
 		const bs = createBigSpender({ dataDir: dir, ingestToken: TOKEN, devices: DEVICES });
 		const res = await ingest(bs, withLimits('mac', [{ ...win(), extra: 1 } as LimitWindow]));
 		assert.equal(res.status, 422);
+	});
+});
+
+const NOW = Date.parse('2026-11-14T22:30:00Z');
+const DAY = 86_400_000;
+
+async function limitsOf(windows: Record<string, LimitWindow[]>, now = NOW) {
+	return withTempDir(async (dir) => {
+		const bs = createBigSpender({ dataDir: dir, ingestToken: TOKEN, devices: DEVICES });
+		for (const [device, limits] of Object.entries(windows)) {
+			assert.equal((await ingest(bs, withLimits(device, limits))).status, 200);
+		}
+		return { limits: await bs.limits(now), summary: await bs.summary(now) };
+	});
+}
+
+test('limits() counts a window reported by two devices once and attributes it to its day', async () => {
+	const hit = win({ hitAt: '2026-11-14T17:30:00.000Z', resetsAt: '2026-11-14T20:00:00.000Z' });
+	const { limits } = await limitsOf({
+		mac: [hit, win({ resetsAt: '2026-11-13T12:00:00.000Z', hitAt: undefined, peakPercent: 40 })],
+		pc: [{ ...hit, resetsAt: '2026-11-14T20:00:30.000Z' }]
+	});
+	assert.equal(limits.bucket, 'day');
+	assert.equal(limits.to, '2026-11-15T00:00:00.000Z');
+	assert.equal(Date.parse(limits.to) - Date.parse(limits.from), 90 * DAY);
+	assert.deepEqual(
+		limits.providers.map((p) => p.provider),
+		['claude']
+	);
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.window, 'five_hour');
+	assert.equal(w.observed, 2);
+	assert.equal(w.hit, 1);
+	assert.equal(w.lockedHours, 2.5);
+	assert.equal(w.lastHit, '2026-11-14');
+	assert.equal(w.series.hits.length, 90);
+	assert.deepEqual(w.series.hits.slice(-3), [0, 0, 1]);
+	assert.deepEqual(w.series.lockedHours.slice(-3), [0, 0, 2.5]);
+	assert.deepEqual(w.series.peakPercent.slice(-3), [null, 40, 100]);
+	assert.ok(w.series.peakPercent.slice(0, -2).every((p) => p === null));
+});
+
+test('limits() shows a window that resets after today on today, with its peak so far', async () => {
+	const { limits } = await limitsOf({
+		mac: [
+			win({
+				window: 'seven_day',
+				resetsAt: '2026-11-19T07:16:00.000Z',
+				hitAt: undefined,
+				peakPercent: 66
+			})
+		]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 1);
+	assert.equal(w.hit, 0);
+	assert.deepEqual(w.series.peakPercent.slice(-2), [null, 66]);
+});
+
+test('limits() leaves out windows older than 90 days and the public summary is unchanged', async () => {
+	const old = win({ resetsAt: '2026-06-01T00:00:00.000Z', hitAt: '2026-06-01T00:00:00.000Z' });
+	const withWindows = await limitsOf({ mac: [old, win()] });
+	assert.equal(withWindows.limits.providers[0].windows[0].observed, 1);
+	const without = await limitsOf({ mac: [] });
+	assert.deepEqual(without.limits.providers, []);
+	assert.deepEqual(withWindows.summary, without.summary);
+});
+
+test('GET /api/usage/limits answers JSON', async () => {
+	await withTempDir(async (dir) => {
+		const bs = createBigSpender({ dataDir: dir, ingestToken: TOKEN, devices: DEVICES });
+		await ingest(bs, withLimits('mac', [win({ resetsAt: new Date().toISOString() })]));
+		const server = createHttpServer(bs);
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		try {
+			const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+			const res = await fetch(`${base}/api/usage/limits`);
+			assert.equal(res.status, 200);
+			assert.match(res.headers.get('cache-control') ?? '', /max-age=300/);
+			const body = (await res.json()) as { providers: { windows: { window: string }[] }[] };
+			assert.equal(body.providers[0].windows[0].window, 'five_hour');
+			assert.equal(JSON.stringify(body).includes('"mac"'), false);
+			const page = await (await fetch(base)).text();
+			assert.match(page, /Usage limits/);
+			assert.match(page, /5-hour session/);
+		} finally {
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
 	});
 });

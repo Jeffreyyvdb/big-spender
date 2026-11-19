@@ -1,4 +1,5 @@
 import { RANGES, type UsageRange } from './schema.ts';
+import type { LimitsSummary } from './limits.ts';
 import type { RangeSummary, UsageSummary } from './summary.ts';
 
 const escapeHtml = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -48,6 +49,9 @@ th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
 .swatch { display: inline-block; width: 0.75rem; height: 0.75rem; margin-right: 0.5rem; border-radius: 50%; vertical-align: -0.05em; }
 .scroll { overflow-x: auto; }
 .empty { color: var(--muted); }
+.days td, .days th { padding: 0.35rem 0.25rem; font-size: 0.8rem; text-align: center; }
+.days td:first-child, .days th:first-child { padding-right: 0.75rem; text-align: left; }
+.days .hit { color: #c0392b; font-weight: 600; }
 `;
 
 function totalsCard(r: RangeSummary): string {
@@ -82,7 +86,39 @@ function modelsTable(r: RangeSummary): string {
 	return `<div class="scroll"><table><thead><tr><th>Model</th><th>Agent</th><th>Cost</th><th>Share</th><th>Tokens</th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
 
-export function renderPage(summary: UsageSummary): string {
+const WINDOW_LABELS: Record<string, string> = {
+	five_hour: '5-hour session',
+	seven_day: 'Weekly'
+};
+const windowLabel = (w: string) =>
+	WINDOW_LABELS[w] ??
+	(w.startsWith('seven_day_') ? `Weekly · ${w.slice(10)}` : w).replace(/_/g, ' ');
+const RECENT_DAYS = 14;
+
+function limitsSection(limits: LimitsSummary): string {
+	const rows = limits.providers.flatMap((p) => p.windows.map((w) => ({ provider: p.provider, w })));
+	if (!rows.length)
+		return '<p class="empty">No usage limit windows recorded in the last 90 days.</p>';
+	const totals = rows.map(
+		({ provider, w }) =>
+			`<tr><td>${escapeHtml(provider)} · ${escapeHtml(windowLabel(w.window))}</td><td>${w.observed}</td><td>${w.hit}</td><td>${w.lockedHours.toFixed(1)}</td><td>${w.lastHit ?? '-'}</td></tr>`
+	);
+	const first = Date.parse(limits.to) - RECENT_DAYS * 86_400_000;
+	const heads = Array.from({ length: RECENT_DAYS }, (_, i) =>
+		new Date(first + i * 86_400_000).toISOString().slice(8, 10)
+	);
+	const days = rows.map(({ provider, w }) => {
+		const cells = w.series.hits
+			.slice(-RECENT_DAYS)
+			.map((n) => (n ? `<td class="hit">${n}</td>` : '<td>·</td>'));
+		return `<tr><td>${escapeHtml(provider)} · ${escapeHtml(windowLabel(w.window))}</td>${cells.join('')}</tr>`;
+	});
+	return `<div class="scroll"><table><thead><tr><th>Window</th><th>Seen</th><th>Hit</th><th>Locked hours</th><th>Last hit</th></tr></thead><tbody>${totals.join('')}</tbody></table></div>
+<p class="sub">Hits per day, last ${RECENT_DAYS} days (UTC day of month)</p>
+<div class="scroll"><table class="days"><thead><tr><th>Window</th>${heads.map((d) => `<th>${d}</th>`).join('')}</tr></thead><tbody>${days.join('')}</tbody></table></div>`;
+}
+
+export function renderPage(summary: UsageSummary, limits?: LimitsSummary): string {
 	const updated = escapeHtml(summary.generatedAt);
 	return `<!doctype html>
 <html lang="en">
@@ -101,7 +137,7 @@ export function renderPage(summary: UsageSummary): string {
 ${devicesTable(summary)}
 <h2>Top models, last 30 days</h2>
 ${modelsTable(summary.ranges['30d'])}
-</main>
+${limits ? `<h2>Usage limits, last 90 days</h2>\n${limitsSection(limits)}\n` : ''}</main>
 </body>
 </html>
 `;

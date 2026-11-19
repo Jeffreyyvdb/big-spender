@@ -92,10 +92,17 @@ const routes: Record<string, Route> = {
 				headers: { 'cache-control': 'public, max-age=300, stale-while-revalidate=900' }
 			})
 	},
+	'/api/usage/limits': {
+		methods: ['GET', 'HEAD'],
+		handle: async (bs) =>
+			Response.json(await bs.limits(), {
+				headers: { 'cache-control': 'public, max-age=300, stale-while-revalidate=900' }
+			})
+	},
 	'/': {
 		methods: ['GET', 'HEAD'],
 		handle: async (bs) =>
-			new Response(renderPage(await bs.summary()), {
+			new Response(renderPage(await bs.summary(), await bs.limits()), {
 				headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' }
 			})
 	},

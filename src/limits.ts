@@ -64,7 +64,7 @@ export type LimitWindowSummary = {
 	lastHit: string | null;
 	/**
 	 * One entry per UTC day from `from` to `to`. An instance belongs to the day of its first
-	 * block, or of its reset when it was never blocked.
+	 * block, or of its reset when it was never blocked; a window still open belongs to today.
 	 */
 	series: LimitsSeries;
 };
@@ -92,13 +92,13 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 	const to = Math.floor(now / DAY_MS) * DAY_MS + DAY_MS;
 	const from = to - RANGE_DAYS * DAY_MS;
 	const windows = mergeLimits(...snapshots.map((s) => s.limits));
+	const anchor = (w: LimitWindow) => Math.min(Date.parse(w.hitAt ?? w.resetsAt), now);
 
 	const providers = PROVIDERS.flatMap((provider) => {
 		const byWindow = new Map<string, LimitWindow[]>();
 		for (const w of windows) {
 			if (w.provider !== provider) continue;
-			const anchor = Date.parse(w.hitAt ?? w.resetsAt);
-			if (anchor < from || anchor >= to) continue;
+			if (anchor(w) < from || anchor(w) >= to) continue;
 			byWindow.set(w.window, [...(byWindow.get(w.window) ?? []), w]);
 		}
 		const summaries = [...byWindow]
@@ -113,7 +113,7 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 				let hit = 0;
 				let locked = 0;
 				for (const w of list) {
-					const day = Math.floor((Date.parse(w.hitAt ?? w.resetsAt) - from) / DAY_MS);
+					const day = Math.floor((anchor(w) - from) / DAY_MS);
 					series.peakPercent[day] = Math.max(series.peakPercent[day] ?? 0, w.peakPercent);
 					if (!w.hitAt) continue;
 					const hours = Math.max(0, Date.parse(w.resetsAt) - Date.parse(w.hitAt)) / HOUR_MS;
