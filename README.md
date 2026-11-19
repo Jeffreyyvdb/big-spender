@@ -132,12 +132,14 @@ of 1, 0.1, 1.25 and 5. The total is Cursor's, up to rounding each part to a mill
 
 A Cursor failure, such as a revoked key, does not stop the machine's own snapshot. The run still
 posts it, then exits with an error that names Cursor. That includes a Cursor answer with fewer
-events than it counted: posting it would replace complete days on the server with partial ones. The device
-id `cursor` is reserved for this snapshot, so no machine can report under it. To switch to
-another Cursor account, stop the server, remove `cursor.json` from its data directory and start it
-again before the new key's first run. The server keeps snapshots in memory, so removing the file
-while it runs is not enough, and the two accounts' histories would be merged. `big-spender push` never
-reads Cursor.
+events than it counted: posting it would replace complete days on the server with partial ones. The
+device id `cursor` is reserved for this snapshot, so no machine can report under it. To switch to
+another Cursor account, stop the server, run `big-spender install --cursor` with the new key, remove
+`cursor.json` from the server's data directory, and start the server again. The install's own first
+run fails while the server is down, which is expected. The next run sends the new account's full
+history. The server keeps snapshots in memory, and the old key keeps posting until it is replaced,
+so in any other order the two accounts' histories can be merged. `big-spender push` never reads
+Cursor.
 
 ## The server
 
