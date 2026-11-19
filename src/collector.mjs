@@ -152,6 +152,8 @@ async function acquireLock() {
 const FIX_CLAUDE_OUTPUT = 'claude-final-output';
 // Limit windows are read from log lines older versions skipped, so those logs are re-read once.
 const FIX_LIMITS = 'usage-limits';
+// Codex refusals are read from the logs too, so those logs are re-read once.
+const FIX_CODEX_REFUSALS = 'codex-refusals';
 
 /** @returns {Promise<State>} */
 async function loadState() {
@@ -161,7 +163,7 @@ async function loadState() {
 		seen: {},
 		buckets: {},
 		limits: {},
-		fixes: [FIX_CLAUDE_OUTPUT, FIX_LIMITS]
+		fixes: [FIX_CLAUDE_OUTPUT, FIX_LIMITS, FIX_CODEX_REFUSALS]
 	};
 	if (RESET) return empty;
 	try {
@@ -178,6 +180,10 @@ async function loadState() {
 		if (!s.fixes.includes(FIX_LIMITS)) {
 			s.fixes.push(FIX_LIMITS);
 			s.rescan = [...new Set([...(s.rescan ?? []), 'claude', 'codex'])];
+		}
+		if (!s.fixes.includes(FIX_CODEX_REFUSALS)) {
+			s.fixes.push(FIX_CODEX_REFUSALS);
+			s.rescan = [...new Set([...(s.rescan ?? []), 'codex'])];
 		}
 		return s;
 	} catch {
@@ -336,6 +342,42 @@ function codexLimits(state, o, rateLimits) {
 		});
 	}
 }
+
+// A window's length in ms from its name: a CODEX_WINDOW_NAMES base or `<N>m`, then an optional
+// `_<suffix>` for an additional limit.
+function codexWindowMs(window) {
+	for (const [minutes, base] of Object.entries(CODEX_WINDOW_NAMES)) {
+		if (window === base || window.startsWith(`${base}_`)) return Number(minutes) * MINUTE_MS;
+	}
+	const m = /^(\d+)m(_|$)/.exec(window);
+	return m ? Number(m[1]) * MINUTE_MS : NaN;
+}
+
+// A refused Codex turn names no window and no reset, so it starts the lockout of every window
+// already seen full that was open at the time. A window never seen full gets no hit.
+function codexRefusal(state, ts) {
+	for (const l of Object.values(state.limits ?? {})) {
+		const resetsAtMs = Date.parse(l.resetsAt);
+		if (l.provider !== 'codex' || l.peakPercent < 100) continue;
+		if (!(ts > resetsAtMs - codexWindowMs(l.window) && ts <= resetsAtMs)) continue;
+		addLimit(state, {
+			provider: 'codex',
+			window: l.window,
+			resetsAtMs,
+			percent: 100,
+			hitMs: ts
+		});
+	}
+}
+
+const isCodexRefusal = (p) => {
+	const err = p.type === 'task_complete' ? p.error : p.type === 'error' ? p : null;
+	if (!err || typeof err !== 'object') return false;
+	return (
+		err.codex_error_info === 'usage_limit_exceeded' ||
+		(typeof err.message === 'string' && /usage limit/i.test(err.message))
+	);
+};
 
 // ---------------------------------------------------------------------------
 // Limit polling
@@ -779,6 +821,11 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 		}
 		if (o.type === 'turn_context' && typeof p?.model === 'string') {
 			fileState.model = p.model;
+			return;
+		}
+		if (o.type === 'event_msg' && p && isCodexRefusal(p)) {
+			const ts = Date.parse(o.timestamp);
+			if (Number.isFinite(ts)) codexRefusal(state, ts);
 			return;
 		}
 		if (o.type !== 'event_msg' || p?.type !== 'token_count') return;

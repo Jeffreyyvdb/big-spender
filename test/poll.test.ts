@@ -569,3 +569,134 @@ test('a later ambiguous poll drops the alias, and a failed poll keeps it', async
 		});
 	});
 });
+
+const SHARING_LIMIT =
+	'stream disconnected before completion: The ChatGPT user has reached their Subscription Sharing usage limit. Ask the user to try again after their usage limit resets or use an API key instead.';
+
+const codexEvent = (ms: number, payload: Record<string, unknown>) =>
+	JSON.stringify({ timestamp: iso(ms), type: 'event_msg', payload });
+const sharingRefusal = (ms: number) =>
+	codexEvent(ms, {
+		type: 'task_complete',
+		error: { message: SHARING_LIMIT, codex_error_info: 'other' }
+	});
+const usageLimitError = (ms: number) =>
+	codexEvent(ms, {
+		type: 'error',
+		message: 'You’ve hit your usage limit.',
+		codex_error_info: 'usage_limit_exceeded'
+	});
+
+async function writeCodexLog(box: Sandbox, lines: string[]) {
+	const dir = join(box.home, '.codex', 'sessions', '2026', '11');
+	await mkdir(dir, { recursive: true });
+	await writeFile(join(dir, 'rollout-a.jsonl'), lines.join('\n') + '\n');
+}
+
+const codexFiveHour = (usedPercent: number, resetsAt: number) => ({
+	rate_limit: {
+		primary_window: {
+			used_percent: usedPercent,
+			limit_window_seconds: 18000,
+			reset_after_seconds: 0,
+			reset_at: resetsAt / 1000
+		}
+	}
+});
+
+const fiveHourResetsAt = NEXT_HOUR + 2 * HOUR;
+
+for (const [name, refusal] of [
+	['a subscription sharing refusal', sharingRefusal],
+	['a usage_limit_exceeded error event', usageLimitError]
+] as const) {
+	test(`${name} starts the lockout at the refusal, not at the poll`, async () => {
+		await withSandbox(async (box) => {
+			await writeCodexLogin(box, liveCodexToken());
+			const refusedAt = fiveHourResetsAt - 4 * HOUR;
+			await writeCodexLog(box, [refusal(refusedAt), refusal(refusedAt + 60_000)]);
+			await withUsageApi(async (api, _seen, url) => {
+				api.codex.body = codexFiveHour(100, fiveHourResetsAt);
+				const res = await collect(box, url);
+				assert.equal(res.code, 0, res.stderr);
+				assert.deepEqual(
+					res.snap.limits.map((w: Win) => [w.window, w.peakPercent, w.hitAt]),
+					[['five_hour', 100, iso(refusedAt)]]
+				);
+			});
+		});
+	});
+}
+
+test('a Codex refusal outside the full window leaves the hit at the poll time', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, [
+			sharingRefusal(fiveHourResetsAt - 6 * HOUR),
+			sharingRefusal(fiveHourResetsAt + HOUR)
+		]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(100, fiveHourResetsAt);
+			const before = Date.now();
+			const res = await collect(box, url);
+			const [[, , , hitAt]] = res.snap.limits.map((w: Win) => [
+				w.window,
+				w.resetsAt,
+				w.peakPercent,
+				w.hitAt
+			]);
+			assert.ok(Date.parse(hitAt) >= before - 1000, hitAt);
+		});
+	});
+});
+
+test('a Codex refusal adds no hit to a window never seen full', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, [sharingRefusal(fiveHourResetsAt - 4 * HOUR)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(60, fiveHourResetsAt);
+			const res = await collect(box, url);
+			assert.deepEqual(
+				res.snap.limits.map((w: Win) => [w.window, w.peakPercent, w.hitAt]),
+				[['five_hour', 60, undefined]]
+			);
+		});
+	});
+});
+
+test('a Codex refusal with no window on record changes nothing', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, [sharingRefusal(fiveHourResetsAt - 4 * HOUR)]);
+		await withUsageApi(async (_api, _seen, url) => {
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal('limits' in res.snap, false);
+		});
+	});
+});
+
+test('state from before Codex refusals were read is rescanned once to attribute them', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		const refusedAt = fiveHourResetsAt - 4 * HOUR;
+		await writeCodexLog(box, [sharingRefusal(refusedAt)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(100, fiveHourResetsAt);
+			await collect(box, url);
+			const statePath = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
+			const state = JSON.parse(await readFile(statePath, 'utf8'));
+			for (const l of Object.values<{ hitAt?: string }>(state.limits)) l.hitAt = iso(Date.now());
+			state.fixes = state.fixes.filter((f: string) => f !== 'codex-refusals');
+			await writeFile(statePath, JSON.stringify(state));
+
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.deepEqual(
+				res.snap.limits.map((w: Win) => w.hitAt),
+				[iso(refusedAt)]
+			);
+			assert.ok(JSON.parse(await readFile(statePath, 'utf8')).fixes.includes('codex-refusals'));
+		});
+	});
+});
