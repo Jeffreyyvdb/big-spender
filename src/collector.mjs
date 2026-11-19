@@ -265,6 +265,7 @@ const LIMIT_TIMES_TO = Date.parse('2100-01-01T00:00:00Z');
 const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
 
 /**
+ * Returns the window name and reset time the record ended up with, or nothing when it was rejected.
  * @param {State} state
  * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
  */
@@ -294,6 +295,7 @@ function addLimit(state, w) {
 		peakPercent: Math.max(prev?.[1].peakPercent ?? 0, percent),
 		...(hits.length ? { hitAt: new Date(Math.min(...hits)).toISOString() } : {})
 	};
+	return { window, resetsAtMs };
 }
 
 // Claude Code logs a refused request as a synthetic assistant line carrying quotaLimits.
@@ -354,16 +356,33 @@ function codexWindowMs(window) {
 }
 
 // A refused Codex turn names no window and no reset, so it starts the lockout of every window
-// already seen full that was open at the time. A window never seen full gets no hit.
-function codexRefusal(state, ts) {
-	for (const l of Object.values(state.limits ?? {})) {
+// already seen full that was open at the time. With none seen full, it falls to elimination.
+// Usage within an instance only rises until its reset, so this run's poll reading below 100%
+// (taken after the refusal) proves the instance was not full at ts. That only settles it when
+// every limit the poll reports had an instance on file at ts and exactly one is not ruled out.
+// polled holds this run's Codex poll readings; it is empty when the poll was off or failed.
+function codexRefusal(state, ts, polled) {
+	const open = Object.values(state.limits ?? {}).filter((l) => {
 		const resetsAtMs = Date.parse(l.resetsAt);
-		if (l.provider !== 'codex' || l.peakPercent < 100) continue;
-		if (!(ts > resetsAtMs - codexWindowMs(l.window) && ts <= resetsAtMs)) continue;
+		return l.provider === 'codex' && ts > resetsAtMs - codexWindowMs(l.window) && ts <= resetsAtMs;
+	});
+	const full = open.filter((l) => l.peakPercent >= 100);
+	const readBelowFull = (l) =>
+		polled.some(
+			(r) =>
+				r.percent < 100 &&
+				r.window === l.window &&
+				Math.abs(r.resetsAtMs - Date.parse(l.resetsAt)) <= RESET_SLACK_MS
+		);
+	const accountedFor =
+		polled.length > 0 && polled.every((r) => open.some((l) => l.window === r.window));
+	const left = accountedFor ? open.filter((l) => !readBelowFull(l)) : [];
+	const blockers = full.length ? full : left.length === 1 ? left : [];
+	for (const l of blockers) {
 		addLimit(state, {
 			provider: 'codex',
 			window: l.window,
-			resetsAtMs,
+			resetsAtMs: Date.parse(l.resetsAt),
 			percent: 100,
 			hitMs: ts
 		});
@@ -504,7 +523,7 @@ const LIMIT_POLLERS = {
 	}
 };
 
-async function pollLimit(state, provider, poller, nowMs) {
+async function pollLimit(state, provider, poller, nowMs, polled) {
 	const path = poller.credentialsPath();
 	if (!existsSync(path)) return;
 	let creds;
@@ -558,7 +577,7 @@ async function pollLimit(state, provider, poller, nowMs) {
 
 	const seen = [];
 	for (const w of windows) {
-		addLimit(state, {
+		const stored = addLimit(state, {
 			provider,
 			window: w.window,
 			// The Claude endpoint's reset time jitters by a fraction of a second (14:59:59.7 for a
@@ -567,21 +586,30 @@ async function pollLimit(state, provider, poller, nowMs) {
 			percent: w.percent,
 			...(w.percent >= 100 ? { hitMs: nowMs } : {})
 		});
+		if (stored) polled.push({ ...stored, percent: w.percent });
 		seen.push(`${w.window} ${Math.round(w.percent)}%`);
 	}
 	log(`polled ${provider} usage: ${seen.join(', ') || 'no windows in use'}`);
 }
 
-/** A failed poll only costs a warning: it never fails the run or the push. */
+/**
+ * A failed poll only costs a warning: it never fails the run or the push. Returns this run's
+ * Codex readings.
+ */
 async function pollLimits(state, nowMs) {
-	if (['off', '0', 'false', 'no'].includes(setting('POLL_LIMITS').toLowerCase())) return;
+	/** @type {{ window: string, resetsAtMs: number, percent: number }[]} */
+	const polled = [];
+	if (['off', '0', 'false', 'no'].includes(setting('POLL_LIMITS').toLowerCase())) return polled;
 	for (const [provider, poller] of Object.entries(LIMIT_POLLERS)) {
+		const readings = [];
 		try {
-			await pollLimit(state, provider, poller, nowMs);
+			await pollLimit(state, provider, poller, nowMs, readings);
+			if (provider === 'codex') polled.push(...readings);
 		} catch (err) {
 			log(`warning: ${provider} usage not polled: ${err?.message ?? 'failed'}`);
 		}
 	}
+	return polled;
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +838,7 @@ function claudeLineHandler(state, resolvePrice, cutoffMs) {
 
 // Codex: token_count events carry per-request usage in info.last_token_usage.
 // input_tokens includes cached_input_tokens. output_tokens includes reasoning.
-function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSession) {
+function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSession, polled) {
 	return (line) => {
 		const o = parseJson(line);
 		if (!o) return;
@@ -825,7 +853,7 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 		}
 		if (o.type === 'event_msg' && p && isCodexRefusal(p)) {
 			const ts = Date.parse(o.timestamp);
-			if (Number.isFinite(ts)) codexRefusal(state, ts);
+			if (Number.isFinite(ts)) codexRefusal(state, ts, polled);
 			return;
 		}
 		if (o.type !== 'event_msg' || p?.type !== 'token_count') return;
@@ -1947,7 +1975,7 @@ function antigravityPriceKeys(model) {
 }
 
 /**
- * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
+ * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, polled: { window: string, resetsAtMs: number, percent: number }[], seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
  *   paths: string[],
  *   envPaths: () => string[],
@@ -1990,7 +2018,8 @@ const SOURCES = {
 				file,
 				ctx.resolvePrice,
 				ctx.cutoffMs,
-				path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path
+				path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path,
+				ctx.polled
 			)
 		),
 		priceKeys: litellmKeys('openai')
@@ -2066,9 +2095,17 @@ function enabledSources() {
 }
 
 /** @param {[string, Source][]} sources */
-async function scan(state, resolvePrice, cutoffMs, sources) {
+async function scan(state, resolvePrice, cutoffMs, sources, polled) {
 	/** @type {ReadContext} */
-	const ctx = { state, resolvePrice, cutoffMs, seenPaths: new Set(), filesRead: 0, parsedBytes: 0 };
+	const ctx = {
+		state,
+		resolvePrice,
+		cutoffMs,
+		polled,
+		seenPaths: new Set(),
+		filesRead: 0,
+		parsedBytes: 0
+	};
 	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
 	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
 	for (const path of Object.keys(state.files)) {
@@ -2559,8 +2596,8 @@ async function main() {
 		pruneState(state, coverageStartMs);
 		const sources = enabledSources();
 		const enabled = new Set(sources.map(([id]) => id));
-		await pollLimits(state, nowMs);
-		await scan(state, resolvePrice, coverageStartMs, sources);
+		const polled = await pollLimits(state, nowMs);
+		await scan(state, resolvePrice, coverageStartMs, sources, polled);
 		await saveState(state);
 
 		const buckets = Object.fromEntries(

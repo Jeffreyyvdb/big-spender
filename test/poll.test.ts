@@ -700,3 +700,149 @@ test('state from before Codex refusals were read is rescanned once to attribute 
 		});
 	});
 });
+
+const REFUSED_AT = NEXT_HOUR - 3 * HOUR;
+const OLD_FIVE_HOUR = NEXT_HOUR - 2 * HOUR;
+const WEEKLY = NEXT_HOUR + 48 * HOUR;
+
+const codexTokenCount = (ms: number, window_minutes: number, used: number, resetsAt: number) =>
+	codexEvent(ms, {
+		type: 'token_count',
+		rate_limits: {
+			primary: { used_percent: used, window_minutes, resets_at: resetsAt / 1000 },
+			secondary: null
+		}
+	});
+
+const polledWindow = (usedPercent: number, windowSeconds: number, resetsAt: number) => ({
+	used_percent: usedPercent,
+	limit_window_seconds: windowSeconds,
+	reset_after_seconds: 0,
+	reset_at: resetsAt / 1000
+});
+
+// The log saw the old five_hour at 32%, then Codex refused; the poll came after the lockout ended.
+const missedLockoutLog = () => [
+	codexTokenCount(REFUSED_AT - HOUR, 300, 32, OLD_FIVE_HOUR),
+	sharingRefusal(REFUSED_AT)
+];
+const missedLockoutLogWithWeekly = () => [
+	codexTokenCount(REFUSED_AT - HOUR, 300, 32, OLD_FIVE_HOUR),
+	codexTokenCount(REFUSED_AT - HOUR, 10080, 50, WEEKLY),
+	sharingRefusal(REFUSED_AT)
+];
+const missedLockoutBody = (extra: Record<string, unknown> = {}) => ({
+	rate_limit: {
+		primary_window: polledWindow(5, 18000, NEXT_HOUR + 3 * HOUR),
+		secondary_window: polledWindow(95, 604800, WEEKLY)
+	},
+	...extra
+});
+const hitsOf = (snap: { limits: Win[] }) =>
+	snap.limits.map((w) => [w.window, w.resetsAt, w.peakPercent, w.hitAt]);
+
+test('a refusal is blamed on the one open window the poll did not read', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLog());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = missedLockoutBody();
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(hitsOf(res.snap).sort(), [
+				['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)],
+				['five_hour', iso(NEXT_HOUR + 3 * HOUR), 5, undefined],
+				['seven_day', iso(WEEKLY), 95, undefined]
+			]);
+		});
+	});
+});
+
+test('with polling off the weekly is not ruled out, so the refusal is not attributed', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLogWithWeekly());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = missedLockoutBody();
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
+		});
+	});
+});
+
+test('a failed Codex poll leaves the refusal unattributed', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLogWithWeekly());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex = { status: 500, body: {} };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
+		});
+	});
+});
+
+test('a refusal with two open windows the poll did not read is not attributed', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, [
+			codexTokenCount(REFUSED_AT - HOUR, 300, 32, OLD_FIVE_HOUR),
+			codexTokenCount(REFUSED_AT - HOUR, 301, 10, OLD_FIVE_HOUR),
+			sharingRefusal(REFUSED_AT)
+		]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = missedLockoutBody();
+			const res = await collect(box, url);
+			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
+		});
+	});
+});
+
+test('a poll that reads the open window below 100% rules it out', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLog());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = {
+				rate_limit: { primary_window: polledWindow(40, 18000, OLD_FIVE_HOUR) }
+			};
+			const res = await collect(box, url);
+			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 40, undefined]]);
+		});
+	});
+});
+
+test('with polling off a lone open window is not blamed', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLog());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = missedLockoutBody();
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 32, undefined]]);
+		});
+	});
+});
+
+test('a polled limit with no window on file at the refusal leaves it unattributed', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLog());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = missedLockoutBody({
+				additional_rate_limits: [
+					{
+						limit_name: 'other',
+						metered_feature: 'other',
+						rate_limit: { primary_window: polledWindow(5, 18000, NEXT_HOUR + 3 * HOUR) }
+					}
+				]
+			});
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.ok(res.snap.limits.some((w: Win) => w.window === 'five_hour_other'));
+			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
+		});
+	});
+});
