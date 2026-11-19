@@ -2496,8 +2496,8 @@ async function main() {
 		pruneState(state, coverageStartMs);
 		const sources = enabledSources();
 		const enabled = new Set(sources.map(([id]) => id));
-		await scan(state, resolvePrice, coverageStartMs, sources);
 		await pollLimits(state, nowMs);
+		await scan(state, resolvePrice, coverageStartMs, sources);
 		await saveState(state);
 
 		const buckets = Object.fromEntries(
