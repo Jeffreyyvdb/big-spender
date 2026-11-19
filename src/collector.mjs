@@ -25,7 +25,7 @@ import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
 import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
 const SCHEMA_VERSION = 1;
@@ -411,7 +411,7 @@ function costOf(entry, tier, t) {
 // ---------------------------------------------------------------------------
 // Log discovery + incremental reading
 
-async function* walk(dir) {
+async function* walk(dir, keep) {
 	let entries;
 	try {
 		entries = await readdir(dir, { withFileTypes: true });
@@ -420,8 +420,8 @@ async function* walk(dir) {
 	}
 	for (const e of entries) {
 		const p = join(dir, e.name);
-		if (e.isDirectory()) yield* walk(p);
-		else if (e.isFile() && e.name.endsWith('.jsonl')) yield p;
+		if (e.isDirectory()) yield* walk(p, keep);
+		else if (e.isFile() && keep(e.name)) yield p;
 	}
 }
 
@@ -673,7 +673,7 @@ const PI_PRICE_PREFIXES = [
 ];
 
 // Local models can have a file path as their id; only the file name leaves the machine.
-const piModel = (model) => {
+const localModelName = (model) => {
 	const isPath =
 		/^([/~.]|[A-Za-z]:)|\\|:\/|\/\//.test(model) ||
 		/\.(gguf|ggml|bin|safetensors|pth?|onnx)$/i.test(model);
@@ -723,7 +723,7 @@ function piLineHandler(state, file, path, resolvePrice, cutoffMs) {
 		if (u.ts < cutoffMs) return;
 		if (state.seen[dedupe] !== undefined) return;
 		state.seen[dedupe] = u.ts;
-		const model = piModel(u.model);
+		const model = localModelName(u.model);
 		addRecord(state, {
 			ts: u.ts,
 			provider: 'pi',
@@ -739,16 +739,100 @@ function piLineHandler(state, file, path, resolvePrice, cutoffMs) {
 	};
 }
 
+/** A Grok model id as a snapshot model name: `[grok] ` dropped, a path reduced to its file name. */
+const grokModelName = (raw) => localModelName(raw.replace(/^\[grok\] /, '').trim()) || 'unknown';
+
+// Grok Build: a completed turn appends one `turn_completed` line whose usage sums the turn's API
+// requests, split per model in `modelUsage` (top-level usage and the session's current model when
+// that map is missing). inputTokens includes cache reads and cache writes; reasoningTokens is part
+// of outputTokens. The same event can be exported into more than one session, so rows with an
+// eventId are deduplicated by eventId and model, others by their full content within the file.
+function grokLineHandler(state, cutoffMs, path) {
+	const sessionDir = basename(dirname(path));
+	let currentModel;
+	const summaryModel = () => {
+		if (currentModel === undefined) {
+			try {
+				const id = JSON.parse(
+					readFileSync(join(dirname(path), 'summary.json'), 'utf8')
+				)?.current_model_id;
+				currentModel = typeof id === 'string' && id ? id : 'unknown';
+			} catch {
+				currentModel = 'unknown';
+			}
+		}
+		return currentModel;
+	};
+	const str = (v) => (typeof v === 'string' && v ? v : undefined);
+	// Token counts are integers; ccusage reads anything else as 0, and the schema rejects it.
+	const count = (v) => (Number.isInteger(v) ? num(v) : 0);
+	return (line) => {
+		if (!line.includes('"turn_completed"')) return;
+		const o = parseJson(line);
+		const p = o?.params;
+		const usage = p?.update?.sessionUpdate === 'turn_completed' ? p.update.usage : undefined;
+		if (!usage || typeof usage !== 'object') return;
+		// agentTimestampMs is milliseconds; the envelope timestamp is Unix seconds.
+		const ts = num(p._meta?.agentTimestampMs) || num(o.timestamp) * 1000;
+		if (!ts || ts < cutoffMs) return;
+		const eventId = str(p._meta?.eventId);
+		const session = str(p.sessionId) ?? sessionDir;
+		const perModel =
+			usage.modelUsage &&
+			typeof usage.modelUsage === 'object' &&
+			Object.keys(usage.modelUsage).length;
+		// Top-level usage is keyed without its model: summary.json can appear or change between
+		// runs, and the same event must not count again under the new name.
+		const byModel = perModel
+			? Object.entries(usage.modelUsage).map(([raw, u]) => [raw, raw, u])
+			: [[summaryModel(), '', usage]];
+		for (const [raw, keyModel, u] of byModel) {
+			const inputAll = count(u?.inputTokens);
+			const cacheRead = Math.min(count(u?.cachedReadTokens), inputAll);
+			const cacheWrite = Math.min(count(u?.cacheCreationTokens), inputAll - cacheRead);
+			const input = inputAll - cacheRead - cacheWrite;
+			const output = count(u?.outputTokens);
+			const reasoning = count(u?.reasoningTokens);
+			if (!input && !cacheRead && !cacheWrite && !output && !reasoning) continue;
+			// Without an eventId, identical rows count once per file, as in ccusage.
+			const id = eventId
+				? `${eventId}|${keyModel}`
+				: `${path}|${ts}|${raw}|${input}|${output}|${cacheRead}|${cacheWrite}|${reasoning}`;
+			const dedupe = `g:${shortHash(id)}`;
+			if (state.seen[dedupe] !== undefined) continue;
+			state.seen[dedupe] = ts;
+			addRecord(state, {
+				ts,
+				provider: 'grok',
+				model: grokModelName(raw),
+				// xAI picks the long-context rate per request, and a turn sums several requests, so
+				// its total cannot pick a tier. Grok's own costUsdTicks bill such turns at base rate.
+				tier: 0,
+				session: shortHash(`grok:${session}`),
+				input,
+				cacheRead,
+				cacheWrite5m: cacheWrite,
+				cacheWrite1h: 0,
+				output
+			});
+		}
+	};
+}
+
+const isJsonl = (name) => name.endsWith('.jsonl');
+
 /**
- * A reader for JSONL logs that only grow: walks `*.jsonl` under each path and parses only the
- * bytes added since the last run. `lines` builds the line handler for one file.
+ * A reader for JSONL logs that only grow: walks the files under each path whose name `keep`
+ * accepts (any `*.jsonl` by default) and parses only the bytes added since the last run. `lines`
+ * builds the line handler for one file.
  * @param {(ctx: ReadContext, file: FileState, path: string) => (line: string) => void} lines
+ * @param {(name: string) => boolean} [keep]
  */
-const jsonlReader = (lines) => async (paths, ctx, provider) => {
+const jsonlReader = (lines, keep) => async (paths, ctx, provider) => {
 	const { state } = ctx;
 	for (const dir of paths) {
 		if (!existsSync(dir)) continue;
-		for await (const path of walk(dir)) {
+		for await (const path of walk(dir, keep ?? isJsonl)) {
 			if (ctx.seenPaths.has(path)) continue;
 			ctx.seenPaths.add(path);
 			let st;
@@ -867,6 +951,17 @@ const SOURCES = {
 				)
 			];
 		}
+	},
+	grok: {
+		paths: [join(HOME, '.grok', 'sessions')],
+		envPaths: () => fromEnv('GROK_HOME', 'sessions'),
+		read: jsonlReader(
+			(ctx, _file, path) => grokLineHandler(ctx.state, ctx.cutoffMs, path),
+			(name) => name === 'updates.jsonl'
+		),
+		// Grok Build logs `grok-4.5-build`; LiteLLM prices it as `xai/grok-4.5`.
+		priceKeys: (model) =>
+			[model, model.replace(/-build$/, '')].flatMap((base) => [base, `xai/${base}`])
 	}
 };
 
