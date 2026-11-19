@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { main } from '../src/cli.ts';
-import type { UsageRow, UsageSnapshot } from '../src/schema.ts';
+import { usageSnapshotSchema, type UsageRow, type UsageSnapshot } from '../src/schema.ts';
 import { createBigSpender } from '../src/server/index.ts';
 import { createHttpServer } from '../src/serve.ts';
 import { harness, run, seedPricing, snapshot, withSandbox, type Sandbox } from './helpers.ts';
@@ -46,7 +46,7 @@ type FakeCursor = {
 	accessToken: string;
 	shortBy: number;
 	countBonus: number;
-	errorOnce: boolean;
+	errorOnce: Record<string, string> | null;
 };
 
 /** Cursor's API as the collector sees it: a key exchange and one page of up to 1000 events. */
@@ -56,7 +56,7 @@ async function withCursor(
 ) {
 	const requests: UsageRequest[] = [];
 	const api: FakeCursor = {
-		errorOnce: false,
+		errorOnce: null,
 		apiKey: API_KEY,
 		accessToken: ACCESS_TOKEN,
 		shortBy: 0,
@@ -81,8 +81,9 @@ async function withCursor(
 				return reply(401, { error: 'no' });
 			}
 			if (api.errorOnce) {
-				api.errorOnce = false;
-				return reply(200, { code: 'unavailable', message: 'upstream error' });
+				const error = api.errorOnce;
+				api.errorOnce = null;
+				return reply(200, error);
 			}
 			const body = JSON.parse(text);
 			const startDate = Number(body.startDate);
@@ -413,10 +414,17 @@ test('a page short of its count, a stale reply or an unsafe token never complete
 				assert.match(invalid.stderr, /Cursor counted 3 usage events in a window but returned 2/);
 				events.pop();
 
-				api.errorOnce = true;
-				const errored = await run(COLLECTOR, [], env);
-				assert.equal(errored.code, 1);
-				assert.match(errored.stderr, /Cursor answered with an error instead of usage events/);
+				const errors: Record<string, string>[] = [
+					{ error: 'x' },
+					{ code: 'unavailable' },
+					{ message: 'upstream' }
+				];
+				for (const error of errors) {
+					api.errorOnce = error;
+					const errored = await run(COLLECTOR, [], env);
+					assert.equal(errored.code, 1, JSON.stringify(error));
+					assert.match(errored.stderr, /Cursor answered with an error instead of usage events/);
+				}
 
 				api.accessToken = 'tok\nsecret-part';
 				const unsafe = await run(COLLECTOR, [], env);
@@ -514,13 +522,13 @@ test('install and push refuse the cursor device id, and install refuses a key wi
 	});
 });
 
-test('the server takes only Cursor usage under the cursor device id', async () => {
+test('the server takes only Cursor usage under the cursor device id, and keeps older files', async () => {
 	await withSandbox(async (box) => {
-		const bs = createBigSpender({
-			dataDir: join(box.home, 'data'),
-			ingestToken: 'tok',
-			devices: { devices: {} }
-		});
+		const dataDir = join(box.home, 'data');
+		await mkdir(dataDir, { recursive: true });
+		// What a machine named "cursor" stored before the id was reserved.
+		await writeFile(join(dataDir, 'cursor.json'), JSON.stringify(snapshot('cursor')));
+		const bs = createBigSpender({ dataDir, ingestToken: 'tok', devices: { devices: {} } });
 		const ingest = (snap: UsageSnapshot) =>
 			bs.ingest(
 				new Request('http://localhost/api/usage/ingest', {
@@ -529,12 +537,31 @@ test('the server takes only Cursor usage under the cursor device id', async () =
 					body: JSON.stringify(snap)
 				})
 			);
+		const cursorRows = snapshot('cursor').hourly.map((r) => ({
+			...r,
+			provider: 'cursor' as const
+		}));
+
+		const legacy = (await bs.summary()).ranges.all.devices.map((d) => d.name);
+		assert.deepEqual(legacy, ['cursor'], 'a stored file from before the reservation still loads');
+
 		assert.equal((await ingest(snapshot('cursor'))).status, 422, 'an older collector named cursor');
-		const cursorOnly = {
-			...snapshot('cursor'),
+		assert.equal(
+			(await ingest({ ...snapshot('cursor'), hourly: cursorRows })).status,
+			422,
+			'Cursor rows with LiteLLM prices'
+		);
+		assert.equal(
+			(await ingest({ ...snapshot('cursor'), pricingSource: 'cursor' })).status,
+			422,
+			'Claude rows from the Cursor reader'
+		);
+		const accepted = await ingest({
+			...snapshot('cursor', '2026-11-15T00:00:00Z'),
 			pricingSource: 'cursor',
-			hourly: snapshot('cursor').hourly.map((r) => ({ ...r, provider: 'cursor' as const }))
-		};
-		assert.equal((await ingest(cursorOnly)).status, 200);
+			hourly: cursorRows
+		});
+		assert.equal(accepted.status, 200);
+		assert.ok(usageSnapshotSchema.pick({ deviceId: true }).parse({ deviceId: 'cursor' }));
 	});
 });

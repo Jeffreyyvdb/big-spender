@@ -133,7 +133,9 @@ of 1, 0.1, 1.25 and 5. The total is Cursor's, up to rounding each part to a mill
 A Cursor failure, such as a revoked key, does not stop the machine's own snapshot. The run still
 posts it, then exits with an error that names Cursor. That includes a Cursor answer with fewer
 events than it counted: posting it would replace complete days on the server with partial ones. The device
-id `cursor` is reserved for this snapshot, so no machine can report under it. `big-spender push` never
+id `cursor` is reserved for this snapshot, so no machine can report under it. To
+switch to another Cursor account, remove `cursor.json` from the server first, or the two
+accounts' histories are merged. `big-spender push` never
 reads Cursor.
 
 ## The server
