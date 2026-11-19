@@ -120,8 +120,8 @@ async function acquireLock() {
 /**
  * @typedef {{ input: number, cacheRead: number, cacheWrite: number, output: number, savings: number }} Cost
  * @typedef {{ input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number, sessions: string[], cost?: Cost }} Bucket
- * A JSONL file's read position. Readers may keep their own fields on it (Codex: model, sessionId, lastTotal; pi: forkCalls).
- * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number, forkCalls?: string[] }} FileState
+ * A JSONL file's read position. Readers may keep their own fields on it (Codex: model, sessionId, lastTotal; pi: forkCalls; Copilot: models, callsSinceShutdown).
+ * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number, forkCalls?: string[], models?: Record<string, { input: number, cacheRead: number, cacheWrite: number, output: number, requests?: number }>, callsSinceShutdown?: boolean }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
@@ -819,20 +819,113 @@ function grokLineHandler(state, cutoffMs, path) {
 	};
 }
 
-const isJsonl = (name) => name.endsWith('.jsonl');
+// Copilot CLI versions without session.usage_record log usage only in session.shutdown. Like
+// ccusage, a shutdown counts as cumulative per model since the session began, which older
+// versions may not hold to (issue #11). inputTokens includes cache reads and writes.
+// reasoningTokens is part of outputTokens.
+// A bring-your-own-key model can be a cloud resource id or gateway URL, which may carry an
+// account id, so only its last path segment leaves the machine.
+const copilotModelName = (raw) => {
+	const name = String(raw ?? '')
+		.trim()
+		.split(/[?#]/)[0]
+		.split('/')
+		.pop();
+	return (/^arn:/i.test(name) ? name.split(':').pop() : name)
+		.replace(/-1m(-internal)?$/, '')
+		.replace(/[^A-Za-z0-9._:@-]/g, '-')
+		.slice(0, 100);
+};
+
+function copilotLineHandler(state, file, resolvePrice, cutoffMs, sessionDir) {
+	const session = shortHash(`copilot:${sessionDir}`);
+	const count = (u, requests) => ({
+		input: num(u?.inputTokens),
+		cacheRead: num(u?.cacheReadTokens),
+		cacheWrite: num(u?.cacheWriteTokens),
+		output: num(u?.outputTokens),
+		requests: num(requests)
+	});
+	const add = (ts, model, t, tier) =>
+		addRecord(state, {
+			ts,
+			provider: 'copilot',
+			model,
+			tier,
+			session,
+			input: Math.max(0, t.input - t.cacheRead - t.cacheWrite),
+			cacheRead: t.cacheRead,
+			cacheWrite5m: t.cacheWrite,
+			cacheWrite1h: 0,
+			output: t.output
+		});
+	return (line) => {
+		const isCall = line.includes('"session.usage_record"');
+		if (!isCall && !line.includes('"session.shutdown"')) return;
+		const o = parseJson(line);
+		if (!o || o.type !== (isCall ? 'session.usage_record' : 'session.shutdown')) return;
+		const ts = Date.parse(o.timestamp);
+		if (!Number.isFinite(ts)) return;
+		const id = o.id ?? o.timestamp;
+		if (isCall) {
+			file.callsSinceShutdown = true;
+			const model = copilotModelName(o.data?.usage?.model);
+			const key = `p:${shortHash(`${sessionDir}:${id}`)}`;
+			if (!model || ts < cutoffMs || state.seen[key] !== undefined) return;
+			state.seen[key] = ts;
+			const t = count(o.data.usage);
+			add(ts, model, t, tierFor(resolvePrice('copilot', model), t.input));
+			return;
+		}
+		// Names that normalise to one model (`gpt-5.2` and `gpt-5.2-1m`) are added up before the
+		// previous shutdown is subtracted.
+		/** @type {Record<string, ReturnType<typeof count>>} */
+		const totals = {};
+		for (const [rawModel, metrics] of Object.entries(o.data?.modelMetrics ?? {})) {
+			const model = copilotModelName(rawModel);
+			if (!metrics?.usage || !model) continue;
+			const t = count(metrics.usage, metrics.requests?.count);
+			const sum = (totals[model] ??= count());
+			for (const k of Object.keys(t)) sum[k] += t[k];
+		}
+		file.models ??= {};
+		for (const [model, now] of Object.entries(totals)) {
+			const was = file.models[model] ?? {};
+			file.models[model] = now;
+			const delta = count();
+			for (const k of Object.keys(delta)) delta[k] = Math.max(0, now[k] - num(was[k]));
+			const key = `p:${shortHash(`${sessionDir}:${id}:${model}`)}`;
+			if (
+				file.callsSinceShutdown ||
+				ts < cutoffMs ||
+				!(delta.input || delta.cacheRead || delta.cacheWrite || delta.output) ||
+				state.seen[key] !== undefined
+			) {
+				continue;
+			}
+			state.seen[key] = ts;
+			// An interval of one request is one prompt, so only then can it reach a long-context tier.
+			const tier = delta.requests === 1 ? tierFor(resolvePrice('copilot', model), delta.input) : 0;
+			add(ts, model, delta, tier);
+		}
+		file.callsSinceShutdown = false;
+	};
+}
+
+const allJsonl = (dir) => walk(dir, (name) => name.endsWith('.jsonl'));
 
 /**
- * A reader for JSONL logs that only grow: walks the files under each path whose name `keep`
- * accepts (any `*.jsonl` by default) and parses only the bytes added since the last run. `lines`
+ * A reader for JSONL logs that only grow: reads the files `files` lists under each path (every
+ * `*.jsonl` below it by default) and parses only the bytes added since the last run. `lines`
  * builds the line handler for one file.
  * @param {(ctx: ReadContext, file: FileState, path: string) => (line: string) => void} lines
- * @param {(name: string) => boolean} [keep]
+ * @param {(dir: string) => AsyncIterable<string>} [files]
  */
-const jsonlReader = (lines, keep) => async (paths, ctx, provider) => {
+const jsonlReader = (lines, files) => async (paths, ctx, provider) => {
 	const { state } = ctx;
 	for (const dir of paths) {
 		if (!existsSync(dir)) continue;
-		for await (const path of walk(dir, keep ?? isJsonl)) {
+		for await (const path of (files ?? allJsonl)(dir)) {
 			if (ctx.seenPaths.has(path)) continue;
 			ctx.seenPaths.add(path);
 			let st;
@@ -882,6 +975,20 @@ async function openSqlite(path) {
 	});
 	const mod = await sqlite;
 	return mod && new mod.DatabaseSync(path, { readOnly: true });
+}
+
+/** Copilot keeps user files in other session subfolders, so only `<session>/events.jsonl` counts. */
+async function* sessionEvents(dir) {
+	let entries;
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const e of entries) {
+		const p = join(dir, e.name, 'events.jsonl');
+		if (e.isDirectory() && existsSync(p)) yield p;
+	}
 }
 
 const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name], ...rest)] : []);
@@ -957,11 +1064,32 @@ const SOURCES = {
 		envPaths: () => fromEnv('GROK_HOME', 'sessions'),
 		read: jsonlReader(
 			(ctx, _file, path) => grokLineHandler(ctx.state, ctx.cutoffMs, path),
-			(name) => name === 'updates.jsonl'
+			(dir) => walk(dir, (name) => name === 'updates.jsonl')
 		),
 		// Grok Build logs `grok-4.5-build`; LiteLLM prices it as `xai/grok-4.5`.
 		priceKeys: (model) =>
 			[model, model.replace(/-build$/, '')].flatMap((base) => [base, `xai/${base}`])
+	},
+	copilot: {
+		paths: [join(HOME, '.copilot', 'session-state')],
+		envPaths: () => fromEnv('COPILOT_HOME', 'session-state'),
+		read: jsonlReader(
+			(ctx, file, path) =>
+				copilotLineHandler(
+					ctx.state,
+					file,
+					ctx.resolvePrice,
+					ctx.cutoffMs,
+					basename(dirname(path))
+				),
+			sessionEvents
+		),
+		priceKeys: (model) => {
+			const claude = model.startsWith('claude-');
+			const name = claude ? model.replace(/(\d)\.(\d)/g, '$1-$2') : model;
+			const prefix = claude ? 'anthropic' : model.startsWith('gemini-') ? 'gemini' : 'openai';
+			return [...new Set([...litellmKeys(prefix)(name), `github_copilot/${model}`])];
+		}
 	}
 };
 

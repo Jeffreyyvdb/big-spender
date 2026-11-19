@@ -24,7 +24,8 @@ const AGENTS = {
 	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
 	codex: { agent: 'codex' },
 	pi: { agent: 'pi', args: ['--mode', 'calculate'], renameModel: (m) => m.replace(/^\[pi\] /, '') },
-	grok: { agent: 'grok', renameModel: (m) => m.replace(/^\[grok\] /, '') }
+	grok: { agent: 'grok', renameModel: (m) => m.replace(/^\[grok\] /, '') },
+	copilot: { agent: 'copilot' }
 };
 
 const CCUSAGE_VERSION = '20.0.51';
