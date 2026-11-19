@@ -135,7 +135,8 @@ async function acquireLock() {
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * Antigravity keeps a merged response under each of its ids: see agStoreGroup.
- * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]]} Seen
+ * Gemini keeps a file's counts under `gm:` and its path: [latest hour, counts]; see readGemini.
+ * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]] | [number, Record<string, any>]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
  * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
@@ -938,6 +939,214 @@ function copilotLineHandler(state, file, resolvePrice, cutoffMs, sessionDir) {
 }
 
 const allJsonl = (dir) => walk(dir, (name) => name.endsWith('.jsonl'));
+
+// Gemini CLI keeps each chat under ~/.gemini/tmp/<project hash>/chats, as a JSON file it rewrites
+// after every message or as JSONL it appends to, and headless runs can save their stats there too.
+// Every .json and .jsonl file under it is read with ccusage's rules for these shapes.
+
+const GEMINI_TOKEN_KEYS = {
+	input: ['input', 'prompt', 'input_tokens', 'prompt_tokens'],
+	output: ['output', 'candidates', 'output_tokens', 'candidates_tokens'],
+	cached: ['cached', 'cached_tokens'],
+	thoughts: ['thoughts', 'reasoning', 'thoughts_tokens', 'reasoning_tokens'],
+	tool: ['tool', 'tool_tokens']
+};
+const GEMINI_TIME =
+	/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{3})?(Z|[+-]\d{2}:\d{2})$/;
+// Gemini's context is a few million tokens, so a larger count is corrupt. Capping each record also
+// keeps a bucket's sum under the snapshot schema's limit.
+const GEMINI_MAX_TOKENS = 1e9;
+
+const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+const nonEmpty = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
+// Date.parse would roll an hour of 24 or February 30 over to the next day; ccusage rejects them.
+const geminiTime = (v) => {
+	const m = typeof v === 'string' ? GEMINI_TIME.exec(v) : null;
+	if (!m) return undefined;
+	const [, y, mo, d, h, mi, sec] = m.map(Number);
+	const day = new Date(Date.UTC(y, mo - 1, d));
+	if (day.getUTCMonth() !== mo - 1 || day.getUTCDate() !== d || h > 23 || mi > 59 || sec > 59) {
+		return undefined;
+	}
+	const ms = Date.parse(v);
+	return plausibleTime(ms) ? ms : undefined;
+};
+
+/**
+ * One request's tokens. Headless stats always count cached tokens inside `input`; a chat message
+ * does when its total equals the parts without them, as Gemini's totalTokenCount does. Reasoning
+ * and whatever the total has beyond the parts are billed as output.
+ */
+function geminiUsage(raw, cachedInInput) {
+	if (!isObject(raw)) return null;
+	const count = (v) => (typeof v === 'number' ? Math.trunc(Math.max(0, v)) : undefined);
+	const tokenKeys = [...Object.values(GEMINI_TOKEN_KEYS).flat(), 'total', 'total_tokens'];
+	if (tokenKeys.some((k) => typeof raw[k] === 'number' && !(raw[k] < GEMINI_MAX_TOKENS)))
+		return null;
+	const pick = (keys) => keys.map((k) => count(raw[k])).find((v) => v !== undefined) ?? 0;
+	const { input, output, cached, thoughts, tool } = Object.fromEntries(
+		Object.entries(GEMINI_TOKEN_KEYS).map(([name, keys]) => [name, pick(keys)])
+	);
+	const total = 'total' in raw ? count(raw.total) : count(raw.total_tokens);
+	const overlap = cachedInInput || (cached > 0 && total === input + output + thoughts + tool);
+	const prompt = (overlap ? input - Math.min(input, cached) : input) + tool;
+	const known = prompt + output + cached + thoughts;
+	const billedOutput = output + thoughts + Math.max(0, (total ?? known) - known);
+	if (!prompt && !cached && !billedOutput) return null;
+	return { input: prompt, cacheRead: cached, output: billedOutput };
+}
+
+/**
+ * The usage events in one Gemini file, or null for a file that may be half written: JSON that
+ * does not parse, or JSONL whose last line does not. `id` is the message id when the event has one. In JSONL a line's session id
+ * and model carry over to the lines after it, and a message logged again with its id replaces
+ * the earlier copy, as in ccusage.
+ */
+function geminiEvents(path, text, mtimeMs) {
+	const events = [];
+	let session = basename(path).replace(/\.jsonl?$/, '');
+	const push = (raw, model, ts, cachedInInput, id) => {
+		const u = model && geminiUsage(raw, cachedInInput);
+		if (u) events.push({ ...u, model, ts, session, id });
+	};
+	const pushStats = (o, model, ts) => {
+		const stats = o.stats ?? (isObject(o.result) ? o.result.stats : undefined);
+		if (!isObject(stats)) return;
+		const before = events.length;
+		if (isObject(stats.models)) {
+			for (const [name, m] of Object.entries(stats.models)) {
+				if (isObject(m)) push(m.tokens, nonEmpty(name), ts, true);
+			}
+		}
+		if (events.length === before) push(stats, model ?? 'unknown', ts, true);
+	};
+	const sessionOf = (o) => nonEmpty(o.sessionId) ?? nonEmpty(o.session_id) ?? session;
+	const direct = (o, model, fallbackMs) =>
+		push(
+			o.tokens,
+			model,
+			geminiTime(o.timestamp) ?? geminiTime(o.created_at) ?? fallbackMs,
+			false,
+			nonEmpty(o.id)
+		);
+
+	if (path.endsWith('.jsonl')) {
+		let model;
+		const byId = new Map();
+		const lines = text.split('\n');
+		const last = lines.findLast((line) => line.trim());
+		if (last !== undefined && parseJson(last) === null) return null;
+		for (const line of lines) {
+			const o = parseJson(line);
+			if (!isObject(o)) continue;
+			session = sessionOf(o);
+			model = nonEmpty(o.model) ?? model;
+			if (o.type !== 'gemini') {
+				pushStats(o, model, geminiTime(o.timestamp) ?? mtimeMs);
+				continue;
+			}
+			const n = events.length;
+			direct(o, model, mtimeMs);
+			const id = events[n]?.id;
+			if (id === undefined) continue;
+			if (byId.has(id)) events[byId.get(id)] = events.pop();
+			else byId.set(id, n);
+		}
+		return events;
+	}
+	const o = parseJson(text);
+	if (o === null) return null;
+	if (!isObject(o)) return events;
+	session = sessionOf(o);
+	if (Array.isArray(o.messages)) {
+		const start = geminiTime(o.startTime) ?? geminiTime(o.lastUpdated) ?? mtimeMs;
+		for (const m of o.messages) {
+			if (isObject(m) && m.type === 'gemini') direct(m, nonEmpty(m.model), start);
+		}
+	} else if (o.type === 'gemini') {
+		direct(o, nonEmpty(o.model), mtimeMs);
+	} else {
+		pushStats(o, nonEmpty(o.model), geminiTime(o.timestamp) ?? mtimeMs);
+	}
+	return events;
+}
+
+/**
+ * Gemini rewrites its files, so a changed file is read whole and what it counts now replaces
+ * what it counted before, as ccusage counts each file as it is. `state.seen` keeps each file's
+ * counts per hour, model, tier and session so they can be taken back, also after the file was
+ * skipped for a while (an experimental source turned off). A message updated, corrected or
+ * removed in the file changes the count with it, and an hour or model it leaves is sent as a
+ * zero row.
+ * @type {Source['read']}
+ */
+async function readGemini(paths, ctx, provider) {
+	const { state, cutoffMs } = ctx;
+	for (const dir of paths) {
+		// A symlinked GEMINI_DATA_DIR reaches the same files as the default under another name.
+		const root = await realpath(dir).catch(() => null);
+		if (!root) continue;
+		for await (const path of walk(root, (name) => /\.jsonl?$/.test(name))) {
+			if (ctx.seenPaths.has(path)) continue;
+			ctx.seenPaths.add(path);
+			let st;
+			let text;
+			try {
+				st = await stat(path);
+				if (st.mtimeMs < cutoffMs) {
+					delete state.files[path];
+					continue;
+				}
+				const prev = state.files[path];
+				const rescan = state.rescan?.includes(provider);
+				if (!rescan && prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) continue;
+				text = await readFile(path, 'utf8');
+			} catch (err) {
+				log(`skipping unreadable file: ${err.message}`);
+				continue;
+			}
+			ctx.filesRead++;
+			ctx.parsedBytes += st.size;
+			const events = geminiEvents(path, text, st.mtimeMs);
+			state.files[path] = { size: st.size, mtimeMs: st.mtimeMs, offset: st.size };
+			// Half written: keep what it counted until the write completes and changes the file.
+			if (!events) continue;
+			/** @type {Record<string, ReturnType<typeof geminiRecord>>} */
+			const counts = {};
+			for (const e of events) {
+				if (e.ts < cutoffMs) continue;
+				const model = localModelName(e.model) || 'unknown';
+				const tier = tierFor(ctx.resolvePrice(provider, model), e.input + e.cacheRead);
+				const r = geminiRecord(e.ts, model, tier, shortHash(`gemini:${e.session}`));
+				const c = (counts[`${recordBucketKey(r)}|${r.session}`] ??= r);
+				c.input += e.input;
+				c.cacheRead += e.cacheRead;
+				c.output += e.output;
+			}
+			const seenKey = `gm:${shortHash(path)}`;
+			const before = state.seen[seenKey];
+			for (const r of Object.values(Array.isArray(before) ? before[1] : {})) removeRecord(state, r);
+			for (const r of Object.values(counts)) addRecord(state, r);
+			const latest = Math.max(...Object.values(counts).map((r) => r.ts));
+			if (Number.isFinite(latest)) state.seen[seenKey] = [latest, counts];
+			else delete state.seen[seenKey];
+		}
+	}
+}
+
+/** A Gemini count for one hour, model, tier and session, in the shape addRecord takes. */
+const geminiRecord = (ts, model, tier, session) => ({
+	ts: Math.floor(ts / HOUR_MS) * HOUR_MS,
+	provider: 'gemini',
+	model,
+	tier,
+	session,
+	input: 0,
+	cacheRead: 0,
+	cacheWrite5m: 0,
+	cacheWrite1h: 0,
+	output: 0
+});
 
 /**
  * A reader for JSONL logs that only grow: reads the files `files` lists under each path (every
@@ -1795,6 +2004,20 @@ const SOURCES = {
 		envPaths: antigravityEnvDirs,
 		read: readAntigravity,
 		priceKeys: antigravityPriceKeys
+	},
+	gemini: {
+		experimental: true,
+		paths: [join(HOME, '.gemini', 'tmp')],
+		envPaths: () =>
+			(process.env.GEMINI_DATA_DIR ?? '')
+				.split(',')
+				.map((p) => p.trim())
+				.filter(Boolean),
+		read: readGemini,
+		priceKeys: (model) => [
+			...['gemini', 'vertex_ai', 'openrouter/google'].map((p) => `${p}/${model}`),
+			model
+		]
 	}
 };
 

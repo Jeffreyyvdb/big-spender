@@ -24,7 +24,8 @@ export const PROVIDERS = [
 	'pi',
 	'grok',
 	'copilot',
-	'antigravity'
+	'antigravity',
+	'gemini'
 ] as const;
 // Public ranges. 7d, 30d and 90d are bucketed by UTC day, `all` by ISO week. Nothing is finer
 // than a day: an hourly view would show when each machine is in use.
