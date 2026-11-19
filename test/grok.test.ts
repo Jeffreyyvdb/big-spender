@@ -152,3 +152,77 @@ test('Grok Build turns count once per event and model, priced at the base rate',
 		assert.equal(third.snapshot.hourly.length, first.snapshot.hourly.length + 1);
 	});
 });
+
+test('Grok Build edge cases: path models, fractional counts, eventless rows, late summaries', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const cache = join(env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(cache, { recursive: true });
+		await writeFile(
+			join(cache, 'litellm-prices.json'),
+			JSON.stringify({ fetchedAt: Date.now(), models: PRICES })
+		);
+		const ts = Math.floor((Date.now() - 3_600_000) / 1000);
+		const line = (usage: object, eventId?: string) =>
+			JSON.stringify({
+				timestamp: ts,
+				params: {
+					update: { sessionUpdate: 'turn_completed', usage },
+					_meta: eventId ? { eventId } : {}
+				}
+			}) + '\n';
+		const sessions = join(home, '.grok', 'sessions');
+		const put = async (rel: string, content: string) => {
+			await mkdir(join(sessions, rel, '..'), { recursive: true });
+			await appendFile(join(sessions, rel), content);
+		};
+		const rows = async () => {
+			const res = await run(COLLECTOR, ['--dry-run'], { ...env, BIG_SPENDER_DEVICE_ID: 'laptop' });
+			assert.equal(res.code, 0, res.stderr);
+			const snapshot = usageSnapshotSchema.parse(JSON.parse(res.stdout));
+			assert.ok(!res.stdout.includes('secret-project'), 'a model path leaks');
+			const out: Record<string, [number, number]> = {};
+			for (const r of snapshot.hourly) {
+				const d = (out[r.model] ??= [0, 0]);
+				d[0] += r.inputTokens;
+				d[1] += r.outputTokens;
+			}
+			return out;
+		};
+
+		const eventless = line({
+			modelUsage: { 'grok-4.5-build': { inputTokens: 100, outputTokens: 20 } }
+		});
+		await put('a/sess/updates.jsonl', eventless + eventless);
+		await put(
+			'p/s1/updates.jsonl',
+			line(
+				{
+					modelUsage: { '/home/dev/secret-project/model.gguf': { inputTokens: 5, outputTokens: 1 } }
+				},
+				'e-path'
+			) +
+				line(
+					{ modelUsage: { 'grok-4.5-build': { inputTokens: 12.5, outputTokens: 10 } } },
+					'e-frac'
+				) +
+				line({ inputTokens: 7, outputTokens: 3 }, 'e-top')
+		);
+		assert.deepEqual(await rows(), {
+			'grok-4.5-build': [100, 30],
+			'model.gguf': [5, 1],
+			unknown: [7, 3]
+		});
+
+		// The same eventless row in another file is another turn; the top-level event replayed
+		// after summary.json appears is the same turn.
+		await put('b/sess/updates.jsonl', eventless);
+		await put('p/s1/summary.json', JSON.stringify({ current_model_id: 'grok-4.5-build' }));
+		await put('p/s2/summary.json', JSON.stringify({ current_model_id: 'grok-4.5-build' }));
+		await put('p/s2/updates.jsonl', line({ inputTokens: 7, outputTokens: 3 }, 'e-top'));
+		assert.deepEqual(await rows(), {
+			'grok-4.5-build': [200, 50],
+			'model.gguf': [5, 1],
+			unknown: [7, 3]
+		});
+	});
+});

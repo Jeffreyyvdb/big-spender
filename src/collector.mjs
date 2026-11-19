@@ -673,7 +673,7 @@ const PI_PRICE_PREFIXES = [
 ];
 
 // Local models can have a file path as their id; only the file name leaves the machine.
-const piModel = (model) => {
+const localModelName = (model) => {
 	const isPath =
 		/^([/~.]|[A-Za-z]:)|\\|:\/|\/\//.test(model) ||
 		/\.(gguf|ggml|bin|safetensors|pth?|onnx)$/i.test(model);
@@ -723,7 +723,7 @@ function piLineHandler(state, file, path, resolvePrice, cutoffMs) {
 		if (u.ts < cutoffMs) return;
 		if (state.seen[dedupe] !== undefined) return;
 		state.seen[dedupe] = u.ts;
-		const model = piModel(u.model);
+		const model = localModelName(u.model);
 		addRecord(state, {
 			ts: u.ts,
 			provider: 'pi',
@@ -739,19 +739,14 @@ function piLineHandler(state, file, path, resolvePrice, cutoffMs) {
 	};
 }
 
-/** A Grok model id as a snapshot model name: `[grok] ` dropped, characters the schema refuses replaced. */
-const grokModelName = (raw) =>
-	raw
-		.replace(/^\[grok\] /, '')
-		.trim()
-		.replace(/[^A-Za-z0-9._:/@-]/g, '-')
-		.slice(0, 100) || 'unknown';
+/** A Grok model id as a snapshot model name: `[grok] ` dropped, a path reduced to its file name. */
+const grokModelName = (raw) => localModelName(raw.replace(/^\[grok\] /, '').trim()) || 'unknown';
 
 // Grok Build: a completed turn appends one `turn_completed` line whose usage sums the turn's API
 // requests, split per model in `modelUsage` (top-level usage and the session's current model when
 // that map is missing). inputTokens includes cache reads and cache writes; reasoningTokens is part
 // of outputTokens. The same event can be exported into more than one session, so rows with an
-// eventId are deduplicated by eventId and model, others by their full content.
+// eventId are deduplicated by eventId and model, others by their full content within the file.
 function grokLineHandler(state, cutoffMs, path) {
 	const sessionDir = basename(dirname(path));
 	let currentModel;
@@ -769,6 +764,8 @@ function grokLineHandler(state, cutoffMs, path) {
 		return currentModel;
 	};
 	const str = (v) => (typeof v === 'string' && v ? v : undefined);
+	// Token counts are integers; ccusage reads anything else as 0, and the schema rejects it.
+	const count = (v) => (Number.isInteger(v) ? num(v) : 0);
 	return (line) => {
 		if (!line.includes('"turn_completed"')) return;
 		const o = parseJson(line);
@@ -780,23 +777,27 @@ function grokLineHandler(state, cutoffMs, path) {
 		if (!ts || ts < cutoffMs) return;
 		const eventId = str(p._meta?.eventId);
 		const session = str(p.sessionId) ?? sessionDir;
-		const byModel =
+		const perModel =
 			usage.modelUsage &&
 			typeof usage.modelUsage === 'object' &&
-			Object.keys(usage.modelUsage).length
-				? Object.entries(usage.modelUsage)
-				: [[summaryModel(), usage]];
-		for (const [raw, u] of byModel) {
-			const inputAll = num(u?.inputTokens);
-			const cacheRead = Math.min(num(u?.cachedReadTokens), inputAll);
-			const cacheWrite = Math.min(num(u?.cacheCreationTokens), inputAll - cacheRead);
+			Object.keys(usage.modelUsage).length;
+		// Top-level usage is keyed without its model: summary.json can appear or change between
+		// runs, and the same event must not count again under the new name.
+		const byModel = perModel
+			? Object.entries(usage.modelUsage).map(([raw, u]) => [raw, raw, u])
+			: [[summaryModel(), '', usage]];
+		for (const [raw, keyModel, u] of byModel) {
+			const inputAll = count(u?.inputTokens);
+			const cacheRead = Math.min(count(u?.cachedReadTokens), inputAll);
+			const cacheWrite = Math.min(count(u?.cacheCreationTokens), inputAll - cacheRead);
 			const input = inputAll - cacheRead - cacheWrite;
-			const output = num(u?.outputTokens);
-			const reasoning = num(u?.reasoningTokens);
+			const output = count(u?.outputTokens);
+			const reasoning = count(u?.reasoningTokens);
 			if (!input && !cacheRead && !cacheWrite && !output && !reasoning) continue;
+			// Without an eventId, identical rows count once per file, as in ccusage.
 			const id = eventId
-				? `${eventId}|${raw}`
-				: `${session}|${ts}|${raw}|${input}|${output}|${cacheRead}|${cacheWrite}|${reasoning}`;
+				? `${eventId}|${keyModel}`
+				: `${path}|${ts}|${raw}|${input}|${output}|${cacheRead}|${cacheWrite}|${reasoning}`;
 			const dedupe = `g:${shortHash(id)}`;
 			if (state.seen[dedupe] !== undefined) continue;
 			state.seen[dedupe] = ts;
