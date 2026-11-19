@@ -19,11 +19,7 @@ import { ccusageRows, collectorRows, compare } from './lib/ccusage-parity.ts';
 
 const execFileAsync = promisify(execFile);
 
-/**
- * `outputExcludesReasoning`: the agent's `outputTokens` leave reasoning out, so output is compared
- * per day against the day's total (see ccusageRows).
- * @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string, outputExcludesReasoning?: boolean }>}
- */
+/** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string, outputExcludesReasoning?: boolean }>} */
 const AGENTS = {
 	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
 	codex: { agent: 'codex' },
@@ -184,7 +180,7 @@ function report({ rows, days, dayOutputs }, snapshot) {
 		);
 		for (const d of shownOutputs) {
 			console.log(
-				`${d.day}  ${String(d.ours).padStart(12)}  ${String(d.theirs).padStart(12)}  ${d.ok ? 'equal' : 'differ'}`
+				`${d.day}  ${String(d.ours).padStart(12)}  ${String(d.theirs ?? '-').padStart(12)}  ${d.ok ? 'equal' : 'differ'}`
 			);
 		}
 	}

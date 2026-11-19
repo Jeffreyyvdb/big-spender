@@ -1,12 +1,9 @@
 // Builds Antigravity conversation databases: SQLite files whose blobs use the protobuf fields that
 // ccusage's antigravity adapter decodes (rust/adapters/antigravity/src/parser.rs, v20.0.51).
-//
-//   node test/antigravity-fixture.ts <home>    # writes the fixture home, for scripts/parity-ccusage.mjs
 import { mkdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-/** Null on a Node without `node:sqlite` (before 22.13); the tests that need a database skip. */
 export const sqlite: typeof import('node:sqlite') | null = await import('node:sqlite').catch(
 	() => null
 );
@@ -66,21 +63,20 @@ function usage(u: Usage): number[] {
 	return out;
 }
 
-/** A `gen_metadata.data` blob. `steps` are the indices of the step rows the call belongs to. */
-export function gen({
+export function generationBlob({
 	model,
 	modelField = 19,
 	use,
 	ts,
 	retries = [],
-	steps = []
+	stepIndices = []
 }: {
 	model?: string;
 	modelField?: 19 | 21;
 	use?: Usage;
 	ts?: number;
 	retries?: Usage[];
-	steps?: number[];
+	stepIndices?: number[];
 }): Uint8Array {
 	const chat = [];
 	if (use?.modelId) chat.push(...fVarint(3, use.modelId));
@@ -89,12 +85,11 @@ export function gen({
 	for (const r of retries) chat.push(...fBytes(17, fBytes(2, usage(r))));
 	if (model) chat.push(...fBytes(modelField, model));
 	const root = fBytes(1, chat);
-	for (const s of steps) root.push(...fVarint(2, s));
+	for (const s of stepIndices) root.push(...fVarint(2, s));
 	return Uint8Array.from(root);
 }
 
-/** A `steps.metadata` blob. */
-export function step({
+export function stepBlob({
 	model,
 	use,
 	ts,
@@ -127,27 +122,24 @@ export type Rows = {
 	gens?: [number, Uint8Array][];
 	steps?: [number, Uint8Array][];
 	trajectories?: Uint8Array[];
-	/** False leaves out the `steps` and `trajectory_metadata_blob` tables. */
-	optionalTables?: boolean;
+	withStepsAndTrajectory?: boolean;
 };
 
-/** Creates the database and returns it open, so a test can add rows later. */
 export function openDatabase(
 	path: string,
-	{ gens = [], steps = [], trajectories = [], optionalTables = true }: Rows
+	{ gens = [], steps = [], trajectories = [], withStepsAndTrajectory = true }: Rows
 ) {
 	mkdirSync(dirname(path), { recursive: true });
 	const db = new sqlite!.DatabaseSync(path);
-	// A fixture needs no durability, and an fsync per insert takes seconds on a busy disk.
 	db.exec('PRAGMA synchronous = OFF');
 	db.exec('BEGIN');
 	db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB NOT NULL)');
-	if (optionalTables) {
+	if (withStepsAndTrajectory) {
 		db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)');
 		db.exec('CREATE TABLE trajectory_metadata_blob (data BLOB)');
 	}
 	addGenerations(db, gens);
-	if (optionalTables) {
+	if (withStepsAndTrajectory) {
 		const s = db.prepare('INSERT INTO steps (idx, metadata) VALUES (?, ?)');
 		for (const [idx, data] of steps) s.run(idx, data);
 		const t = db.prepare('INSERT INTO trajectory_metadata_blob (data) VALUES (?)');
@@ -169,15 +161,9 @@ export function createDatabase(path: string, rows: Rows) {
 	openDatabase(path, rows).close();
 }
 
-/** The conversation database `name` below a default root of `home`. */
 export const conversation = (home: string, name: string, root = '.gemini/antigravity') =>
 	join(home, root, 'conversations', name);
 
-/**
- * Writes a home with databases in five of the default roots. Day 0 is three UTC days before
- * `nowMs`, so every timestamp is in the past and inside the collector's 90 days; `at` gives a
- * time on day `d`.
- */
 export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 	const day0 = Math.floor(nowMs / DAY_MS) * DAY_MS - 3 * DAY_MS;
 	const at = (d: number, h: number, m = 0, s = 0, ms = 0) =>
@@ -200,10 +186,9 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 
 	createDatabase(conversation(home, 'main.db'), {
 		gens: [
-			// Out of order on purpose: rows are read by idx.
 			[
 				2,
-				gen({
+				generationBlob({
 					use: {
 						input: 300,
 						totalOutput: 100,
@@ -217,7 +202,7 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 			],
 			[
 				1,
-				gen({
+				generationBlob({
 					model: 'Gemini 3 Pro',
 					use: {
 						input: 400,
@@ -233,10 +218,9 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					ts: at(0, 10, 0, 0, 123)
 				})
 			],
-			// A retry that shares message and provider ids with the primary is the same response.
 			[
 				3,
-				gen({
+				generationBlob({
 					model: 'gemini-3-pro',
 					use: shared,
 					ts: at(0, 12, 0, 1),
@@ -255,7 +239,7 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 			],
 			[
 				4,
-				gen({
+				generationBlob({
 					model: 'Gemini 3.6 Flash (High)',
 					use: { input: 1000, totalOutput: 300, visible: 300, responseId: 'flash-high' },
 					ts: at(0, 23, 59, 59, 900)
@@ -263,7 +247,7 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 			],
 			[
 				5,
-				gen({
+				generationBlob({
 					use: {
 						modelId: 246,
 						input: 4,
@@ -274,31 +258,29 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					ts: at(1, 0)
 				})
 			],
-			// Unkeyed copies linked to step 10 by index, plus a retry that mirrors the primary.
 			[
 				6,
-				gen({
+				generationBlob({
 					model: 'gemini-4-argon',
 					use: unkeyedMirror,
 					ts: at(1, 3, 0, 1),
 					retries: [unkeyedMirror],
-					steps: [10]
+					stepIndices: [10]
 				})
 			],
-			// The failed attempt counts once; the success mirrors step 11.
 			[
 				7,
-				gen({
+				generationBlob({
 					model: 'gemini-3-pro',
 					use: success,
 					ts: at(1, 4, 0, 1),
 					retries: [failed, success],
-					steps: [11]
+					stepIndices: [11]
 				})
 			],
 			[
 				8,
-				gen({
+				generationBlob({
 					model: 'model_placeholder_m402',
 					use: { input: 400, totalOutput: 80, visible: 80, responseId: 'opus-placeholder' },
 					ts: at(1, 5)
@@ -306,15 +288,14 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 			],
 			[
 				9,
-				gen({
+				generationBlob({
 					use: { modelId: 1402, input: 300, totalOutput: 60, visible: 60, responseId: 'opus-id' },
 					ts: at(1, 5, 1)
 				})
 			],
-			// Unknown id with an explicit name; its retry's unknown id stays a placeholder.
 			[
 				10,
-				gen({
+				generationBlob({
 					model: 'claude-opus-5-5-medium',
 					use: {
 						modelId: 1401,
@@ -330,12 +311,13 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					]
 				})
 			],
-			// No timestamp: the trajectory timestamp stands in.
-			[11, gen({ model: 'gemini-3-pro', use: { input: 2, totalOutput: 3, visible: 3 } })],
-			// Seen in the cli database too, with larger counts.
+			[
+				11,
+				generationBlob({ model: 'gemini-3-pro', use: { input: 2, totalOutput: 3, visible: 3 } })
+			],
 			[
 				12,
-				gen({
+				generationBlob({
 					model: 'gemini-3-pro',
 					use: {
 						input: 20,
@@ -349,14 +331,13 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					ts: at(2, 8)
 				})
 			],
-			// Zero tokens: not an event.
-			[13, gen({ model: 'gemini-3-pro', use: { responseId: 'empty' }, ts: at(2, 9) })]
+			[13, generationBlob({ model: 'gemini-3-pro', use: { responseId: 'empty' }, ts: at(2, 9) })]
 		],
 		steps: [
-			[1, step({ use: shared, ts: at(0, 12), provider: 7 })],
+			[1, stepBlob({ use: shared, ts: at(0, 12), provider: 7 })],
 			[
 				2,
-				step({
+				stepBlob({
 					model: 'gemini-3-flash-agent',
 					ts: at(0, 12, 0, 2),
 					retries: [
@@ -373,12 +354,11 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					provider: 7
 				})
 			],
-			[10, step({ model: 'gemini-4-argon-medium', use: unkeyedMirror, ts: at(1, 3) })],
-			[11, step({ model: 'gemini-3-pro', use: success, ts: at(1, 4) })],
-			// Token model ids beat the row model: step on 2.5 Pro, its retry on Claude 4 Opus.
+			[10, stepBlob({ model: 'gemini-4-argon-medium', use: unkeyedMirror, ts: at(1, 3) })],
+			[11, stepBlob({ model: 'gemini-3-pro', use: success, ts: at(1, 4) })],
 			[
 				12,
-				step({
+				stepBlob({
 					use: { modelId: 246, input: 10, totalOutput: 5, visible: 5, responseId: 'step-pro' },
 					ts: at(1, 7),
 					retries: [
@@ -386,10 +366,9 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					]
 				})
 			],
-			// A Google API provider id.
 			[
 				13,
-				step({
+				stepBlob({
 					model: 'gemini-2.5-flash',
 					use: {
 						input: 700,
@@ -411,7 +390,7 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 		gens: [
 			[
 				1,
-				gen({
+				generationBlob({
 					model: 'gemini-3-pro',
 					use: {
 						input: 200,
@@ -427,7 +406,7 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 			],
 			[
 				2,
-				gen({
+				generationBlob({
 					model: 'Claude 3.7 Sonnet Thinking',
 					use: {
 						input: 1200,
@@ -441,10 +420,9 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					ts: at(2, 13, 30)
 				})
 			],
-			// A display name no table knows is kept as written, spaces and parentheses included.
 			[
 				3,
-				gen({
+				generationBlob({
 					model: 'Experimental Model (Preview 2)',
 					use: { input: 70, totalOutput: 7, visible: 7, responseId: 'odd-name' },
 					ts: at(2, 14)
@@ -453,12 +431,11 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 		]
 	});
 
-	// No steps or trajectory tables, model name in field 21, nested below conversations/.
 	createDatabase(conversation(home, 'sub/nested.db', '.config/antigravity'), {
 		gens: [
 			[
 				1,
-				gen({
+				generationBlob({
 					model: 'gemini-3-flash-agent',
 					modelField: 21,
 					use: {
@@ -471,10 +448,9 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 					ts: at(2, 15)
 				})
 			],
-			// A prompt above 200k tokens, where LiteLLM lists a higher price for this model.
 			[
 				2,
-				gen({
+				generationBlob({
 					use: {
 						modelId: 246,
 						input: 250_000,
@@ -486,22 +462,20 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 				})
 			]
 		],
-		optionalTables: false
+		withStepsAndTrajectory: false
 	});
 
-	// No model and no timestamp anywhere: the default model and the file's mtime.
 	const noModel = conversation(home, 'nomodel.db', '.gemini/antigravity-acp');
 	createDatabase(noModel, {
-		gens: [[1, gen({ use: { input: 33, totalOutput: 11, visible: 11 } })]]
+		gens: [[1, generationBlob({ use: { input: 33, totalOutput: 11, visible: 11 } })]]
 	});
 	utimesSync(noModel, new Date(at(2, 18)), new Date(at(2, 18)));
 
-	// Skipped whole: one malformed row spoils the database, so its valid row must not count.
 	createDatabase(conversation(home, 'partial.db', '.gemini/antigravity-backup'), {
 		gens: [
 			[
 				1,
-				gen({
+				generationBlob({
 					model: 'gemini-3-pro',
 					use: { input: 100, totalOutput: 5, visible: 5, responseId: 'must-not-count' },
 					ts: at(2, 20)
@@ -512,7 +486,6 @@ export function buildAntigravityHome(home: string, nowMs = Date.now()) {
 	});
 	writeFileSync(conversation(home, 'not-a-database.db'), 'not sqlite');
 	writeFileSync(conversation(home, 'empty.db'), '');
-	// A default root without conversations/ is not read at all.
 	mkdirSync(join(home, '.gemini/antigravity-ide'), { recursive: true });
 	writeFileSync(join(home, '.gemini/antigravity-ide/conversation_summaries.db'), 'not sqlite');
 	return { day0, at };

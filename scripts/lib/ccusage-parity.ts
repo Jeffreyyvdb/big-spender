@@ -58,7 +58,7 @@ export type DayResult = {
 	ok: boolean;
 };
 
-export type DayOutputResult = { day: string; ours: number; theirs: number; ok: boolean };
+export type DayOutputResult = { day: string; ours: number; theirs: number | null; ok: boolean };
 
 const TOKEN_FIELDS = ['input', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'output'] as const;
 const COST_PARTS = 4;
@@ -103,8 +103,7 @@ export function collectorRows(snapshot: UsageSnapshot, provider: string): Rows {
  *
  * `outputExcludesReasoning` is for agents (antigravity) whose `outputTokens` leave reasoning
  * out, while the collector counts it as output. Their rows have no reasoning field; only a day's
- * `totalTokens` includes it. So the result carries `dayOutput`, each day's output with reasoning
- * (the day total minus input and cache tokens), and `compare` checks output per day, not per row.
+ * `totalTokens` includes it.
  */
 export function ccusageRows(
 	report: CcusageReport,
@@ -113,16 +112,15 @@ export function ccusageRows(
 ) {
 	const rows: Rows = new Map();
 	const dayCost = new Map<string, number>();
-	const dayOutput = outputExcludesReasoning ? new Map<string, number>() : undefined;
+	const dayOutput = outputExcludesReasoning ? new Map<string, number | null>() : undefined;
 	for (const day of report.daily ?? []) {
 		dayCost.set(day.date, day.totalCost ?? day.costUSD ?? 0);
-		// NaN when ccusage leaves a total out, which compares unequal to every count.
+		const totals = [day.totalTokens, day.inputTokens, day.cacheCreationTokens, day.cacheReadTokens];
 		dayOutput?.set(
 			day.date,
-			Number(day.totalTokens) -
-				Number(day.inputTokens) -
-				Number(day.cacheCreationTokens) -
-				Number(day.cacheReadTokens)
+			totals.every((n) => typeof n === 'number')
+				? day.totalTokens! - day.inputTokens! - day.cacheCreationTokens! - day.cacheReadTokens!
+				: null
 		);
 		const models: Array<[string, CcusageModel]> = day.modelBreakdowns
 			? day.modelBreakdowns.map((m) => [m.modelName ?? 'unknown', m])
@@ -195,7 +193,7 @@ export function compare(
 	});
 	const dayOutputs = theirs.dayOutput
 		? [...ourDay].map(([day, a]) => {
-				const b = theirs.dayOutput!.get(day) ?? 0;
+				const b = theirs.dayOutput!.get(day) ?? null;
 				return { day, ours: a.output, theirs: b, ok: a.output === b };
 			})
 		: [];

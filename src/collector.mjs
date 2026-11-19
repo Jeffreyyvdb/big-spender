@@ -134,7 +134,6 @@ async function acquireLock() {
  * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number, forkCalls?: string[], models?: Record<string, { input: number, cacheRead: number, cacheWrite: number, output: number, requests?: number }>, callsSinceShutdown?: boolean }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
- * For Antigravity it is [timestamp, input, cache write, cache read, output] as counted so far.
  * @typedef {number | [number, number] | [number, number, number, number, number]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
@@ -1004,9 +1003,6 @@ async function* sessionEvents(dir) {
 
 const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name], ...rest)] : []);
 
-// ---------------------------------------------------------------------------
-// Antigravity
-//
 // One SQLite database per conversation; its blobs are protobuf. `gen_metadata` rows (one per model
 // call) and `steps` rows each carry a usage message plus the usage of earlier attempts. The same
 // response is written to several rows and to several databases, sometimes with partial counts, so
@@ -1032,11 +1028,6 @@ const isDir = (path) => {
 	}
 };
 
-/**
- * The conversation dirs ANTIGRAVITY_DATA_DIR names, comma-separated; each may be a data root or
- * the conversation dir itself. A default root is read only through `conversations/`: without it,
- * it is a fresh install whose only database has no usage tables.
- */
 const antigravityEnvDirs = () =>
 	(process.env.ANTIGRAVITY_DATA_DIR ?? '')
 		.split(',')
@@ -1255,7 +1246,6 @@ const AG_ID_MODELS = {
 const AG_PLACEHOLDER = 'model_placeholder_m';
 const AG_UNRESOLVED_ID = 'antigravity-model-';
 const AG_EFFORT_NAME = /^gemini (3\.[678]) flash \((high|medium|low)\)$/;
-// Display names, agent aliases and placeholders, lower-cased, to the API model name.
 const AG_NAMES = {
 	'gemini 3.8 flash': 'gemini-3.8-flash',
 	'gemini 3.8 flash thinking': 'gemini-3.8-flash',
@@ -1344,27 +1334,24 @@ const agModelFromId = (id) =>
 			)
 		: undefined;
 
-// 2 a real model name, 1 a placeholder for an id the tables do not know, 0 no model at all.
+const AG_MODEL = { DEFAULT: 0, PLACEHOLDER: 1, RESOLVED: 2 };
 const agResolution = (model) =>
 	model === ANTIGRAVITY_DEFAULT_MODEL
-		? 0
+		? AG_MODEL.DEFAULT
 		: model.startsWith(AG_PLACEHOLDER) || model.startsWith(AG_UNRESOLVED_ID)
-			? 1
-			: 2;
+			? AG_MODEL.PLACEHOLDER
+			: AG_MODEL.RESOLVED;
 const agResolved = (model) =>
-	model !== undefined && agResolution(model) === 2 ? model : undefined;
+	model !== undefined && agResolution(model) === AG_MODEL.RESOLVED ? model : undefined;
 
-/**
- * One usage message. `identities` are the ids copies of the same response share; `rank` says where
- * `ts` came from (3 its own row, 1 the conversation, 0 the file's mtime). `output` is the visible
- * part of `totalOutput` and `reasoning` the rest. A retry without ids has `retryKey` instead, which
- * names its row so a later run can tell it was counted.
- * @typedef {{ ts: number, rank: number, session: string, model: string, input: number, output: number, cacheWrite: number, cacheRead: number, reasoning: number, totalOutput: number, identities: string[], retryKey?: string }} AgEvent
- */
+// Where an event's timestamp came from; a merge keeps the better source.
+const AG_TS = { FILE_MTIME: 0, TRAJECTORY: 1, OWN_ROW: 3 };
+
+/** @typedef {{ ts: number, rank: number, session: string, model: string, input: number, output: number, cacheWrite: number, cacheRead: number, reasoning: number, totalOutput: number, identities: string[], retryKey?: string }} AgEvent */
 
 /**
  * @param {AgEvent[]} events
- * @param {Map<string, [number, number]>} idTimestamps the best timestamp seen for each identity in this database
+ * @param {Map<string, [number, number]>} idTimestamps
  */
 function agAppendEvent(events, idTimestamps, usage, row) {
 	if (!AG_COUNTS.some((k) => usage[k] > 0)) return;
@@ -1372,9 +1359,11 @@ function agAppendEvent(events, idTimestamps, usage, row) {
 	if (!identities.length) identities = row.fallbackIdentities;
 	const [ts, rank] =
 		row.ts !== undefined
-			? [row.ts, 3]
+			? [row.ts, AG_TS.OWN_ROW]
 			: (identities.map((id) => idTimestamps.get(id)).find(Boolean) ??
-				(row.trajectoryTs !== undefined ? [row.trajectoryTs, 1] : [row.fallbackTs, 0]));
+				(row.trajectoryTs !== undefined
+					? [row.trajectoryTs, AG_TS.TRAJECTORY]
+					: [row.fallbackTs, AG_TS.FILE_MTIME]));
 	const totalOutput = Math.max(usage.totalOutput, usage.visible + usage.reasoning);
 	const output = Math.max(usage.visible, totalOutput - usage.reasoning);
 	const fromId = agModelFromId(usage.modelId);
@@ -1405,11 +1394,7 @@ function agAppendEvent(events, idTimestamps, usage, row) {
 	});
 }
 
-/**
- * The usage events of one open database, steps first and then generations, each by `idx`.
- * Throws when any row is unreadable, so a damaged database never counts in part.
- * @returns {AgEvent[]}
- */
+/** @returns {AgEvent[]} */
 function agDatabaseEvents(db, session, fallbackTs) {
 	db.exec('BEGIN');
 	if (db.prepare('PRAGMA page_count').get().page_count === 0) return [];
@@ -1487,7 +1472,6 @@ function agMergeInto(target, copy) {
 	}
 }
 
-/** Merges events that share any identity, transitively, into the first of them. */
 function agMergeEvents(events) {
 	const slots = [];
 	const slotOf = new Map();
@@ -1511,8 +1495,6 @@ function agMergeEvents(events) {
 	return slots.filter(Boolean);
 }
 
-// ccusage keeps a display name it does not know as written; the snapshot schema allows no spaces
-// or parentheses, and a `|` would break the bucket key.
 const agSchemaModel = (model) =>
 	model
 		.replace(/[^A-Za-z0-9._:/@-]+/g, '-')
@@ -1554,7 +1536,6 @@ async function readAntigravity(dirs, ctx, provider) {
 			ctx.filesRead++;
 			ctx.parsedBytes += st.size;
 		} catch (err) {
-			// Its file state stays as it was, so the next run tries again.
 			log(`skipping unreadable Antigravity database ${basename(path)}: ${err.message}`);
 		} finally {
 			db?.close();
@@ -1563,8 +1544,6 @@ async function readAntigravity(dirs, ctx, provider) {
 
 	for (const e of agMergeEvents(events)) {
 		if (e.ts < ctx.cutoffMs) continue;
-		// A database that did not change is not read again, and a response can gain tokens between
-		// runs, so each identity remembers what was counted for it: [timestamp, ...counts].
 		const keys = (e.identities.length ? e.identities : [e.retryKey]).map(
 			(id) => `ag:${shortHash(id)}`
 		);
@@ -1598,10 +1577,8 @@ async function readAntigravity(dirs, ctx, provider) {
 const GOOGLE_PRICE_PREFIXES = ['google/', 'gemini/', 'vertex_ai/', 'openrouter/google/'];
 
 /**
- * Antigravity's names are not LiteLLM's. An effort or thinking variant is priced as its base model,
- * `claude-4.5-sonnet` is LiteLLM's `claude-sonnet-4-5`, and some Gemini models are listed only as
- * `-preview`. Each name is tried bare and with LiteLLM's Google prefixes: the usage does carry an
- * API provider, but a price is looked up per model, after the events are summed.
+ * Antigravity's names are not LiteLLM's: `claude-4.5-sonnet` is LiteLLM's `claude-sonnet-4-5`, and
+ * some Gemini models are listed only as `-preview`.
  */
 function antigravityPriceKeys(model) {
 	const base = model.replace(/-(?:extra-low|low|medium|high|thinking)$/, '');

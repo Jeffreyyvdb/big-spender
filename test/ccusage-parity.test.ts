@@ -181,8 +181,6 @@ test('without per-model cost, tokens are compared per model and cost per day', (
 	);
 });
 
-// An agent whose outputTokens leave reasoning out: a third of each row's output is reasoning, which
-// ccusage shows only in the day's totalTokens.
 function withoutReasoning(): CcusageReport {
 	const report = matching();
 	for (const day of report.daily!) {

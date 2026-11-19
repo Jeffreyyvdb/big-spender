@@ -70,7 +70,6 @@ export async function withSandbox<T>(fn: (box: Sandbox) => Promise<T>): Promise<
 	});
 }
 
-/** A fresh price cache, so the collector never fetches. `models` is LiteLLM's key to entry map. */
 export async function seedPricing(
 	cacheDir: string,
 	models: Record<string, Record<string, number>> = {}

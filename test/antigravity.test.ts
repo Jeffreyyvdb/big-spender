@@ -9,7 +9,7 @@ import {
 	buildAntigravityHome,
 	conversation,
 	createDatabase,
-	gen,
+	generationBlob,
 	openDatabase,
 	sqlite
 } from './antigravity-fixture.ts';
@@ -26,13 +26,11 @@ const PRICES = {
 		input_cost_per_token_above_200k_tokens: 2.5e-6,
 		output_cost_per_token_above_200k_tokens: 1.5e-5
 	},
-	// Listed only under a Google prefix.
 	'gemini/gemini-2.5-flash': {
 		input_cost_per_token: 3e-7,
 		output_cost_per_token: 2.5e-6,
 		cache_read_input_token_cost: 3e-8
 	},
-	// The base model of the effort variants.
 	'gemini-3.6-flash': { input_cost_per_token: 7.5e-7, output_cost_per_token: 3.75e-6 }
 };
 
@@ -54,7 +52,6 @@ type DayModel = {
 	cost: UsageSnapshot['hourly'][number]['costUsd'];
 };
 
-/** Antigravity usage per "<days after day0> <model>". */
 function byDayAndModel(snapshot: UsageSnapshot, day0: number) {
 	const out: Record<string, DayModel> = {};
 	for (const r of snapshot.hourly) {
@@ -80,34 +77,30 @@ function byDayAndModel(snapshot: UsageSnapshot, day0: number) {
 
 const tokens = (rows: Record<string, DayModel>) =>
 	Object.fromEntries(
-		Object.entries(rows).map(([key, t]) => [key, [t.input, t.output, t.cacheWrite, t.cacheRead]])
+		Object.entries(rows).map(([key, { input, output, cacheWrite, cacheRead }]) => [
+			key,
+			{ input, output, cacheWrite, cacheRead }
+		])
 	);
 
-// [input, output with reasoning, cache write, cache read] of the home in antigravity-fixture.ts.
 const FIXTURE_TOKENS = {
-	// response-0, response-2 and response-1, whose step copy and id-sharing retry add nothing.
-	'0 gemini-3-pro': [800, 350, 35, 507],
-	'0 gemini-3.5-flash-high': [11, 22, 0, 0],
-	// 23:59:59.900 stays on day 0.
-	'0 gemini-3.6-flash-high': [1000, 300, 0, 0],
-	'1 claude-4-opus': [20, 4, 0, 0],
-	'1 claude-opus-5-5': [700, 140, 0, 0],
-	'1 claude-opus-5-5-medium': [60, 10, 0, 40],
-	'1 gemini-2.5-flash': [700, 90, 0, 300],
-	'1 gemini-2.5-pro': [14, 11, 0, 0],
-	// The success once (its step copy and mirrored retry are the same call) plus the failed attempt.
-	'1 gemini-3-pro': [200, 60, 0, 0],
-	// Three unkeyed copies of one call.
-	'1 gemini-4-argon-medium': [15027, 49, 0, 500131],
-	'1 model_placeholder_m499': [5, 1, 0, 0],
-	'2 Experimental-Model-Preview-2': [70, 7, 0, 0],
-	'2 claude-3-7-sonnet': [1200, 640, 2048, 4096],
-	'2 gemini-2.5-pro': [250000, 1000, 0, 0],
-	// The larger counts of the response both databases hold, plus the row dated by the trajectory.
-	'2 gemini-3-pro': [202, 403, 0, 0],
-	'2 gemini-3.5-flash-high': [900, 120, 0, 2000],
-	// Dated by the file's mtime.
-	'2 gemini-internal-model': [33, 11, 0, 0]
+	'0 gemini-3-pro': { input: 800, output: 350, cacheWrite: 35, cacheRead: 507 },
+	'0 gemini-3.5-flash-high': { input: 11, output: 22, cacheWrite: 0, cacheRead: 0 },
+	'0 gemini-3.6-flash-high': { input: 1000, output: 300, cacheWrite: 0, cacheRead: 0 },
+	'1 claude-4-opus': { input: 20, output: 4, cacheWrite: 0, cacheRead: 0 },
+	'1 claude-opus-5-5': { input: 700, output: 140, cacheWrite: 0, cacheRead: 0 },
+	'1 claude-opus-5-5-medium': { input: 60, output: 10, cacheWrite: 0, cacheRead: 40 },
+	'1 gemini-2.5-flash': { input: 700, output: 90, cacheWrite: 0, cacheRead: 300 },
+	'1 gemini-2.5-pro': { input: 14, output: 11, cacheWrite: 0, cacheRead: 0 },
+	'1 gemini-3-pro': { input: 200, output: 60, cacheWrite: 0, cacheRead: 0 },
+	'1 gemini-4-argon-medium': { input: 15027, output: 49, cacheWrite: 0, cacheRead: 500131 },
+	'1 model_placeholder_m499': { input: 5, output: 1, cacheWrite: 0, cacheRead: 0 },
+	'2 Experimental-Model-Preview-2': { input: 70, output: 7, cacheWrite: 0, cacheRead: 0 },
+	'2 claude-3-7-sonnet': { input: 1200, output: 640, cacheWrite: 2048, cacheRead: 4096 },
+	'2 gemini-2.5-pro': { input: 250000, output: 1000, cacheWrite: 0, cacheRead: 0 },
+	'2 gemini-3-pro': { input: 202, output: 403, cacheWrite: 0, cacheRead: 0 },
+	'2 gemini-3.5-flash-high': { input: 900, output: 120, cacheWrite: 0, cacheRead: 2000 },
+	'2 gemini-internal-model': { input: 33, output: 11, cacheWrite: 0, cacheRead: 0 }
 };
 
 test('Antigravity usage is counted once per response, per day and model', { skip }, async () => {
@@ -141,8 +134,7 @@ test(
 			const near = (actual: number, expected: number, what: string) =>
 				assert.ok(Math.abs(actual - expected) < 1e-9, `${what}: ${actual} is not ${expected}`);
 
-			// 70 visible and 20 reasoning tokens.
-			near(rows['1 gemini-2.5-flash'].cost.output, 90 * 2.5e-6, 'output with reasoning');
+			near(rows['1 gemini-2.5-flash'].cost.output, (70 + 20) * 2.5e-6, 'output with reasoning');
 			near(rows['1 gemini-2.5-flash'].cost.input, 700 * 3e-7, 'input');
 			near(rows['1 gemini-2.5-flash'].cost.cacheRead, 300 * 3e-8, 'cache read');
 			near(rows['0 gemini-3.6-flash-high'].cost.input, 1000 * 7.5e-7, 'effort variant input');
@@ -176,7 +168,7 @@ test(
 			addGenerations(db, [
 				[
 					20,
-					gen({
+					generationBlob({
 						model: 'gemini-3-pro',
 						use: {
 							input: 350,
@@ -191,8 +183,11 @@ test(
 			]);
 			db.close();
 
-			// response-2 was counted on day 0 with 300 input and 100 output.
-			const grown = { ...FIXTURE_TOKENS, '0 gemini-3-pro': [850, 380, 35, 507] };
+			const before = FIXTURE_TOKENS['0 gemini-3-pro'];
+			const grown = {
+				...FIXTURE_TOKENS,
+				'0 gemini-3-pro': { ...before, input: before.input + 50, output: before.output + 30 }
+			};
 			const third = await collect(box);
 			assert.deepEqual(tokens(byDayAndModel(third.snapshot, day0)), grown);
 			const recount = await collect(box, ['--reset']);
@@ -207,7 +202,7 @@ test('a database that changed only in its WAL file is read again', { skip }, asy
 		const ts = Date.now() - DAY_MS;
 		const path = conversation(box.home, 'live.db');
 		const call = (n: number) =>
-			gen({ model: 'gemini-3-pro', use: { input: n, responseId: `call-${n}` }, ts });
+			generationBlob({ model: 'gemini-3-pro', use: { input: n, responseId: `call-${n}` }, ts });
 		const db = openDatabase(path, { gens: [[1, call(1)]] });
 		try {
 			db.exec('PRAGMA journal_mode = WAL');
@@ -238,7 +233,7 @@ test('nothing but numbers and a schema-safe model name leaves the machine', { sk
 			gens: [
 				[
 					1,
-					gen({
+					generationBlob({
 						model: 'Secret Model (Internal | Build 7)',
 						use: {
 							input: 5,
@@ -273,7 +268,12 @@ test('ANTIGRAVITY_DATA_DIR is read after the default roots', { skip }, async () 
 		const ts = Date.now() - DAY_MS;
 		const one = (path: string, input: number) =>
 			createDatabase(path, {
-				gens: [[1, gen({ model: 'gemini-3-pro', use: { input, responseId: `r-${input}` }, ts })]]
+				gens: [
+					[
+						1,
+						generationBlob({ model: 'gemini-3-pro', use: { input, responseId: `r-${input}` }, ts })
+					]
+				]
 			});
 		one(conversation(box.home, 'default.db'), 1);
 		const dataRoot = join(box.home, 'elsewhere');
