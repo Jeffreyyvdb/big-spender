@@ -5,7 +5,9 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
 import { createBigSpender } from '../src/server/index.ts';
 import { usageSnapshotSchema } from '../src/schema.ts';
 import { createHttpServer } from '../src/serve.ts';
@@ -233,5 +235,246 @@ test('a file that a default path and an override both reach goes to the provider
 			r.model
 		]);
 		assert.deepEqual(rows, [['codex', 'gpt-test']]);
+	});
+});
+
+const iso = (ms: number) => new Date(ms).toISOString();
+
+type Fixture = { claude: string; codex: string; resets: Record<string, number> };
+
+/** Logs with limit lines. Times are relative to now so they stay inside the 90-day window. */
+async function writeLimitLogs(home: string): Promise<Fixture> {
+	const hourStart = Math.floor(Date.now() / HOUR_MS) * HOUR_MS;
+	const t = (hoursAgo: number, extraMs = 0) => hourStart - hoursAgo * HOUR_MS + extraMs;
+	const fiveHourReset = t(-2);
+	const weeklyReset = t(-30);
+	const codexWeekly = t(-70, 12_000);
+	const reject = (ms: number, type: string, resetsAt: number) =>
+		JSON.stringify({
+			type: 'assistant',
+			timestamp: iso(ms),
+			isApiErrorMessage: true,
+			error: 'rate_limit',
+			apiErrorStatus: 429,
+			message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } },
+			quotaLimits: { status: 'rejected', resetsAt: resetsAt / 1000, rateLimitType: type }
+		});
+	const claudeLines = [
+		JSON.stringify({
+			type: 'assistant',
+			timestamp: iso(t(5)),
+			requestId: 'r1',
+			sessionId: 's1',
+			message: {
+				id: 'm1',
+				model: 'claude-test',
+				usage: { input_tokens: 100, output_tokens: 20 }
+			}
+		}),
+		reject(t(1, 60_000), 'five_hour', fiveHourReset),
+		reject(t(1, 90_000), 'five_hour', fiveHourReset),
+		reject(t(1, 30_000), 'five_hour', fiveHourReset),
+		reject(t(3), 'seven_day', weeklyReset)
+	];
+	const rate = (primary: unknown, secondary: unknown, reached: unknown = null) => ({
+		limit_id: 'codex',
+		primary,
+		secondary,
+		rate_limit_reached_type: reached
+	});
+	const tokenCount = (ms: number, rateLimits: unknown, withInfo = false) =>
+		JSON.stringify({
+			type: 'event_msg',
+			timestamp: iso(ms),
+			payload: {
+				type: 'token_count',
+				...(withInfo
+					? {
+							info: {
+								total_token_usage: { total_tokens: 500 },
+								last_token_usage: { input_tokens: 400, output_tokens: 100 }
+							}
+						}
+					: { info: null }),
+				rate_limits: rateLimits
+			}
+		});
+	const codexLines = [
+		JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-test' } }),
+		tokenCount(t(8), rate(null, null)),
+		tokenCount(
+			t(7),
+			rate(
+				{ used_percent: 32, window_minutes: 300, resets_at: t(-1) / 1000 },
+				{ used_percent: 66, window_minutes: 10080, resets_at: codexWeekly / 1000 }
+			),
+			true
+		),
+		tokenCount(
+			t(6),
+			rate(
+				{ used_percent: 100, window_minutes: 300, resets_at: t(-1) / 1000 + 20 },
+				{ used_percent: 66.5, window_minutes: 10080, resets_at: codexWeekly / 1000 + 5 }
+			)
+		)
+	];
+	await mkdir(join(home, '.claude', 'projects', 'p'), { recursive: true });
+	await mkdir(join(home, '.codex', 'sessions', '2026', '11'), { recursive: true });
+	await writeFile(
+		join(home, '.claude', 'projects', 'p', 's1.jsonl'),
+		claudeLines.join('\n') + '\n'
+	);
+	await writeFile(
+		join(home, '.codex', 'sessions', '2026', '11', 'rollout-a.jsonl'),
+		codexLines.join('\n') + '\n'
+	);
+	return {
+		claude: '',
+		codex: '',
+		resets: {
+			fiveHour: fiveHourReset,
+			weekly: weeklyReset,
+			codexFive: Math.floor(t(-1) / 60_000) * 60_000,
+			codexWeekly: Math.floor(codexWeekly / 60_000) * 60_000
+		}
+	};
+}
+
+const dryRun = async (env: Record<string, string>) => {
+	const res = await run(COLLECTOR, ['--dry-run'], { ...env, BIG_SPENDER_DEVICE_ID: 'laptop' });
+	assert.equal(res.code, 0, res.stderr);
+	return JSON.parse(res.stdout);
+};
+
+const usageOf = (snap: { hourly: unknown[]; sessionsTotal: number }) => ({
+	hourly: snap.hourly,
+	sessionsTotal: snap.sessionsTotal
+});
+
+test('limit windows are collected from Claude rejections and Codex rate limits', async () => {
+	await withSandbox(async ({ home, env }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		const f = await writeLimitLogs(home);
+		const snap = await dryRun(env);
+
+		const summary = (snap.limits as Array<Record<string, unknown>>).map((w) => ({
+			provider: w.provider,
+			window: w.window,
+			resetsAt: w.resetsAt,
+			peakPercent: w.peakPercent,
+			hit: w.hitAt !== undefined
+		}));
+		assert.deepEqual(summary, [
+			{
+				provider: 'codex',
+				window: 'five_hour',
+				resetsAt: iso(f.resets.codexFive),
+				peakPercent: 100,
+				hit: true
+			},
+			{
+				provider: 'claude',
+				window: 'five_hour',
+				resetsAt: iso(f.resets.fiveHour),
+				peakPercent: 100,
+				hit: true
+			},
+			{
+				provider: 'claude',
+				window: 'seven_day',
+				resetsAt: iso(f.resets.weekly),
+				peakPercent: 100,
+				hit: true
+			},
+			{
+				provider: 'codex',
+				window: 'seven_day',
+				resetsAt: iso(f.resets.codexWeekly),
+				peakPercent: 66.5,
+				hit: false
+			}
+		]);
+		// Retries of one window collapse to the earliest rejection.
+		const fiveHour = snap.limits.find(
+			(w: { provider: string; window: string }) =>
+				w.provider === 'claude' && w.window === 'five_hour'
+		);
+		assert.equal(Date.parse(fiveHour.hitAt) % 3_600_000, 30_000);
+		assert.equal(snap.sessionsTotal, 2);
+
+		const again = await dryRun(env);
+		assert.deepEqual(again.limits, snap.limits);
+		assert.deepEqual(usageOf(again), usageOf(snap));
+	});
+});
+
+test('a snapshot without limit lines has no limits key', async () => {
+	await withSandbox(async ({ env }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		const snap = await dryRun(env);
+		assert.equal('limits' in snap, false);
+	});
+});
+
+test('state from before limits existed picks up old limit lines once, without changing usage', async () => {
+	await withSandbox(async ({ home, env }) => {
+		const cache = join(env.XDG_CACHE_HOME, 'big-spender');
+		await seedPricing(cache);
+		await writeLimitLogs(home);
+		const current = await dryRun(env);
+
+		const statePath = join(cache, 'state.json');
+		const state = JSON.parse(await readFile(statePath, 'utf8'));
+		delete state.limits;
+		state.fixes = state.fixes.filter((f: string) => f !== 'usage-limits');
+		await writeFile(statePath, JSON.stringify(state));
+
+		const upgraded = await dryRun(env);
+		assert.deepEqual(upgraded.limits, current.limits);
+		assert.deepEqual(usageOf(upgraded), usageOf(current));
+		assert.ok(JSON.parse(await readFile(statePath, 'utf8')).fixes.includes('usage-limits'));
+		assert.deepEqual((await dryRun(env)).limits, current.limits);
+	});
+});
+
+test('a server too old for limits gets the snapshot again without them', async () => {
+	await withSandbox(async ({ home, env }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		await writeLimitLogs(home);
+		const bodies: Array<Record<string, unknown>> = [];
+		const server = createServer(async (req, res) => {
+			const chunks: Buffer[] = [];
+			for await (const c of req) chunks.push(c as Buffer);
+			const body = JSON.parse(gunzipSync(Buffer.concat(chunks)).toString());
+			bodies.push(body);
+			res.setHeader('content-type', 'application/json');
+			if ('limits' in body) {
+				res.statusCode = 422;
+				res.end(
+					JSON.stringify({
+						error: 'invalid snapshot',
+						issues: ['(root): Unrecognized key: "limits"']
+					})
+				);
+			} else res.end('{"ok":true}');
+		});
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		try {
+			const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+			const res = await run(COLLECTOR, [], {
+				...env,
+				BIG_SPENDER_DEVICE_ID: 'laptop',
+				BIG_SPENDER_INGEST_URL: url,
+				BIG_SPENDER_INGEST_TOKEN: 'tok'
+			});
+			assert.equal(res.code, 0, res.stderr);
+			assert.match(res.stderr, /too old to store limit data/);
+			assert.equal(bodies.length, 2);
+			assert.equal('limits' in bodies[1], false);
+			assert.deepEqual(usageOf(bodies[1] as never), usageOf(bodies[0] as never));
+		} finally {
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
 	});
 });

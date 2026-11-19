@@ -125,7 +125,9 @@ async function acquireLock() {
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
+ * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
+ * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
  * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
  * account's full history. Hashed, because an ingest URL can carry a credential.
  */
@@ -133,6 +135,8 @@ async function acquireLock() {
 // One-time fixes to existing state. The state version stays the same so an older installed copy
 // can still read the file instead of discarding it.
 const FIX_CLAUDE_OUTPUT = 'claude-final-output';
+// Limit windows are read from log lines older versions skipped, so those logs are re-read once.
+const FIX_LIMITS = 'usage-limits';
 
 /** @returns {Promise<State>} */
 async function loadState() {
@@ -141,18 +145,24 @@ async function loadState() {
 		files: {},
 		seen: {},
 		buckets: {},
-		fixes: [FIX_CLAUDE_OUTPUT]
+		limits: {},
+		fixes: [FIX_CLAUDE_OUTPUT, FIX_LIMITS]
 	};
 	if (RESET) return empty;
 	try {
 		const s = JSON.parse(await readFile(STATE_PATH, 'utf8'));
 		if (s?.version !== STATE_VERSION) return empty;
 		s.fixes ??= [];
+		s.limits ??= {};
 		if (!s.fixes.includes(FIX_CLAUDE_OUTPUT)) {
 			// Older versions kept the first log line of a Claude message, whose output count can be
 			// partial. Re-read the Claude logs once so later lines add what was missed.
 			s.fixes.push(FIX_CLAUDE_OUTPUT);
 			s.rescan = ['claude'];
+		}
+		if (!s.fixes.includes(FIX_LIMITS)) {
+			s.fixes.push(FIX_LIMITS);
+			s.rescan = [...new Set([...(s.rescan ?? []), 'claude', 'codex'])];
 		}
 		return s;
 	} catch {
@@ -203,6 +213,82 @@ function pruneState(state, cutoffMs) {
 	}
 	for (const [key, v] of Object.entries(state.seen)) {
 		if ((Array.isArray(v) ? v[0] : v) < cutoffMs) delete state.seen[key];
+	}
+	for (const [key, w] of Object.entries(state.limits ?? {})) {
+		if (Date.parse(w.resetsAt) < cutoffMs) delete state.limits[key];
+	}
+}
+
+// Same rule as mergeLimits in src/limits.ts (this file ships alone, so it cannot import it):
+// one record per (provider, window, reset minute), highest peak, earliest hit.
+const MINUTE_MS = 60_000;
+
+/**
+ * @param {State} state
+ * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
+ */
+function addLimit(state, w) {
+	const resetsAtMs = Math.floor(w.resetsAtMs / MINUTE_MS) * MINUTE_MS;
+	if (!Number.isFinite(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(w.window)) return;
+	const key = `${w.provider}|${w.window}|${resetsAtMs}`;
+	state.limits ??= {};
+	const prev = state.limits[key];
+	const hits = [prev?.hitAt && Date.parse(prev.hitAt), w.hitMs].filter(Number.isFinite);
+	const percent = Math.min(100, Math.max(0, w.percent));
+	state.limits[key] = {
+		provider: w.provider,
+		window: w.window,
+		resetsAt: new Date(resetsAtMs).toISOString(),
+		peakPercent: Math.max(prev?.peakPercent ?? 0, percent),
+		...(hits.length ? { hitAt: new Date(Math.min(...hits)).toISOString() } : {})
+	};
+}
+
+// Claude Code logs a refused request as a synthetic assistant line carrying quotaLimits.
+// One blocked window repeats on every retry; the key makes the repeats one record.
+function claudeLimit(state, o) {
+	const q = o.quotaLimits;
+	if (q?.status !== 'rejected' || typeof q.rateLimitType !== 'string') return;
+	const ts = Date.parse(o.timestamp);
+	if (!Number.isFinite(ts) || !(q.resetsAt > 0)) return;
+	addLimit(state, {
+		provider: 'claude',
+		window: q.rateLimitType
+			.toLowerCase()
+			.replace(/[^a-z0-9_]/g, '_')
+			.slice(0, 40),
+		resetsAtMs: q.resetsAt * 1000,
+		percent: 100,
+		hitMs: ts
+	});
+}
+
+const CODEX_WINDOW_NAMES = { 300: 'five_hour', 10080: 'seven_day' };
+
+// Codex token_count lines carry the account's rate limits; a window is null until it is in use.
+function codexLimits(state, o, rateLimits) {
+	const ts = Date.parse(o.timestamp);
+	if (!Number.isFinite(ts) || !rateLimits) return;
+	const reached = String(rateLimits.rate_limit_reached_type ?? '').toLowerCase();
+	for (const slot of ['primary', 'secondary']) {
+		const w = rateLimits[slot];
+		if (!w || typeof w.used_percent !== 'number') continue;
+		const minutes = Number(w.window_minutes);
+		const window = CODEX_WINDOW_NAMES[minutes] ?? `${minutes}m`;
+		const resetsAtMs =
+			typeof w.resets_at === 'number'
+				? w.resets_at * 1000
+				: typeof w.resets_in_seconds === 'number'
+					? ts + w.resets_in_seconds * 1000
+					: NaN;
+		const hit = w.used_percent >= 100 || (reached !== '' && reached.includes(slot));
+		addLimit(state, {
+			provider: 'codex',
+			window,
+			resetsAtMs,
+			percent: hit ? 100 : w.used_percent,
+			...(hit ? { hitMs: ts } : {})
+		});
 	}
 }
 
@@ -364,6 +450,7 @@ function claudeLineHandler(state, resolvePrice, cutoffMs) {
 		if (!line.includes('"assistant"')) return;
 		const o = parseJson(line);
 		if (!o || o.type !== 'assistant') return;
+		if (o.quotaLimits) claudeLimit(state, o);
 		const msg = o.message;
 		const usage = msg?.usage;
 		const model = msg?.model;
@@ -442,7 +529,9 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 			fileState.model = p.model;
 			return;
 		}
-		if (o.type !== 'event_msg' || p?.type !== 'token_count' || !p.info) return;
+		if (o.type !== 'event_msg' || p?.type !== 'token_count') return;
+		codexLimits(state, o, p.rate_limits);
+		if (!p.info) return;
 		const total = p.info.total_token_usage?.total_tokens;
 		if (typeof total === 'number') {
 			if (total === fileState.lastTotal) return;
@@ -611,13 +700,13 @@ const round = (n, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
 /**
  * @param {Record<string, Bucket>} buckets
  * @param {(b: Bucket, provider: string, model: string, tier: number) => Cost} costFor
- * @param {{ deviceId: string, pricingSource: string, providers: string[], nowMs: number, coverageStartMs: number }} meta
+ * @param {{ deviceId: string, pricingSource: string, providers: string[], nowMs: number, coverageStartMs: number, limits?: Record<string, Limit> }} meta
  *   `providers` names the session counts the snapshot carries.
  */
 function buildSnapshot(
 	buckets,
 	costFor,
-	{ deviceId, pricingSource, providers, nowMs, coverageStartMs }
+	{ deviceId, pricingSource, providers, nowMs, coverageStartMs, limits: windows = {} }
 ) {
 	const hourlyCutoff = Math.floor((nowMs - HOURLY_DAYS * DAY_MS) / DAY_MS) * DAY_MS;
 	/** @type {Map<string, any>} */
@@ -716,7 +805,32 @@ function buildSnapshot(
 		sessionsTotal: all.size,
 		sessionCounts: publicCounts
 	};
+	const limits = Object.values(windows)
+		.filter((w) => Date.parse(w.resetsAt) >= coverageStartMs)
+		.sort(
+			(a, b) =>
+				a.resetsAt.localeCompare(b.resetsAt) ||
+				a.provider.localeCompare(b.provider) ||
+				a.window.localeCompare(b.window)
+		);
+	if (limits.length) snapshot.limits = limits;
 	return { snapshot, sessions24h };
+}
+
+// Local only (never posted), so hit times may be shown to the minute.
+function limitLines(snapshot, nowMs) {
+	const from = nowMs - 7 * DAY_MS;
+	const hits = new Map();
+	for (const w of snapshot.limits ?? []) {
+		if (!w.hitAt || Date.parse(w.hitAt) < from) continue;
+		const key = `${w.provider} ${w.window}`;
+		hits.set(key, [...(hits.get(key) ?? []), w.hitAt.slice(0, 16).replace('T', ' ')]);
+	}
+	if (!hits.size) return [];
+	return [
+		'Limits hit, last 7 days (UTC)',
+		...[...hits].map(([key, times]) => `  ${key.padEnd(24)} ${times.length}x  last ${times.at(-1)}`)
+	];
 }
 
 function printSummary(snapshot, sessions24h, nowMs) {
@@ -758,6 +872,7 @@ function printSummary(snapshot, sessions24h, nowMs) {
 				([m, v]) =>
 					`  ${m.padEnd(28)} ${usd(v.cost).padStart(10)}  ${(v.tokens / 1e6).toFixed(1)}M tok`
 			),
+		...limitLines(snapshot, nowMs),
 		...(snapshot.pricingSource === 'cursor'
 			? []
 			: [`Compare with \`bunx ccusage claude daily\` (Claude Code only) for this device.`])
@@ -961,6 +1076,18 @@ function assertHeaderSafe(secret, name) {
 }
 
 async function post(snapshot) {
+	try {
+		return await postOnce(snapshot);
+	} catch (err) {
+		// A server from before limits existed rejects the unknown key with a 422 naming it.
+		if (err.status !== 422 || !snapshot.limits || !/limits/.test(err.message)) throw err;
+		log('warning: the server is too old to store limit data; sending usage without it');
+		const { limits, ...usageOnly } = snapshot;
+		return await postOnce(usageOnly);
+	}
+}
+
+async function postOnce(snapshot) {
 	const url = setting('INGEST_URL');
 	const token = setting('INGEST_TOKEN').trim();
 	if (!url || !token) {
@@ -989,7 +1116,7 @@ async function post(snapshot) {
 				);
 				return parseJson(reply)?.result;
 			}
-			lastErr = new Error(`HTTP ${res.status}: ${text}`);
+			lastErr = Object.assign(new Error(`HTTP ${res.status}: ${text}`), { status: res.status });
 			// Client errors other than rate limiting won't fix themselves.
 			if (res.status >= 400 && res.status < 500 && res.status !== 429) break;
 		} catch (err) {
@@ -1048,7 +1175,8 @@ async function main() {
 					(p) => p === 'claude' || p === 'codex' || used.has(p)
 				),
 				nowMs,
-				coverageStartMs
+				coverageStartMs,
+				limits: state.limits
 			}
 		);
 		if (SUMMARY_ONLY) {
