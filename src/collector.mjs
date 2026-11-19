@@ -72,13 +72,14 @@ const ENV_FILE =
 
 const log = (...m) => console.error('[big-spender]', ...m);
 
-// The override exists for tests. It only points at this machine, so the Cursor API key and
-// access token can't be sent anywhere but Cursor.
-function cursorApiUrl(override) {
-	if (!override) return 'https://api2.cursor.sh';
+// The overrides exist for tests. They only point at this machine, so keys and tokens can't be
+// sent anywhere but the service they belong to.
+function localOverride(name, defaultUrl) {
+	const override = process.env[name];
+	if (!override) return defaultUrl;
 	const { hostname } = new URL(override);
 	if (!['127.0.0.1', 'localhost', '[::1]'].includes(hostname)) {
-		throw new Error('BIG_SPENDER_CURSOR_API_URL may only point at this machine');
+		throw new Error(`${name} may only point at this machine`);
 	}
 	return override.replace(/\/$/, '');
 }
@@ -2018,14 +2019,21 @@ function printSummary(snapshot, sessions24h, nowMs) {
 // local logs and sent under its own device id: the same account on two machines is one history.
 
 async function cursorRequest(path, bearer, body, headers = {}) {
-	const res = await fetch(`${cursorApiUrl(process.env.BIG_SPENDER_CURSOR_API_URL)}${path}`, {
-		method: 'POST',
-		headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json', ...headers },
-		body: JSON.stringify(body),
-		// Never forward the key or token to another host.
-		redirect: 'error',
-		signal: AbortSignal.timeout(30_000)
-	});
+	const res = await fetch(
+		`${localOverride('BIG_SPENDER_CURSOR_API_URL', 'https://api2.cursor.sh')}${path}`,
+		{
+			method: 'POST',
+			headers: {
+				authorization: `Bearer ${bearer}`,
+				'content-type': 'application/json',
+				...headers
+			},
+			body: JSON.stringify(body),
+			// Never forward the key or token to another host.
+			redirect: 'error',
+			signal: AbortSignal.timeout(30_000)
+		}
+	);
 	if (!res.ok) {
 		const hint =
 			res.status === 401 || res.status === 403 ? '; check BIG_SPENDER_CURSOR_API_KEY' : '';
