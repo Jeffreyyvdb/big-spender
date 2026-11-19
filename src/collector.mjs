@@ -1451,10 +1451,8 @@ function agDatabaseEvents(db, path, fallbackTs) {
 		m.retries.forEach((retry, n) =>
 			append(retry, {
 				...row,
-				// ccusage gives a retry without ids no identity and never merges it, so a copy of the
-				// database elsewhere counts its own. An identity no other event has does the same, and
-				// lets a later run find the retry it counted: hence the file, not the session name two
-				// files can share.
+				// ccusage never merges a retry without ids, so each database counts its own. Naming the
+				// file keeps the identity unique and lets a later run find the retry it counted.
 				fallbackIdentities: [`retry:${path}:${kind}:${idx}:${n}`]
 			})
 		);
@@ -1640,7 +1638,7 @@ async function readAntigravity(dirs, ctx, provider) {
 	for (const group of stored.values()) {
 		removeRecord(state, agBucketRecord(provider, group));
 		for (const key of group.identities) delete state.seen[key];
-		// That database was read again, and its modification time with it.
+		// Its timestamp was that database's modification time, which this read replaces.
 		if (group.rank === AG_TS.FILE_MTIME && read.has(group.mtimeOf)) group.ts = Infinity;
 	}
 	for (const group of agMergeEvents([...stored.values(), ...events])) {
