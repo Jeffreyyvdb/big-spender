@@ -22,7 +22,8 @@ const execFileAsync = promisify(execFile);
 /** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string }>} */
 const AGENTS = {
 	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
-	codex: { agent: 'codex' }
+	codex: { agent: 'codex' },
+	pi: { agent: 'pi', args: ['--mode', 'calculate'], renameModel: (m) => m.replace(/^\[pi\] /, '') }
 };
 
 const CCUSAGE_VERSION = '20.0.51';

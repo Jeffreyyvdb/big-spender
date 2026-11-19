@@ -17,7 +17,7 @@ export const MAX_ROWS = 50_000;
 export const DEVICE_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
 // Collectors send the Cursor account's usage under this id, so no machine may use it.
 export const CURSOR_DEVICE_ID = 'cursor';
-export const PROVIDERS = ['claude', 'codex', 'cursor'] as const;
+export const PROVIDERS = ['claude', 'codex', 'cursor', 'pi'] as const;
 // Public ranges. 7d, 30d and 90d are bucketed by UTC day, `all` by ISO week. Nothing is finer
 // than a day: an hourly view would show when each machine is in use.
 export const RANGES = ['7d', '30d', '90d', 'all'] as const;
