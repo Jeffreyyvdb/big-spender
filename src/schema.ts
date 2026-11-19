@@ -41,12 +41,15 @@ export const usageRowSchema = z.strictObject({
 	cacheSavingsUsd: usd
 });
 
+const count = z.number().int().nonnegative();
 const sessionCount = z.strictObject({
-	claude: z.number().int().nonnegative(),
-	codex: z.number().int().nonnegative(),
-	// Sent by collectors that read Cursor; older ones only know claude and codex.
-	cursor: z.number().int().nonnegative().optional(),
-	all: z.number().int().nonnegative()
+	...(Object.fromEntries(PROVIDERS.map((p) => [p, count.optional()])) as Record<
+		UsageProvider,
+		z.ZodOptional<typeof count>
+	>),
+	claude: count,
+	codex: count,
+	all: count
 });
 
 export const usageSnapshotSchema = z.strictObject({

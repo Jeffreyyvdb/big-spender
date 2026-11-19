@@ -218,9 +218,10 @@ function summarizeRange(
 		// that has usage inside this window, so an offline device's old sessions drop out.
 		if (counts) {
 			for (const id of active) {
-				if (!counts[id]) continue;
-				sessions += counts[id];
-				provider(id).sessions! += counts[id];
+				const n = counts[id];
+				if (!n) continue;
+				sessions += n;
+				provider(id).sessions! += n;
 			}
 		}
 	}
