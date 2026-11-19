@@ -71,6 +71,18 @@ function dropOldestDays(rows: UsageRow[], excess: number): { rows: UsageRow[]; d
 	return { rows: rows.slice(cut), days };
 }
 
+const isEmpty = (r: UsageRow) =>
+	!r.sessions &&
+	!r.inputTokens &&
+	!r.cacheReadTokens &&
+	!r.cacheWrite5mTokens &&
+	!r.cacheWrite1hTokens &&
+	!r.outputTokens &&
+	!r.costUsd.input &&
+	!r.costUsd.cacheRead &&
+	!r.costUsd.cacheWrite &&
+	!r.costUsd.output;
+
 export function mergeSnapshots(
 	stored: UsageSnapshot | undefined,
 	next: UsageSnapshot

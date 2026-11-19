@@ -38,7 +38,8 @@ const AGENTS = {
 					.replace(/^-+|-+$/g, '')
 					.slice(0, 100)) ||
 			'gemini-internal-model'
-	}
+	},
+	opencode: { agent: 'opencode' }
 };
 
 const CCUSAGE_VERSION = '20.0.51';
