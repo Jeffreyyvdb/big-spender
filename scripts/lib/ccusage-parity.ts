@@ -103,7 +103,8 @@ export function collectorRows(snapshot: UsageSnapshot, provider: string): Rows {
  *
  * `outputExcludesReasoning` is for agents (antigravity) whose `outputTokens` leave reasoning
  * out, while the collector counts it as output. Their rows have no reasoning field; only a day's
- * `totalTokens` includes it.
+ * `totalTokens` includes it. So output is compared exactly per day, and per row only as a floor:
+ * a collector row below ccusage's has lost output to another model.
  */
 export function ccusageRows(
 	report: CcusageReport,
@@ -163,9 +164,10 @@ export function compare(
 		const [day, model] = key.split('|');
 		const a = ours.get(key) ?? zero();
 		const b = theirs.rows.get(key) ?? missing();
+		const outputIsFloor = (f: (typeof TOKEN_FIELDS)[number]) => f === 'output' && theirs.dayOutput;
 		const tokenDiffs = TOKEN_FIELDS.filter(
-			(f) => b[f] !== null && !(f === 'output' && theirs.dayOutput) && a[f] !== b[f]
-		).map((f) => `${f} ${a[f]} vs ${b[f]}`);
+			(f) => b[f] !== null && (outputIsFloor(f) ? a[f]! < b[f]! : a[f] !== b[f])
+		).map((f) => `${f} ${a[f]} ${outputIsFloor(f) ? 'below' : 'vs'} ${b[f]}`);
 		if (b.cost === null) daysWithoutModelCost.add(day);
 		const costDiff = b.cost === null ? null : costGap(a.cost!, b.cost, a.rows);
 		rows.push({

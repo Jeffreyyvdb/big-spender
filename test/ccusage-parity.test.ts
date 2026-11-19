@@ -250,6 +250,19 @@ test('the other token counts stay exact per row when output is compared per day'
 	assert.ok(dayOutputs.every((d) => d.ok));
 });
 
+test('output moved to another model on the same day is reported for the row that lost it', () => {
+	const report = withoutReasoning();
+	const [opus, haiku] = report.daily![1].modelBreakdowns!;
+	opus.outputTokens! -= 15;
+	haiku.outputTokens! += 15;
+	const { rows, dayOutputs } = runWithoutReasoning(report);
+	assert.deepEqual(
+		rows.filter((r) => !r.ok).map((r) => [r.day, r.model, r.tokenDiffs]),
+		[['2026-11-14', 'haiku', ['output 30 below 35']]]
+	);
+	assert.ok(dayOutputs.every((d) => d.ok));
+});
+
 test('nothing reported on either side leaves nothing to compare', () => {
 	const { rows, days } = compare(
 		collectorRows(snapshot([]), 'claude'),
