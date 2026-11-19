@@ -267,7 +267,7 @@ test('nothing but numbers and a schema-safe model name leaves the machine', { sk
 	});
 });
 
-test('ANTIGRAVITY_DATA_DIR replaces the default roots', { skip }, async () => {
+test('ANTIGRAVITY_DATA_DIR is read after the default roots', { skip }, async () => {
 	await withSandbox(async (box) => {
 		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
 		const ts = Date.now() - DAY_MS;
@@ -287,7 +287,7 @@ test('ANTIGRAVITY_DATA_DIR replaces the default roots', { skip }, async () => {
 		});
 		assert.deepEqual(
 			snapshot.hourly.map((r) => r.inputTokens),
-			[110]
+			[111]
 		);
 	});
 });

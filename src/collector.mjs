@@ -1033,21 +1033,16 @@ const isDir = (path) => {
 };
 
 /**
- * The conversation dirs. ANTIGRAVITY_DATA_DIR replaces the defaults; each of its roots may be a
- * data root or the conversation dir itself. A default root without `conversations/` is a fresh
- * install whose only database has no usage tables.
+ * The conversation dirs ANTIGRAVITY_DATA_DIR names, comma-separated; each may be a data root or
+ * the conversation dir itself. A default root is read only through `conversations/`: without it,
+ * it is a fresh install whose only database has no usage tables.
  */
-function antigravityDirs() {
-	const custom = process.env.ANTIGRAVITY_DATA_DIR;
-	if (custom === undefined) {
-		return ANTIGRAVITY_ROOTS.map((root) => join(HOME, root, 'conversations')).filter(isDir);
-	}
-	return custom
+const antigravityEnvDirs = () =>
+	(process.env.ANTIGRAVITY_DATA_DIR ?? '')
 		.split(',')
 		.map((root) => root.trim())
 		.filter(Boolean)
 		.map((root) => (isDir(join(root, 'conversations')) ? join(root, 'conversations') : root));
-}
 
 function byPathComponents(a, b) {
 	const x = a.split(sep);
@@ -1721,7 +1716,8 @@ const SOURCES = {
 		}
 	},
 	antigravity: {
-		paths: antigravityDirs,
+		paths: ANTIGRAVITY_ROOTS.map((root) => join(HOME, root, 'conversations')),
+		envPaths: antigravityEnvDirs,
 		read: readAntigravity,
 		priceKeys: antigravityPriceKeys
 	}
