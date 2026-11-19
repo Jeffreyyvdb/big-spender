@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { usageSnapshotSchema, type UsageSnapshot } from '../src/schema.ts';
@@ -314,15 +314,40 @@ test('odd records: last copy out of the window, padded ids, bad times, huge coun
 			join(tmp, 'project-hash-d.jsonl'),
 			`{"id":"r4","type":"gemini","timestamp":"${recent.toISOString()}","tokens":{"input":1e309,"output":1}}\n`
 		);
+		// An escaped key is still the key; a model that is a path leaves only its file name; a
+		// timestamp in year 9999 is not one, so the file's mtime dates the message.
+		await writeFile(
+			join(tmp, 'project-hash-e.json'),
+			JSON.stringify({
+				sessionId: 'sess-odd-2',
+				messages: [
+					{ ...msg('e1', 'x', 0), timestamp: undefined, model: '/home/alice/acme/weights' }
+				]
+			}).replace(
+				'"tokens":{"input":0,"output":1,"total":1}',
+				'"to\\u006bens":{"input":7,"output":1}'
+			)
+		);
+		await writeFile(
+			join(tmp, 'project-hash-f.json'),
+			JSON.stringify({ ...msg('f1', '9999-12-31T23:59:59-01:00', 3), model: 'gemini-2.5-pro' })
+		);
+		for (const name of ['project-hash-e.json', 'project-hash-f.json']) {
+			await utimes(join(tmp, name), recent, recent);
+		}
 		const { snapshot } = await collect();
 		const added = snapshot.hourly.filter(
 			(r) => !first.snapshot.hourly.some((f) => f.hour === r.hour && f.model === r.model)
 		);
+		const hour = recent.toISOString().slice(0, 13);
 		assert.deepEqual(
-			added.map((r) => [r.model, r.inputTokens, r.outputTokens]),
-			[['gemini-2.5-pro', 50, 2]]
+			added.map((r) => [r.hour.slice(0, 13), r.model, r.inputTokens, r.outputTokens]),
+			[
+				[hour, 'gemini-2.5-pro', 53, 3],
+				[hour, 'weights', 7, 1]
+			]
 		);
-		assert.equal(added[0].hour.slice(0, 13), recent.toISOString().slice(0, 13));
+		assert.ok(!JSON.stringify(snapshot).includes('alice'));
 	});
 });
 
@@ -349,6 +374,34 @@ test('a half-written chat file is read again once it is complete', async () => {
 		await writeFile(path, chat);
 		const complete = await collect();
 		assert.equal(tokens(complete.snapshot) - tokens(first.snapshot), 120);
+	});
+});
+
+test('a chat caught mid-write keeps its counts, and so does a JSONL line cut off', async () => {
+	await geminiSandbox(async ({ tmp, collect }) => {
+		const first = await collect();
+		const chatPath = join(tmp, 'project-hash-a/chats/session-a.json');
+		const chat = await readFile(chatPath, 'utf8');
+		await writeFile(chatPath, chat.slice(0, chat.indexOf('"tokens"')));
+		const linesPath = join(tmp, 'project-hash-b/chats/session-b.jsonl');
+		const lines = await readFile(linesPath, 'utf8');
+		await writeFile(linesPath, lines.slice(0, -20));
+		const midWrite = await collect();
+		assert.deepEqual(midWrite.snapshot.hourly, first.snapshot.hourly);
+		await writeFile(chatPath, chat);
+		await writeFile(linesPath, lines);
+		const done = await collect();
+		assert.deepEqual(done.snapshot.hourly, first.snapshot.hourly);
+	});
+});
+
+test('a symlink to ~/.gemini/tmp in GEMINI_DATA_DIR reads its files once', async () => {
+	await geminiSandbox(async ({ home, tmp, collect }) => {
+		const alias = join(home, 'gemini-alias');
+		await symlink(tmp, alias, 'dir');
+		const plain = await collect();
+		const viaAlias = await collect({ GEMINI_DATA_DIR: alias });
+		assert.deepEqual(viaAlias.snapshot.hourly, plain.snapshot.hourly);
 	});
 });
 

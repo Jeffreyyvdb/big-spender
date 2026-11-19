@@ -135,7 +135,7 @@ async function acquireLock() {
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * Antigravity keeps a merged response under each of its ids: see agStoreGroup.
- * Gemini keeps a file's counts under its path: [latest hour, counts]; see readGemini.
+ * Gemini keeps a file's counts under `gm:` and its path: [latest hour, counts]; see readGemini.
  * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]] | [number, Record<string, any>]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
@@ -953,8 +953,9 @@ const GEMINI_TOKEN_KEYS = {
 };
 const GEMINI_TIME =
 	/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{3})?(Z|[+-]\d{2}:\d{2})$/;
-// No request has this many tokens; a larger count is corrupt and would fail the snapshot schema.
-const GEMINI_MAX_TOKENS = 1e12;
+// Gemini's context is a few million tokens, so a larger count is corrupt. Capping each record also
+// keeps a bucket's sum under the snapshot schema's limit.
+const GEMINI_MAX_TOKENS = 1e9;
 
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const nonEmpty = (v) => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
@@ -968,7 +969,7 @@ const geminiTime = (v) => {
 		return undefined;
 	}
 	const ms = Date.parse(v);
-	return Number.isFinite(ms) ? ms : undefined;
+	return plausibleTime(ms) ? ms : undefined;
 };
 
 /**
@@ -996,8 +997,8 @@ function geminiUsage(raw, cachedInInput) {
 }
 
 /**
- * The usage events in one Gemini file, or null for a JSON file that does not parse (it may be
- * half written). `id` is the message id when the event has one. In JSONL a line's session id
+ * The usage events in one Gemini file, or null for a file that may be half written: JSON that
+ * does not parse, or JSONL whose last line does not. `id` is the message id when the event has one. In JSONL a line's session id
  * and model carry over to the lines after it, and a message logged again with its id replaces
  * the earlier copy, as in ccusage.
  */
@@ -1032,7 +1033,10 @@ function geminiEvents(path, text, mtimeMs) {
 	if (path.endsWith('.jsonl')) {
 		let model;
 		const byId = new Map();
-		for (const line of text.split('\n')) {
+		const lines = text.split('\n');
+		const last = lines.findLast((line) => line.trim());
+		if (last !== undefined && parseJson(last) === null) return null;
+		for (const line of lines) {
 			const o = parseJson(line);
 			if (!isObject(o)) continue;
 			session = sessionOf(o);
@@ -1079,8 +1083,10 @@ function geminiEvents(path, text, mtimeMs) {
 async function readGemini(paths, ctx, provider) {
 	const { state, cutoffMs } = ctx;
 	for (const dir of paths) {
-		if (!existsSync(dir)) continue;
-		for await (const path of walk(dir, (name) => /\.jsonl?$/.test(name))) {
+		// A symlinked GEMINI_DATA_DIR reaches the same files as the default under another name.
+		const root = await realpath(dir).catch(() => null);
+		if (!root) continue;
+		for await (const path of walk(root, (name) => /\.jsonl?$/.test(name))) {
 			if (ctx.seenPaths.has(path)) continue;
 			ctx.seenPaths.add(path);
 			let st;
@@ -1101,16 +1107,15 @@ async function readGemini(paths, ctx, provider) {
 			}
 			ctx.filesRead++;
 			ctx.parsedBytes += st.size;
-			const events =
-				text.includes('"tokens"') || text.includes('"stats"')
-					? geminiEvents(path, text, st.mtimeMs)
-					: [];
+			const events = geminiEvents(path, text, st.mtimeMs);
+			state.files[path] = { size: st.size, mtimeMs: st.mtimeMs, offset: st.size };
+			// Half written: keep what it counted until the write completes and changes the file.
 			if (!events) continue;
 			/** @type {Record<string, ReturnType<typeof geminiRecord>>} */
 			const counts = {};
 			for (const e of events) {
 				if (e.ts < cutoffMs) continue;
-				const model = e.model.replace(/[^A-Za-z0-9._:/@-]/g, '-').slice(0, 100);
+				const model = localModelName(e.model) || 'unknown';
 				const tier = tierFor(ctx.resolvePrice(provider, model), e.input + e.cacheRead);
 				const r = geminiRecord(e.ts, model, tier, shortHash(`gemini:${e.session}`));
 				const c = (counts[`${recordBucketKey(r)}|${r.session}`] ??= r);
@@ -1118,14 +1123,13 @@ async function readGemini(paths, ctx, provider) {
 				c.cacheRead += e.cacheRead;
 				c.output += e.output;
 			}
-			const seenKey = `g:${shortHash(path)}`;
+			const seenKey = `gm:${shortHash(path)}`;
 			const before = state.seen[seenKey];
 			for (const r of Object.values(Array.isArray(before) ? before[1] : {})) removeRecord(state, r);
 			for (const r of Object.values(counts)) addRecord(state, r);
 			const latest = Math.max(...Object.values(counts).map((r) => r.ts));
 			if (Number.isFinite(latest)) state.seen[seenKey] = [latest, counts];
 			else delete state.seen[seenKey];
-			state.files[path] = { size: st.size, mtimeMs: st.mtimeMs, offset: st.size };
 		}
 	}
 }
