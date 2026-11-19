@@ -1,3 +1,4 @@
+import { mergeLimits } from './limits.ts';
 import { MAX_ROWS, usageRowSchema, type UsageRow, type UsageSnapshot } from './schema.ts';
 
 const DAY_MS = 86_400_000;
@@ -70,7 +71,10 @@ export function mergeSnapshots(
 	next: UsageSnapshot
 ): { snapshot: UsageSnapshot; droppedDays: number } {
 	const fresh = [...next.hourly].sort(compareRows);
-	if (!stored) return { snapshot: { ...next, hourly: fresh }, droppedDays: 0 };
+	const limits = mergeLimits(stored?.limits, next.limits);
+	const withLimits = limits.length ? { limits } : {};
+	const { limits: _, ...rest } = next;
+	if (!stored) return { snapshot: { ...rest, hourly: fresh, ...withLimits }, droppedDays: 0 };
 
 	const reported = new Set(fresh.map(keyOf));
 	const kept = [...group(stored.hourly)]
@@ -91,5 +95,5 @@ export function mergeSnapshots(
 		const latest = Math.min(earliest, Date.parse(next.coverageStart));
 		if (latest > Date.parse(coverage)) coverage = new Date(latest).toISOString();
 	}
-	return { snapshot: { ...next, coverageStart: coverage, hourly }, droppedDays };
+	return { snapshot: { ...rest, coverageStart: coverage, hourly, ...withLimits }, droppedDays };
 }

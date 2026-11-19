@@ -41,6 +41,22 @@ export const usageRowSchema = z.strictObject({
 	cacheSavingsUsd: usd
 });
 
+export const MAX_LIMIT_WINDOWS = 5_000;
+
+// One subscription usage window (the 5-hour session, the weekly cap, ...) as it was observed.
+// A window instance is identified by (provider, window, resetsAt rounded down to the minute).
+export const limitWindowSchema = z.strictObject({
+	provider: z.enum(PROVIDERS),
+	// five_hour, seven_day, seven_day_opus, ...; Codex windows are named from window_minutes
+	// (300 -> five_hour, 10080 -> seven_day, otherwise `${minutes}m`).
+	window: z.string().regex(/^[a-z0-9_]{1,40}$/),
+	resetsAt: isoDate,
+	// Highest share of the window seen used, 0-100. A blocked request means 100.
+	peakPercent: z.number().min(0).max(100),
+	// First time a request was refused because this window was used up.
+	hitAt: isoDate.optional()
+});
+
 const count = z.number().int().nonnegative();
 const sessionCount = z.strictObject({
 	...(Object.fromEntries(PROVIDERS.map((p) => [p, count.optional()])) as Record<
@@ -72,9 +88,11 @@ export const usageSnapshotSchema = z.strictObject({
 			'30d': sessionCount,
 			'90d': sessionCount
 		})
-		.optional()
+		.optional(),
+	limits: z.array(limitWindowSchema).max(MAX_LIMIT_WINDOWS).optional()
 });
 
+export type LimitWindow = z.infer<typeof limitWindowSchema>;
 export type UsageRow = z.infer<typeof usageRowSchema>;
 export type UsageSnapshot = z.infer<typeof usageSnapshotSchema>;
 export type UsageProvider = (typeof PROVIDERS)[number];
