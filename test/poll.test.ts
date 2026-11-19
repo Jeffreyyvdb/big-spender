@@ -444,3 +444,128 @@ test('a Codex 401 warns without the token and exits 0', async () => {
 		});
 	});
 });
+
+const refusedClaudeWeekly = (ms: number, resetsAt: number) =>
+	JSON.stringify({
+		type: 'assistant',
+		timestamp: iso(ms),
+		isApiErrorMessage: true,
+		error: 'rate_limit',
+		apiErrorStatus: 429,
+		message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } },
+		quotaLimits: {
+			status: 'rejected',
+			resetsAt: resetsAt / 1000,
+			rateLimitType: 'seven_day_overage_included'
+		}
+	});
+
+async function writeClaudeLog(box: Sandbox, lines: string[]) {
+	await mkdir(join(box.home, '.claude', 'projects', 'p'), { recursive: true });
+	await writeFile(join(box.home, '.claude', 'projects', 'p', 's1.jsonl'), lines.join('\n') + '\n');
+}
+
+const weeklyResetsAt = NEXT_HOUR + 48 * HOUR;
+const fableWeekly = (percent = 4) => ({
+	kind: 'weekly_scoped',
+	percent,
+	resets_at: iso(weeklyResetsAt),
+	scope: { model: { display_name: 'Fable' } }
+});
+
+test('a refusal logged as seven_day_overage_included joins the polled Fable weekly in one run', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		const hitMs = NEXT_HOUR - 3 * HOUR;
+		await writeClaudeLog(box, [refusedClaudeWeekly(hitMs, weeklyResetsAt)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = { limits: [fableWeekly(100)] };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(
+				res.snap.limits.map((w: Win) => [w.window, w.resetsAt, w.peakPercent, w.hitAt]),
+				[['seven_day_fable', iso(weeklyResetsAt), 100, iso(hitMs)]]
+			);
+		});
+	});
+});
+
+test('the Fable alias is kept for a later run whose poll is off', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = { limits: [fableWeekly()] };
+			await collect(box, url);
+			const hitMs = NEXT_HOUR - HOUR;
+			await writeClaudeLog(box, [refusedClaudeWeekly(hitMs, weeklyResetsAt)]);
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.deepEqual(
+				res.snap.limits.map((w: Win) => [w.window, w.hitAt]),
+				[['seven_day_fable', iso(hitMs)]]
+			);
+		});
+	});
+});
+
+test('with polling off and no stored alias the raw window name stays', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeLog(box, [refusedClaudeWeekly(NEXT_HOUR - HOUR, weeklyResetsAt)]);
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = { limits: [fableWeekly()] };
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.deepEqual(seen, []);
+			assert.deepEqual(
+				res.snap.limits.map((w: Win) => w.window),
+				['seven_day_overage_included']
+			);
+		});
+	});
+});
+
+test('two model weeklies make the refused one unknown, so the raw name stays', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeLog(box, [refusedClaudeWeekly(NEXT_HOUR - HOUR, weeklyResetsAt)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = {
+				limits: [fableWeekly(), { ...fableWeekly(), scope: { model: { display_name: 'Sonnet' } } }]
+			};
+			const res = await collect(box, url);
+			assert.deepEqual(res.snap.limits.map((w: Win) => w.window).sort(), [
+				'seven_day_fable',
+				'seven_day_overage_included',
+				'seven_day_sonnet'
+			]);
+		});
+	});
+});
+
+test('a later ambiguous poll drops the alias, and a failed poll keeps it', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await withUsageApi(async (api, _seen, url) => {
+			const names = async () =>
+				(await collect(box, url)).snap.limits
+					.map((w: Win) => w.window)
+					.filter((n: string) => n.includes('overage') || n === 'seven_day_fable');
+			api.claude.body = { limits: [fableWeekly()] };
+			await collect(box, url);
+			api.claude = { status: 500, body: {} };
+			await writeClaudeLog(box, [refusedClaudeWeekly(NEXT_HOUR - HOUR, weeklyResetsAt)]);
+			assert.deepEqual(await names(), ['seven_day_fable']);
+
+			api.claude = {
+				status: 200,
+				body: {
+					limits: [fableWeekly(), { ...fableWeekly(), scope: { model: { display_name: 'Other' } } }]
+				}
+			};
+			await writeClaudeLog(box, [
+				refusedClaudeWeekly(NEXT_HOUR - HOUR, weeklyResetsAt),
+				refusedClaudeWeekly(NEXT_HOUR - 2 * HOUR, weeklyResetsAt + 2 * HOUR)
+			]);
+			assert.ok((await names()).includes('seven_day_overage_included'));
+		});
+	});
+});

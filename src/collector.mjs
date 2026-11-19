@@ -140,7 +140,9 @@ async function acquireLock() {
  * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[], limitAliases?: Record<string, Record<string, string>> }} State
+ * limitAliases maps a provider's raw window name to the name a poll gave it, applied when a
+ * record is created (the server merges pushes by name, so a later rename would leave a duplicate).
  * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
  * account's full history. Hashed, because an ingest URL can carry a credential.
  */
@@ -261,14 +263,15 @@ const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
  * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
  */
 function addLimit(state, w) {
+	const window = state.limitAliases?.[w.provider]?.[w.window] ?? w.window;
 	let resetsAtMs = Math.floor(w.resetsAtMs / MINUTE_MS) * MINUTE_MS;
-	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(w.window)) return;
+	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(window)) return;
 	if (w.hitMs !== undefined && !plausibleTime(w.hitMs)) return;
 	state.limits ??= {};
 	let prev;
 	for (const [key, l] of Object.entries(state.limits)) {
 		const gap = Math.abs(Date.parse(l.resetsAt) - resetsAtMs);
-		if (l.provider !== w.provider || l.window !== w.window || gap > RESET_SLACK_MS) continue;
+		if (l.provider !== w.provider || l.window !== window || gap > RESET_SLACK_MS) continue;
 		if (prev && gap >= Math.abs(Date.parse(prev[1].resetsAt) - resetsAtMs)) continue;
 		prev = [key, l];
 	}
@@ -278,9 +281,9 @@ function addLimit(state, w) {
 	}
 	const hits = [prev?.[1].hitAt && Date.parse(prev[1].hitAt), w.hitMs].filter(Number.isFinite);
 	const percent = Math.min(100, Math.max(0, w.percent));
-	state.limits[`${w.provider}|${w.window}|${resetsAtMs}`] = {
+	state.limits[`${w.provider}|${window}|${resetsAtMs}`] = {
 		provider: w.provider,
-		window: w.window,
+		window,
 		resetsAt: new Date(resetsAtMs).toISOString(),
 		peakPercent: Math.max(prev?.[1].peakPercent ?? 0, percent),
 		...(hits.length ? { hitAt: new Date(Math.min(...hits)).toISOString() } : {})
@@ -352,9 +355,9 @@ const claudeResetMs = (resetsAt) => (typeof resetsAt === 'string' ? Date.parse(r
 
 function claudeWindows(body) {
 	const out = [];
-	const add = (window, percent, resetsAtMs) => {
+	const add = (window, percent, resetsAtMs, modelScoped = false) => {
 		if (Number.isFinite(percent) && Number.isFinite(resetsAtMs)) {
-			out.push({ window: window.slice(0, 40), percent, resetsAtMs });
+			out.push({ window: window.slice(0, 40), percent, resetsAtMs, modelScoped });
 		}
 	};
 	for (const [key, w] of Object.entries(body)) {
@@ -365,7 +368,7 @@ function claudeWindows(body) {
 	for (const l of Array.isArray(body.limits) ? body.limits : []) {
 		const model = l?.scope?.model?.display_name;
 		if (l?.kind === 'weekly_scoped' && typeof model === 'string' && slug(model)) {
-			add(`seven_day_${slug(model)}`, l.percent, claudeResetMs(l.resets_at));
+			add(`seven_day_${slug(model)}`, l.percent, claudeResetMs(l.resets_at), true);
 		}
 	}
 	return out;
@@ -413,6 +416,8 @@ function jwtExpiresMs(token) {
 }
 
 // headers() returns the request headers, or a string saying why this provider is skipped.
+// modelWeeklyLog is the name the provider's log gives its model-specific weekly refusal; the
+// poll says which model that is.
 const LIMIT_POLLERS = {
 	claude: {
 		credentialsPath: () =>
@@ -433,7 +438,8 @@ const LIMIT_POLLERS = {
 				'user-agent': 'big-spender'
 			};
 		},
-		windows: claudeWindows
+		windows: claudeWindows,
+		modelWeeklyLog: 'seven_day_overage_included'
 	},
 	codex: {
 		credentialsPath: () => join(process.env.CODEX_HOME || join(HOME, '.codex'), 'auth.json'),
@@ -498,8 +504,18 @@ async function pollLimit(state, provider, poller, nowMs) {
 		throw new Error('the answer was not a JSON object');
 	}
 
+	const windows = poller.windows(body, nowMs);
+	if (poller.modelWeeklyLog) {
+		// With zero or several model weeklies the refused one is unknown, so its raw name stays.
+		const scoped = windows.filter((w) => w.modelScoped);
+		const aliases = { ...state.limitAliases };
+		if (scoped.length === 1) aliases[provider] = { [poller.modelWeeklyLog]: scoped[0].window };
+		else delete aliases[provider];
+		state.limitAliases = aliases;
+	}
+
 	const seen = [];
-	for (const w of poller.windows(body, nowMs)) {
+	for (const w of windows) {
 		addLimit(state, {
 			provider,
 			window: w.window,
