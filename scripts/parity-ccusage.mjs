@@ -23,7 +23,8 @@ const execFileAsync = promisify(execFile);
 const AGENTS = {
 	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
 	codex: { agent: 'codex' },
-	pi: { agent: 'pi', args: ['--mode', 'calculate'], renameModel: (m) => m.replace(/^\[pi\] /, '') }
+	pi: { agent: 'pi', args: ['--mode', 'calculate'], renameModel: (m) => m.replace(/^\[pi\] /, '') },
+	grok: { agent: 'grok' }
 };
 
 const CCUSAGE_VERSION = '20.0.51';
