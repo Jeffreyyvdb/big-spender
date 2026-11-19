@@ -260,3 +260,187 @@ test('a failed poll after a good one still sends the earlier peak', async () => 
 		});
 	});
 });
+
+const jwt = (payload: unknown) =>
+	['e30', Buffer.from(JSON.stringify(payload)).toString('base64url'), 'sig'].join('.');
+const CODEX_ACCOUNT = 'acct-123';
+
+async function writeCodexLogin(
+	box: Sandbox,
+	token: string,
+	accountId: string | null = CODEX_ACCOUNT
+) {
+	await mkdir(join(box.home, '.codex'), { recursive: true });
+	await writeFile(
+		join(box.home, '.codex', 'auth.json'),
+		JSON.stringify({
+			OPENAI_API_KEY: null,
+			tokens: {
+				id_token: 'id-secret',
+				access_token: token,
+				refresh_token: 'codex-refresh-secret',
+				account_id: accountId
+			}
+		})
+	);
+}
+
+const liveCodexToken = () => jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+
+const codexBody = () => ({
+	plan_type: 'pro',
+	rate_limit: {
+		allowed: true,
+		limit_reached: false,
+		primary_window: {
+			used_percent: 42,
+			limit_window_seconds: 18000,
+			reset_after_seconds: 0,
+			reset_at: (NEXT_HOUR + 2 * HOUR) / 1000
+		},
+		secondary_window: {
+			used_percent: 100,
+			limit_window_seconds: 604800,
+			reset_after_seconds: 0,
+			reset_at: (NEXT_HOUR + 48 * HOUR) / 1000
+		}
+	},
+	additional_rate_limits: [
+		{
+			limit_name: 'codex_other',
+			metered_feature: 'codex_other',
+			rate_limit: {
+				primary_window: {
+					used_percent: 70,
+					limit_window_seconds: 18000,
+					reset_after_seconds: 0,
+					reset_at: (NEXT_HOUR + 2 * HOUR) / 1000
+				},
+				secondary_window: null
+			}
+		}
+	]
+});
+
+test('Codex windows are polled with the account header, additional limits get their own window', async () => {
+	await withSandbox(async (box) => {
+		const token = liveCodexToken();
+		await writeCodexLogin(box, token);
+		await withUsageApi(async (api, seen, url) => {
+			api.codex.body = codexBody();
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'codex'), [
+				['five_hour', iso(NEXT_HOUR + 2 * HOUR), 42, false],
+				['five_hour_codex_other', iso(NEXT_HOUR + 2 * HOUR), 70, false],
+				['seven_day', iso(NEXT_HOUR + 48 * HOUR), 100, true]
+			]);
+			assert.match(res.stderr, /polled codex usage: five_hour 42%/);
+			assert.equal(seen.length, 1);
+			assert.equal(seen[0].path, '/codex');
+			assert.equal(seen[0].headers.authorization, `Bearer ${token}`);
+			assert.equal(seen[0].headers['chatgpt-account-id'], CODEX_ACCOUNT);
+			assert.equal(seen[0].headers['user-agent'], 'big-spender');
+
+			const state = await readFile(
+				join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'),
+				'utf8'
+			);
+			for (const secret of [token, 'id-secret', 'codex-refresh-secret']) {
+				assert.ok(
+					!res.stdout.includes(secret) && !res.stderr.includes(secret) && !state.includes(secret)
+				);
+			}
+		});
+	});
+});
+
+test('a window without a reset time is dated from now plus its seconds left', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = {
+				rate_limit: {
+					primary_window: {
+						used_percent: 10,
+						limit_window_seconds: 900,
+						reset_after_seconds: 7200,
+						reset_at: 0
+					}
+				}
+			};
+			const before = Date.now();
+			const res = await collect(box, url);
+			const [[window, resetsAt, percent]] = windows(res.snap, 'codex');
+			assert.deepEqual([window, percent], ['15m', 10]);
+			const delta = Date.parse(String(resetsAt)) - before - 7200_000;
+			assert.ok(delta > -60_000 && delta < 60_000, String(delta));
+		});
+	});
+});
+
+test('an expired Codex token sends no request and warns once', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, jwt({ exp: Math.floor(Date.now() / 1000) - 10 }));
+		await withUsageApi(async (_api, seen, url) => {
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(seen, []);
+			assert.equal(warnings(res.stderr), 1);
+			assert.match(res.stderr, /codex usage not polled: the login token expired/);
+			assert.equal(res.snap.deviceId, 'laptop');
+		});
+	});
+});
+
+test('a token that is not a JWT is still sent, and a missing account id is skipped', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, 'opaque-token');
+		await withUsageApi(async (api, seen, url) => {
+			api.codex.body = codexBody();
+			const res = await collect(box, url);
+			assert.equal(seen.length, 1);
+			assert.equal(seen[0].headers.authorization, 'Bearer opaque-token');
+			assert.equal(windows(res.snap, 'codex').length, 3);
+		});
+	});
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken(), null);
+		await withUsageApi(async (_api, seen, url) => {
+			const res = await collect(box, url);
+			assert.deepEqual(seen, []);
+			assert.equal(warnings(res.stderr), 1);
+		});
+	});
+});
+
+test('one provider failing leaves the other polled', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, seen, url) => {
+			api.claude = { status: 500, body: {} };
+			api.codex.body = codexBody();
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 2);
+			assert.equal(warnings(res.stderr), 1);
+			assert.equal(windows(res.snap, 'codex').length, 3);
+			assert.equal(windows(res.snap, 'claude').length, 0);
+		});
+	});
+});
+
+test('a Codex 401 warns without the token and exits 0', async () => {
+	await withSandbox(async (box) => {
+		const token = liveCodexToken();
+		await writeCodexLogin(box, token);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex = { status: 401, body: { echo: token } };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.match(res.stderr, /codex usage not polled: HTTP 401/);
+			assert.ok(!res.stderr.includes(token));
+		});
+	});
+});

@@ -371,6 +371,47 @@ function claudeWindows(body) {
 	return out;
 }
 
+const CODEX_SLOTS = ['primary_window', 'secondary_window'];
+
+function codexWindows(body, nowMs) {
+	const out = [];
+	const add = (rateLimit, suffix) => {
+		for (const slot of CODEX_SLOTS) {
+			const w = rateLimit?.[slot];
+			if (!w || typeof w.used_percent !== 'number') continue;
+			const minutes = w.limit_window_seconds / 60;
+			const resetsAtMs =
+				w.reset_at > 0 ? w.reset_at * 1000 : nowMs + Number(w.reset_after_seconds) * 1000;
+			if (!Number.isFinite(minutes) || !Number.isFinite(resetsAtMs)) continue;
+			const base = CODEX_WINDOW_NAMES[minutes] ?? `${minutes}m`;
+			out.push({
+				window: (suffix ? `${base}_${suffix}` : base).slice(0, 40),
+				percent: w.used_percent,
+				resetsAtMs
+			});
+		}
+	};
+	add(body.rate_limit, '');
+	for (const extra of Array.isArray(body.additional_rate_limits)
+		? body.additional_rate_limits
+		: []) {
+		const name = typeof extra?.limit_name === 'string' ? slug(extra.limit_name) : '';
+		if (name) add(extra.rate_limit, name);
+	}
+	return out;
+}
+
+// The access token is a JWT; its payload says when it expires. One that can't be decoded is sent
+// anyway and the endpoint decides.
+function jwtExpiresMs(token) {
+	try {
+		const exp = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).exp;
+		return typeof exp === 'number' ? exp * 1000 : NaN;
+	} catch {
+		return NaN;
+	}
+}
+
 // headers() returns the request headers, or a string saying why this provider is skipped.
 const LIMIT_POLLERS = {
 	claude: {
@@ -393,6 +434,25 @@ const LIMIT_POLLERS = {
 			};
 		},
 		windows: claudeWindows
+	},
+	codex: {
+		credentialsPath: () => join(process.env.CODEX_HOME || join(HOME, '.codex'), 'auth.json'),
+		url: 'https://chatgpt.com/backend-api/wham/usage',
+		urlEnv: 'BIG_SPENDER_CODEX_USAGE_URL',
+		headers: (creds, nowMs) => {
+			const { access_token: token, account_id: accountId } = creds?.tokens ?? {};
+			if (typeof token !== 'string' || !token) return 'not signed in with ChatGPT';
+			if (typeof accountId !== 'string' || !accountId) return 'no ChatGPT account id in the login';
+			if (jwtExpiresMs(token) <= nowMs) {
+				return 'the login token expired; run Codex once to refresh it';
+			}
+			return {
+				authorization: `Bearer ${token}`,
+				'chatgpt-account-id': accountId,
+				'user-agent': 'big-spender'
+			};
+		},
+		windows: codexWindows
 	}
 };
 
