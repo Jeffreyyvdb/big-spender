@@ -102,7 +102,8 @@ Remove the schedule with `big-spender uninstall`. The env file and the state are
 ### Cursor
 
 Cursor keeps usage on its servers, per account, so the collector reads it from Cursor's API
-instead of local files. Set it up on one machine only:
+instead of local files. The server must run the big-spender release that added Cursor, or newer.
+An older one answers the `cursor` snapshot with `422`. Set it up on one machine only:
 
 ```sh
 npx big-spender install --device laptop --cursor
@@ -119,16 +120,19 @@ from the first one, or both would send the same usage. Add `cursor` to your
 
 The first run sends all of the account's history that has token counts. Cursor billed per request
 until about June 2025 and reported no tokens for those events, so they are skipped. Later runs
-send the last 90 days, and the server keeps the older days. If the first run fails, the next run
-tries the full history again.
+send the last 90 days, and the server keeps the older days. The full history is sent again until a
+server has stored it, so a failed first run, or a new ingest URL, gets it on the next run.
 
 Cost is Cursor's own price for each event (`totalCents`), not LiteLLM's. Cursor's model names
 mostly don't match LiteLLM's, and models such as Composer have no API price at all. Cursor reports
 one price per event, so the split over input, cache read, cache write and output uses fixed ratios
-of 1, 0.1, 1.25 and 5. The total is always Cursor's.
+of 1, 0.1, 1.25 and 5. The total is Cursor's, up to rounding each part to a millionth of a dollar.
 
 A Cursor failure, such as a revoked key, does not stop the machine's own snapshot. The run still
-posts it, then exits with an error that names Cursor. `big-spender push` never reads Cursor.
+posts it, then exits with an error that names Cursor. That includes a Cursor answer with fewer
+events than it counted: posting it would replace complete days on the server with partial ones. A
+machine whose own device id is `cursor` cannot also send Cursor usage. `big-spender push` never
+reads Cursor.
 
 ## The server
 

@@ -39,7 +39,6 @@ const PRICING_URL =
 	'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 const PRICING_TTL_MS = DAY_MS;
 const POST_ATTEMPTS = 4;
-const CURSOR_API_URL = process.env.BIG_SPENDER_CURSOR_API_URL || 'https://api2.cursor.sh';
 const CURSOR_DEVICE_ID = 'cursor';
 const CURSOR_PAGE_SIZE = 1000;
 // The server's date floor (EARLIEST_DATE in schema.ts); the backfill reads from here.
@@ -62,6 +61,17 @@ const ENV_FILE =
 	join(process.env.XDG_CONFIG_HOME || join(HOME, '.config'), 'big-spender', 'env');
 
 const log = (...m) => console.error('[big-spender]', ...m);
+
+// The override exists for tests. It only points at this machine, so the Cursor API key and
+// access token can't be sent anywhere but Cursor.
+function cursorApiUrl(override) {
+	if (!override) return 'https://api2.cursor.sh';
+	const { hostname } = new URL(override);
+	if (!['127.0.0.1', 'localhost', '[::1]'].includes(hostname)) {
+		throw new Error('BIG_SPENDER_CURSOR_API_URL may only point at this machine');
+	}
+	return override.replace(/\/$/, '');
+}
 
 // Collectors installed before the rename have USAGE_* in their env file and scheduler units.
 const setting = (name) => process.env[`BIG_SPENDER_${name}`] || process.env[`USAGE_${name}`] || '';
@@ -114,7 +124,8 @@ async function acquireLock() {
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean, cursorBackfilled?: boolean }} State
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean, cursorBackfilledTo?: string[] }} State
+ * cursorBackfilledTo lists the ingest URLs that stored the Cursor account's full history.
  */
 
 // One-time fixes to existing state. The state version stays the same so an older installed copy
@@ -705,7 +716,7 @@ function printSummary(snapshot, sessions24h, nowMs) {
 // local logs and sent under its own device id: the same account on two machines is one history.
 
 async function cursorRequest(path, bearer, body, headers = {}) {
-	const res = await fetch(`${CURSOR_API_URL}${path}`, {
+	const res = await fetch(`${cursorApiUrl(process.env.BIG_SPENDER_CURSOR_API_URL)}${path}`, {
 		method: 'POST',
 		headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json', ...headers },
 		body: JSON.stringify(body),
@@ -731,6 +742,7 @@ async function cursorAccessToken(apiKey) {
 	if (typeof accessToken !== 'string' || !accessToken) {
 		throw new Error('Cursor did not return an access token for BIG_SPENDER_CURSOR_API_KEY');
 	}
+	assertHeaderSafe(accessToken, "Cursor's access token");
 	return accessToken;
 }
 
@@ -762,8 +774,11 @@ async function cursorEvents(token, fromMs, toMs) {
 		const mid = fromMs + Math.floor((toMs - fromMs) / 2);
 		return [...(await cursorEvents(token, fromMs, mid)), ...(await cursorEvents(token, mid, toMs))];
 	}
+	// Posting a short window would replace complete days on the server with partial ones.
 	if (events.length !== total) {
-		log(`warning: Cursor counted ${total} usage events in a window but returned ${events.length}`);
+		throw new Error(
+			`Cursor counted ${total} usage events in a window but returned ${events.length}`
+		);
 	}
 	return events.filter((e) => {
 		const ts = Number(e?.timestamp);
@@ -904,7 +919,7 @@ async function post(snapshot) {
 				log(
 					`posted ${snapshot.hourly.length} rows for "${snapshot.deviceId}" (${body.length} bytes gzipped): ${text}`
 				);
-				return;
+				return parseJson(text)?.result;
 			}
 			lastErr = new Error(`HTTP ${res.status}: ${text}`);
 			// Client errors other than rate limiting won't fix themselves.
@@ -965,11 +980,17 @@ async function main() {
 
 		// A Cursor failure is held until this device's snapshot is posted, so it never blocks it.
 		const cursorKey = (process.env.BIG_SPENDER_CURSOR_API_KEY ?? '').trim();
-		const backfill = !state.cursorBackfilled;
+		const ingestUrl = setting('INGEST_URL');
+		const backfill = !(state.cursorBackfilledTo ?? []).includes(ingestUrl);
 		let cursor = null;
 		let cursorError = null;
 		if (cursorKey) {
 			try {
+				if (setting('DEVICE_ID') === CURSOR_DEVICE_ID) {
+					throw new Error(
+						`this machine's device id is "${CURSOR_DEVICE_ID}", which the Cursor snapshot uses; rename this machine with big-spender install --device <id> --rename`
+					);
+				}
 				assertHeaderSafe(cursorKey, 'BIG_SPENDER_CURSOR_API_KEY');
 				cursor = await cursorSnapshot(cursorKey, backfill, nowMs, coverageStartMs);
 			} catch (err) {
@@ -989,10 +1010,14 @@ async function main() {
 		await post(device.snapshot);
 		if (cursorError) throw cursorError;
 		if (cursor) {
-			await post(cursor.snapshot);
-			if (backfill) {
-				state.cursorBackfilled = true;
+			const result = await post(cursor.snapshot);
+			if (backfill && result === 'stored') {
+				(state.cursorBackfilledTo ??= []).push(ingestUrl);
 				await saveState(state);
+			} else if (result !== 'stored') {
+				log(
+					`warning: the server kept a newer "${CURSOR_DEVICE_ID}" snapshot (${result}); is Cursor set up on two machines?`
+				);
 			}
 		}
 	} finally {

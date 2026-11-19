@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { main } from '../src/cli.ts';
 import type { UsageRow, UsageSnapshot } from '../src/schema.ts';
@@ -36,12 +37,16 @@ function event(
 	};
 }
 
+/** What the fake Cursor API hands out: the access token, and how many events a page leaves out. */
+type FakeCursor = { accessToken: string; shortBy: number };
+
 /** Cursor's API as the collector sees it: a key exchange and one page of up to 1000 events. */
 async function withCursor(
 	events: CursorEvent[],
-	fn: (url: string, requests: UsageRequest[]) => Promise<void>
+	fn: (url: string, requests: UsageRequest[], api: FakeCursor) => Promise<void>
 ) {
 	const requests: UsageRequest[] = [];
+	const api: FakeCursor = { accessToken: ACCESS_TOKEN, shortBy: 0 };
 	const server = createServer(async (req, res) => {
 		let text = '';
 		for await (const chunk of req) text += chunk;
@@ -51,7 +56,7 @@ async function withCursor(
 		};
 		if (req.url === '/auth/exchange_user_api_key') {
 			if (req.headers.authorization !== `Bearer ${API_KEY}`) return reply(401, { error: 'no' });
-			return reply(200, { accessToken: ACCESS_TOKEN });
+			return reply(200, { accessToken: api.accessToken });
 		}
 		if (req.url === '/aiserver.v1.DashboardService/GetFilteredUsageEvents') {
 			if (
@@ -66,7 +71,7 @@ async function withCursor(
 			const inside = events
 				.filter((e) => Number(e.timestamp) >= startDate && Number(e.timestamp) <= endDate)
 				.sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
-			const page = inside.slice(0, body.pageSize);
+			const page = inside.slice(0, body.pageSize).slice(api.shortBy);
 			requests.push({ startDate, endDate, returned: page.length });
 			// Connect leaves out empty fields.
 			return reply(
@@ -78,7 +83,7 @@ async function withCursor(
 	});
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 	try {
-		await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests);
+		await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests, api);
 	} finally {
 		server.closeAllConnections();
 		await new Promise((resolve) => server.close(resolve));
@@ -293,5 +298,107 @@ test('push never reads Cursor, and install --cursor takes the key from the envir
 			await readFile(envFile, 'utf8'),
 			new RegExp(`^BIG_SPENDER_CURSOR_API_KEY=${API_KEY}$`, 'm')
 		);
+	});
+});
+
+/** An ingest endpoint that records what it gets and answers Cursor snapshots with `result`. */
+async function withFakeIngest(
+	fn: (url: string, received: UsageSnapshot[], reply: { result: string }) => Promise<void>
+) {
+	const received: UsageSnapshot[] = [];
+	const reply = { result: 'stored' };
+	const server = createServer(async (req, res) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of req) chunks.push(chunk);
+		const snap = JSON.parse(gunzipSync(Buffer.concat(chunks)).toString('utf8'));
+		received.push(snap);
+		const result = snap.deviceId === 'cursor' ? reply.result : 'stored';
+		res.writeHead(200, { 'content-type': 'application/json' });
+		res.end(
+			JSON.stringify({ ok: true, deviceId: snap.deviceId, rows: snap.hourly.length, result })
+		);
+	});
+	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+	try {
+		await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}/ingest`, received, reply);
+	} finally {
+		server.closeAllConnections();
+		await new Promise((resolve) => server.close(resolve));
+	}
+}
+
+test('a page short of its count, a stale reply or an unsafe token never completes the backfill', async () => {
+	const oldDay = '2025-09-01T00:00:00.000Z';
+	const events = [
+		event(Date.parse('2025-09-01T12:00:00Z'), 'composer-2', { inputTokens: 10, totalCents: 2 }),
+		event(Date.now() - DAY_MS, 'composer-2', { inputTokens: 5, totalCents: 1 })
+	];
+	const cursorCoverage = (received: UsageSnapshot[]) =>
+		received.filter((r) => r.deviceId === 'cursor').map((r) => r.coverageStart);
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await withCursor(events, async (cursorUrl, _requests, api) => {
+			await withFakeIngest(async (ingestUrl, received, reply) => {
+				const env = collectorEnv(box, ingestUrl, cursorUrl);
+
+				api.shortBy = 1;
+				const short = await run(COLLECTOR, [], env);
+				assert.equal(short.code, 1);
+				assert.match(short.stderr, /Cursor counted 2 usage events in a window but returned 1/);
+				api.shortBy = 0;
+
+				api.accessToken = 'tok\nsecret-part';
+				const unsafe = await run(COLLECTOR, [], env);
+				assert.equal(unsafe.code, 1);
+				assert.match(unsafe.stderr, /Cursor's access token contains characters/);
+				assert.doesNotMatch(unsafe.stderr, /secret-part/);
+				api.accessToken = ACCESS_TOKEN;
+				assert.deepEqual(cursorCoverage(received), [], 'nothing partial was sent');
+
+				reply.result = 'stale';
+				const stale = await run(COLLECTOR, [], env);
+				assert.equal(stale.code, 0, stale.stderr);
+				assert.match(stale.stderr, /server kept a newer "cursor" snapshot \(stale\)/);
+				reply.result = 'stored';
+
+				for (let i = 0; i < 2; i++) {
+					const ok = await run(COLLECTOR, [], env);
+					assert.equal(ok.code, 0, ok.stderr);
+				}
+				const [staleRun, backfill, incremental] = cursorCoverage(received);
+				assert.equal(staleRun, oldDay);
+				assert.equal(backfill, oldDay, 'a stale reply leaves the backfill to do');
+				assert.notEqual(incremental, oldDay, 'once stored, later runs send 90 days');
+			});
+
+			await withFakeIngest(async (otherUrl, received) => {
+				const moved = await run(COLLECTOR, [], collectorEnv(box, otherUrl, cursorUrl));
+				assert.equal(moved.code, 0, moved.stderr);
+				assert.deepEqual(cursorCoverage(received), [oldDay], 'a new server gets the full history');
+			});
+		});
+	});
+});
+
+test('Cursor is refused for a machine named cursor and for an API URL off this machine', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await withIngest(box, async (ingestUrl, dataDir) => {
+			const named = await run(COLLECTOR, [], {
+				...collectorEnv(box, ingestUrl, 'http://127.0.0.1:9'),
+				BIG_SPENDER_DEVICE_ID: 'cursor'
+			});
+			assert.equal(named.code, 1);
+			assert.match(named.stderr, /device id is "cursor"/);
+
+			const remote = await run(
+				COLLECTOR,
+				[],
+				collectorEnv(box, ingestUrl, 'https://collector.example.com')
+			);
+			assert.equal(remote.code, 1);
+			assert.match(remote.stderr, /may only point at this machine/);
+			assert.ok(existsSync(join(dataDir, 'laptop.json')), 'the device snapshot is still posted');
+		});
 	});
 });
