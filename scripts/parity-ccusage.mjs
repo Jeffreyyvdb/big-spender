@@ -26,6 +26,7 @@ const AGENTS = {
 	pi: { agent: 'pi', args: ['--mode', 'calculate'], renameModel: (m) => m.replace(/^\[pi\] /, '') },
 	grok: { agent: 'grok', renameModel: (m) => m.replace(/^\[grok\] /, '') },
 	copilot: { agent: 'copilot' },
+	gemini: { agent: 'gemini', outputExcludesReasoning: true },
 	antigravity: {
 		agent: 'antigravity',
 		outputExcludesReasoning: true,
