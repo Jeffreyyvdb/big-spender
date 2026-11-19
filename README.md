@@ -258,7 +258,10 @@ their local logs, and it polls their usage endpoints (see [Polling](#polling-usa
   alone say nothing about utilisation below 100%; polling fills that in.
 - **Codex.** `token_count` events carry `rate_limits` with the used percentage and reset time of the
   5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). A
-  window counts as hit when its share reaches 100%.
+  window counts as hit when its share reaches 100%. A refused turn is logged too, but names no
+  window and no reset. It starts the lockout of each Codex window already seen full (by a poll or
+  an earlier log line) that was open at that moment, so the lockout begins at the first logged
+  refusal instead of at the next poll. A refusal with no such window changes nothing.
 
 A record is one window instance, identified by provider, window name and reset time rounded down
 to the minute. Reports whose resets are at most two minutes apart are the same window, because one
@@ -292,6 +295,15 @@ Each reading is a peak for the same window record the logs feed. Windows are nam
 `seven_day`, plus one `seven_day_<model>` per model-specific weekly (`seven_day_fable`,
 `seven_day_opus`). Codex's extra limits become `<window>_<limit name>`. Only the window name, reset
 time and percentage are stored or sent.
+
+Claude Code logs a refusal of Fable's weekly as `seven_day_overage_included`, which is the same
+limit the endpoint reports as `seven_day_fable`. Once a poll has reported exactly one model-specific
+weekly, refusals logged under that name are recorded as that window, so they join its polled
+readings in one record. With none or several, the raw name stays. The name is applied when a record
+is created and is kept between runs; an earlier record is not renamed.
+
+A lockout that starts and ends between two collector runs, with no full reading from a poll or the
+logs, is still missed.
 
 To turn polling off, set `BIG_SPENDER_POLL_LIMITS=off` in the env file.
 
