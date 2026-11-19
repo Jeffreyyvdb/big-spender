@@ -18,6 +18,7 @@ prompt, so neither is written to this machine. Nothing is scheduled.
 --dry-run prints the overview, writes the exact JSON that would be sent to
 $TMPDIR/big-spender-snapshot-<device>.json and never asks for the token. Both modes update the
 collector's local state in ~/.cache/big-spender (which logs were read), never anything remote.
+A server too old to store usage-limit windows gets the snapshot again without them.
 Cursor usage is not part of a push: only the scheduled collector sends it.`;
 
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
@@ -70,7 +71,13 @@ function overview(snapshot: UsageSnapshot, gzipped: number): string[] {
 		'',
 		`  ${'provider  model'.padEnd(width)}  ${'tokens'.padStart(10)}  ${'cost'.padStart(10)}`,
 		...rows.map(([k, m]) => line(k, m.tokens, m.cost)),
-		line('total', tokens, cost)
+		line('total', tokens, cost),
+		...(snapshot.limits
+			? [
+					'',
+					`${snapshot.limits.length} usage-limit windows (name, reset time, peak percent, first block time) are published too.`
+				]
+			: [])
 	];
 }
 
@@ -143,8 +150,21 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		);
 	}
 
-	const result = await send(ctx, url, token, body);
-	ctx.out(`posted ${snapshot.hourly.length} rows (${body.length} bytes gzipped): ${result}`);
+	let sent = body;
+	let result: string;
+	try {
+		result = await send(ctx, url, token, body);
+	} catch (err) {
+		// A server from before limits existed rejects the unknown key with a 422 naming it. Any
+		// other limits error is a real bug and must not silently drop the windows.
+		const message = err instanceof Error ? err.message : '';
+		if (!snapshot.limits || !/^HTTP 422\b.*Unrecognized key.{0,20}limits/.test(message)) throw err;
+		ctx.err('warning: the server is too old to store limit data; sending usage without it');
+		const { limits: _, ...usageOnly } = snapshot;
+		sent = gzipSync(JSON.stringify(usageOnly));
+		result = await send(ctx, url, token, sent);
+	}
+	ctx.out(`posted ${snapshot.hourly.length} rows (${sent.length} bytes gzipped): ${result}`);
 	return 0;
 }
 
