@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { usageSnapshotSchema, type UsageSnapshot } from '../src/schema.ts';
@@ -12,6 +12,7 @@ import {
 	generationBlob,
 	openDatabase,
 	sqlite,
+	trajectory,
 	type Usage
 } from './antigravity-fixture.ts';
 import { run, seedPricing, withSandbox, type Sandbox } from './helpers.ts';
@@ -254,6 +255,115 @@ test(
 		)
 );
 
+test(
+	'scenario 1a: a later copy that links two responses counted apart leaves one response',
+	{ skip },
+	() =>
+		converges(
+			[
+				(home) => {
+					createDatabase(conversation(home, 'a.db'), {
+						gens: [[1, pro({ ...plain(100, 10), responseId: 'R' }, at(1, 10))]]
+					});
+					createDatabase(conversation(home, 'b.db'), {
+						gens: [[1, pro({ ...plain(100, 10), providerMessageId: 'P' }, at(1, 10))]]
+					});
+				},
+				(home) =>
+					createDatabase(conversation(home, 'c.db'), {
+						gens: [
+							[1, pro({ ...plain(120, 10), responseId: 'R', providerMessageId: 'P' }, at(1, 10))]
+						]
+					})
+			],
+			{ '1 gemini-3-pro': { input: 120, output: 10 } }
+		)
+);
+
+test(
+	'scenario 3b: a later copy with its own timestamp moves the response to that day',
+	{ skip },
+	() =>
+		converges(
+			[
+				(home) =>
+					createDatabase(conversation(home, 'a.db'), {
+						gens: [[1, pro({ ...plain(100, 10), responseId: 'R' })]],
+						trajectories: [trajectory(at(2, 5))]
+					}),
+				(home) =>
+					createDatabase(conversation(home, 'b.db'), {
+						gens: [[1, pro({ ...plain(100, 10), responseId: 'R' }, at(1, 5))]]
+					})
+			],
+			{ '1 gemini-3-pro': { input: 100, output: 10 } }
+		)
+);
+
+test(
+	'scenario 4b: a later copy that names the model moves the response off the placeholder',
+	{ skip },
+	() =>
+		converges(
+			[
+				(home) =>
+					createDatabase(conversation(home, 'a.db'), {
+						gens: [
+							[
+								1,
+								generationBlob({
+									use: { ...plain(100, 10), modelId: 1499, responseId: 'R' },
+									ts: at(1, 10)
+								})
+							]
+						]
+					}),
+				(home) =>
+					createDatabase(conversation(home, 'b.db'), {
+						gens: [
+							[
+								1,
+								generationBlob({
+									model: 'Gemini 3 Pro',
+									use: { ...plain(160, 10), responseId: 'R' },
+									ts: at(1, 10)
+								})
+							]
+						]
+					})
+			],
+			{ '1 gemini-3-pro': { input: 160, output: 10 } }
+		)
+);
+
+test(
+	'scenario 8: a response dated by its file follows the file when it is written again',
+	{ skip },
+	() => {
+		const touch = (path: string, ms: number) => utimesSync(path, new Date(ms), new Date(ms));
+		return converges(
+			[
+				(home) => {
+					const path = conversation(home, 'a.db');
+					createDatabase(path, {
+						gens: [[1, pro({ input: 100, responseId: 'R' })]],
+						withStepsAndTrajectory: false
+					});
+					touch(path, at(1, 10));
+				},
+				(home) => {
+					const path = conversation(home, 'a.db');
+					const db = new sqlite!.DatabaseSync(path);
+					addGenerations(db, [[2, pro({ input: 5, responseId: 'S' }, at(2, 10))]]);
+					db.close();
+					touch(path, at(2, 10));
+				}
+			],
+			{ '2 gemini-3-pro': { input: 105, output: 0 } }
+		);
+	}
+);
+
 test('a database that changed only in its WAL file is read again', { skip }, async () => {
 	await withSandbox(async (box) => {
 		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
@@ -317,6 +427,14 @@ test('nothing but numbers and a schema-safe model name leaves the machine', { sk
 		}
 		assert.match(stderr, /Antigravity database broken\.db: /);
 		assert.ok(!stderr.includes(box.home), 'a log line names a path');
+
+		const state = JSON.parse(
+			readFileSync(join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'), 'utf8')
+		);
+		const kept = JSON.stringify([state.seen, state.buckets]);
+		for (const secret of [box.home, 'conv-7f3a9c', 'resp-private', 'billing', 'conversations']) {
+			assert.ok(!kept.includes(secret), `the state keeps "${secret}" outside its file list`);
+		}
 	});
 });
 

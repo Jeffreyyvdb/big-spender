@@ -134,7 +134,8 @@ async function acquireLock() {
  * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number, forkCalls?: string[], models?: Record<string, { input: number, cacheRead: number, cacheWrite: number, output: number, requests?: number }>, callsSinceShutdown?: boolean }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
- * @typedef {number | [number, number] | [number, number, number, number, number]} Seen
+ * Antigravity keeps a merged response under each of its ids: see agStoreGroup.
+ * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
  * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
@@ -193,14 +194,16 @@ const shortHash = (s) => createHash('sha256').update(s).digest('base64url').slic
 // Bucket key: hour start (ms) | provider | model | pricing tier (prompt-size threshold, 0 = base).
 const bucketKey = (hourMs, provider, model, tier) => `${hourMs}|${provider}|${model}|${tier}`;
 
+const BUCKET_COUNTS = ['input', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'output'];
+const recordBucketKey = (r) =>
+	bucketKey(Math.floor(r.ts / HOUR_MS) * HOUR_MS, r.provider, r.model, r.tier);
+
 /**
  * @param {State} state
  * @param {{ ts: number, provider: string, model: string, tier: number, session: string, input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number }} r
  */
 function addRecord(state, r) {
-	const hourMs = Math.floor(r.ts / HOUR_MS) * HOUR_MS;
-	const key = bucketKey(hourMs, r.provider, r.model, r.tier);
-	const b = (state.buckets[key] ??= {
+	const b = (state.buckets[recordBucketKey(r)] ??= {
 		input: 0,
 		cacheRead: 0,
 		cacheWrite5m: 0,
@@ -208,12 +211,21 @@ function addRecord(state, r) {
 		output: 0,
 		sessions: []
 	});
-	b.input += r.input;
-	b.cacheRead += r.cacheRead;
-	b.cacheWrite5m += r.cacheWrite5m;
-	b.cacheWrite1h += r.cacheWrite1h;
-	b.output += r.output;
+	for (const k of BUCKET_COUNTS) b[k] += r[k];
 	if (!b.sessions.includes(r.session)) b.sessions.push(r.session);
+}
+
+/**
+ * Takes back what addRecord added for `r`. Its session stays listed, since a bucket does not
+ * know which of its records named it, unless nothing is left of the bucket.
+ * @type {typeof addRecord}
+ */
+function removeRecord(state, r) {
+	const key = recordBucketKey(r);
+	const b = state.buckets[key];
+	if (!b) return;
+	for (const k of BUCKET_COUNTS) b[k] = Math.max(0, b[k] - r[k]);
+	if (BUCKET_COUNTS.every((k) => b[k] === 0)) delete state.buckets[key];
 }
 
 /** @param {State} state @param {number} cutoffMs */
@@ -1347,7 +1359,11 @@ const agResolved = (model) =>
 // Where an event's timestamp came from; a merge keeps the better source.
 const AG_TS = { FILE_MTIME: 0, TRAJECTORY: 1, OWN_ROW: 3 };
 
-/** @typedef {{ ts: number, rank: number, session: string, model: string, input: number, output: number, cacheWrite: number, cacheRead: number, reasoning: number, totalOutput: number, identities: string[], retryKey?: string }} AgEvent */
+/**
+ * One response, or after a merge every copy of it. `mtimeOf` names the database whose modification
+ * time is the timestamp (rank FILE_MTIME), and is empty for any other rank.
+ * @typedef {{ ts: number, rank: number, mtimeOf: string, session: string, model: string, input: number, output: number, cacheWrite: number, cacheRead: number, reasoning: number, totalOutput: number, identities: string[], tier?: number }} AgEvent
+ */
 
 /**
  * @param {AgEvent[]} events
@@ -1381,6 +1397,7 @@ function agAppendEvent(events, idTimestamps, usage, row) {
 	events.push({
 		ts,
 		rank,
+		mtimeOf: '',
 		session: row.session,
 		model,
 		input: usage.input,
@@ -1389,8 +1406,7 @@ function agAppendEvent(events, idTimestamps, usage, row) {
 		cacheRead: usage.cacheRead,
 		reasoning: Math.max(usage.reasoning, totalOutput - output),
 		totalOutput,
-		identities: [...identities],
-		retryKey: row.retryKey
+		identities: [...identities]
 	});
 }
 
@@ -1435,10 +1451,11 @@ function agDatabaseEvents(db, path, fallbackTs) {
 		m.retries.forEach((retry, n) =>
 			append(retry, {
 				...row,
-				fallbackIdentities: [],
-				// ccusage never merges a retry without ids, so a copy of the database elsewhere counts
-				// its own: the key is the file, not the session name two files can share.
-				retryKey: `retry:${path}:${kind}:${idx}:${n}`
+				// ccusage gives a retry without ids no identity and never merges it, so a copy of the
+				// database elsewhere counts its own. An identity no other event has does the same, and
+				// lets a later run find the retry it counted: hence the file, not the session name two
+				// files can share.
+				fallbackIdentities: [`retry:${path}:${kind}:${idx}:${n}`]
 			})
 		);
 	};
@@ -1469,6 +1486,7 @@ function agMergeInto(target, copy) {
 	if (copy.rank > target.rank || (copy.rank === target.rank && copy.ts < target.ts)) {
 		target.ts = copy.ts;
 		target.rank = copy.rank;
+		target.mtimeOf = copy.mtimeOf;
 	}
 	for (const id of copy.identities) {
 		if (!target.identities.includes(id)) target.identities.push(id);
@@ -1504,11 +1522,67 @@ const agSchemaModel = (model) =>
 		.replace(/^-+|-+$/g, '')
 		.slice(0, 100) || ANTIGRAVITY_DEFAULT_MODEL;
 
+const AG_STORED = [
+	'ts',
+	'rank',
+	'model',
+	'input',
+	'output',
+	'cacheWrite',
+	'cacheRead',
+	'reasoning',
+	'totalOutput',
+	'tier',
+	'session',
+	'mtimeOf'
+];
+
+/**
+ * Keeps a counted group in `seen` so a later run can merge new copies into it and replace what it
+ * added to its bucket. The first identity holds the AG_STORED fields followed by the group's other
+ * identities, and each of those holds [ts, first identity]. Every entry starts with the group's
+ * timestamp, which is what pruneState reads.
+ * @param {State['seen']} seen @param {AgEvent} group
+ */
+function agStoreGroup(seen, group) {
+	const [first, ...others] = group.identities;
+	seen[first] = [...AG_STORED.map((field) => group[field]), ...others];
+	for (const key of others) seen[key] = [group.ts, first];
+}
+
+/** @param {State['seen']} seen @param {string} key @returns {AgEvent | undefined} */
+function agStoredGroup(seen, key) {
+	let record = seen[key];
+	if (Array.isArray(record) && typeof record[1] === 'string') {
+		key = record[1];
+		record = seen[key];
+	}
+	if (!Array.isArray(record) || typeof record[2] !== 'string') return undefined;
+	return {
+		...Object.fromEntries(AG_STORED.map((field, i) => [field, record[i]])),
+		identities: [key, ...record.slice(AG_STORED.length)]
+	};
+}
+
+const agBucketRecord = (provider, group) => ({
+	ts: group.ts,
+	provider,
+	model: agSchemaModel(group.model),
+	tier: group.tier,
+	session: group.session,
+	input: group.input,
+	cacheRead: group.cacheRead,
+	cacheWrite5m: group.cacheWrite,
+	cacheWrite1h: 0,
+	output: group.totalOutput
+});
+
 /** @type {Source['read']} */
 async function readAntigravity(dirs, ctx, provider) {
 	const { state } = ctx;
 	/** @type {AgEvent[]} */
 	const events = [];
+	const read = new Set();
 	for (const path of await antigravityDatabases(dirs)) {
 		if (ctx.seenPaths.has(path)) continue;
 		ctx.seenPaths.add(path);
@@ -1534,7 +1608,16 @@ async function readAntigravity(dirs, ctx, provider) {
 		try {
 			db = await openSqlite(path);
 			if (!db) return;
-			events.push(...agDatabaseEvents(db, path, st.mainMtimeMs));
+			const database = shortHash(`antigravity-db:${path}`);
+			for (const e of agDatabaseEvents(db, path, st.mainMtimeMs)) {
+				events.push({
+					...e,
+					mtimeOf: e.rank === AG_TS.FILE_MTIME ? database : '',
+					session: shortHash(`antigravity:${e.session}`),
+					identities: e.identities.map((id) => `ag:${shortHash(id)}`)
+				});
+			}
+			read.add(database);
 			state.files[path] = { size: st.size, mtimeMs: st.mtimeMs, offset: 0 };
 			ctx.filesRead++;
 			ctx.parsedBytes += st.size;
@@ -1545,35 +1628,29 @@ async function readAntigravity(dirs, ctx, provider) {
 		}
 	}
 
-	for (const e of agMergeEvents(events)) {
-		if (e.ts < ctx.cutoffMs) continue;
-		const keys = (e.identities.length ? e.identities : [e.retryKey]).map(
-			(id) => `ag:${shortHash(id)}`
+	// An unchanged database is not read again, so its copies are known only through the groups
+	// earlier runs stored. Merging those first, as ccusage would have read them first, and counting
+	// the result in their place gives what one scan of every database gives.
+	/** @type {Map<string, AgEvent>} */
+	const stored = new Map();
+	for (const key of events.flatMap((e) => e.identities)) {
+		const group = agStoredGroup(state.seen, key);
+		if (group) stored.set(group.identities[0], group);
+	}
+	for (const group of stored.values()) {
+		removeRecord(state, agBucketRecord(provider, group));
+		for (const key of group.identities) delete state.seen[key];
+		// That database was read again, and its modification time with it.
+		if (group.rank === AG_TS.FILE_MTIME && read.has(group.mtimeOf)) group.ts = Infinity;
+	}
+	for (const group of agMergeEvents([...stored.values(), ...events])) {
+		if (group.ts < ctx.cutoffMs) continue;
+		group.tier = tierFor(
+			ctx.resolvePrice(provider, agSchemaModel(group.model)),
+			group.input + group.cacheRead + group.cacheWrite
 		);
-		const found = keys.map((key) => state.seen[key]).filter(Array.isArray);
-		const [ts, ...counted] = found.length
-			? found[0].map((_, i) => Math.max(...found.map((record) => record[i])))
-			: [e.ts, 0, 0, 0, 0];
-		const counts = [e.input, e.cacheWrite, e.cacheRead, e.totalOutput];
-		const [input, cacheWrite, cacheRead, output] = counts.map((n, i) =>
-			Math.max(0, n - counted[i])
-		);
-		const record = [ts, ...counts.map((n, i) => Math.max(n, counted[i]))];
-		for (const key of keys) state.seen[key] = record;
-		if (input + cacheWrite + cacheRead + output === 0) continue;
-		const model = agSchemaModel(e.model);
-		addRecord(state, {
-			ts,
-			provider,
-			model,
-			tier: tierFor(ctx.resolvePrice(provider, model), e.input + e.cacheRead + e.cacheWrite),
-			session: shortHash(`antigravity:${e.session}`),
-			input,
-			cacheRead,
-			cacheWrite5m: cacheWrite,
-			cacheWrite1h: 0,
-			output
-		});
+		agStoreGroup(state.seen, group);
+		addRecord(state, agBucketRecord(provider, group));
 	}
 }
 
