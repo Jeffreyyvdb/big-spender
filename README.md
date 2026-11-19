@@ -32,6 +32,10 @@ nothing is bucketed finer than a UTC day: 7, 30 and 90 days are per day, all tim
 (Monday UTC). Device ids are published only if you leave
 `unknownDevices` at its default, see [Device names and colours](#device-names-and-colours).
 
+Usage limit windows (see [Usage limits](#usage-limits)) are sent as a window name, its reset time,
+a peak percentage and, when a request was refused, the time of the first refusal. They never name a
+device, and `/api/usage/limits` publishes them per UTC day only.
+
 Before the first send you can see exactly what would leave the machine with
 `big-spender push <device> --dry-run`.
 
@@ -145,12 +149,13 @@ Cursor.
 
 `big-spender serve` is a small `node:http` server:
 
-| Route                    | What it does                                                                                                                                 |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /api/usage/ingest` | Collectors post a snapshot here (gzip or plain JSON, bearer token).                                                                          |
-| `GET /api/usage`         | Merged totals for 7, 30 and 90 days and all time as JSON, with `cache-control: public, max-age=300, stale-while-revalidate=900`.             |
-| `GET /`                  | A plain server-rendered page: totals per range, devices with colour swatches, top models. No JavaScript, no external assets, light and dark. |
-| `GET /healthz`           | `ok`, for load balancers and Docker.                                                                                                         |
+| Route                    | What it does                                                                                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/usage/ingest` | Collectors post a snapshot here (gzip or plain JSON, bearer token).                                                                                      |
+| `GET /api/usage`         | Merged totals for 7, 30 and 90 days and all time as JSON, with `cache-control: public, max-age=300, stale-while-revalidate=900`.                         |
+| `GET /api/usage/limits`  | Subscription limit hits per provider and window over the last 90 UTC days, per day, same cache header. See [Usage limits](#usage-limits).                |
+| `GET /`                  | A plain server-rendered page: totals per range, devices with colour swatches, top models, limit hits. No JavaScript, no external assets, light and dark. |
+| `GET /healthz`           | `ok`, for load balancers and Docker.                                                                                                                     |
 
 Configuration comes from flags or environment variables (flags win):
 
@@ -234,10 +239,50 @@ Next.js route handler (`export const POST = (request: Request) => bs.ingest(requ
   `{ ok, deviceId, rows, result: 'stored' | 'stale' }`).
 - `summary(now?)`: the merged totals for every range. The result is cached for five minutes and
   recomputed right after an ingest.
+- `limits(now?)`: the [usage limit](#usage-limits) summary, cached the same way.
 
-The module also exports `summarize(snapshots, now, config)`, the snapshot schema
-(`usageSnapshotSchema`), `resolveDevices`, `RANGES`, `PROVIDERS` and the types, for building your
+The module also exports `summarize(snapshots, now, config)`, `summarizeLimits(snapshots, now)`, the
+snapshot schema (`usageSnapshotSchema`, `limitWindowSchema`, `MAX_LIMIT_WINDOWS`), `resolveDevices`, `RANGES`, `PROVIDERS` and the types, for building your
 own storage or charts.
+
+## Usage limits
+
+Besides cost, the collector records when you run out of your Claude and Codex subscription
+allowance, so you can judge whether a plan fits how you work. It reads only what the agents already
+write to their local logs. It reads no credentials and makes no new network calls.
+
+- **Claude Code.** A refused request is logged as an `assistant` line with `error: "rate_limit"`
+  and a `quotaLimits` object that names the window (`five_hour`, `seven_day`, a model-specific
+  weekly window such as `seven_day_opus`) and when it resets. Retries repeat the line, so one
+  blocked window becomes one record. Claude Code logs nothing when a request is allowed, so
+  utilisation below 100% is unknown for Claude.
+- **Codex.** `token_count` events carry `rate_limits` with the used percentage and reset time of the
+  5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). Codex
+  is the only source of utilisation below 100%. A window counts as hit when its share reaches 100%
+  or Codex names it in `rate_limit_reached_type`.
+
+A record is one window instance, identified by provider, window name and reset time rounded down
+to the minute. It holds the peak percentage seen and the time of the first refusal. Limits belong
+to the account, not the machine, so merging keeps the highest peak and the earliest refusal, and
+two machines that report the same window count once. Records are kept for 90 days on the collector and up to 5,000 windows on the
+server, like day rows.
+
+`GET /api/usage/limits` returns, for each provider and window over the last 90 UTC days, how many
+window instances were seen, how many were hit, the hours locked out (first refusal until reset),
+the day of the last hit and a per-day series. A window counts on the day of its first refusal, or
+of its reset when it was never refused; a window that is still open counts on today with its peak
+so far. It follows the same privacy rule as the rest: nothing
+finer than a UTC day, no device names, no report times. It is separate from `/api/usage`, whose
+shape did not change. `big-spender status` also lists the limits hit in the last 7 days, to the
+minute, because that output never leaves the machine.
+
+Polling the Anthropic or OpenAI usage endpoints would show utilisation for Claude too, but it needs
+your OAuth credentials, so it is not done. The record shape already has room for it: a polled
+percentage is just another peak for the same window.
+
+An older server rejects the unknown `limits` field with a 422. The collector and `push` then send
+the snapshot again without it and print a warning on each run, so usage keeps arriving. Upgrade the server to store
+limits.
 
 ## Push by hand
 
@@ -311,6 +356,9 @@ aggregates, so each run parses only new bytes but still sends the full 90-day sn
 than 7 days are rolled up to daily rows. Because the aggregates live in the state file, usage stays
 counted even after Claude Code deletes old session logs. `--reset` rebuilds from the logs that still
 exist, so avoid it unless the state is corrupt.
+
+Limit windows live in the same state file. The first run after the update re-reads every log once
+to pick up limit lines older runs skipped; it adds no usage.
 
 State from an older collector is fixed in place on the first run of a newer one (for example, one
 re-read of the Claude logs to pick up missed output tokens), so updating never needs `--reset`.
