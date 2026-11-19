@@ -66,14 +66,14 @@ try {
 		`${after.hourly.length} rows (${providers}), ${after.sessionsTotal} sessions, ${after.pricingSource}`
 	);
 	if (diff) console.log(diff.trimEnd());
-	if (after.hourly.length === 0) {
-		console.log('inconclusive: the collector found no usage');
-		process.exitCode = 2;
-	} else if (same(before, after)) {
-		console.log('ok: only generatedAt may differ');
-	} else {
+	if (!same(before, after)) {
 		console.log('FAIL: the snapshots differ');
 		process.exitCode = 1;
+	} else if (after.hourly.length === 0) {
+		console.log('inconclusive: neither collector found usage');
+		process.exitCode = 2;
+	} else {
+		console.log('ok: only generatedAt may differ');
 	}
 } finally {
 	await rm(dir, { recursive: true, force: true });

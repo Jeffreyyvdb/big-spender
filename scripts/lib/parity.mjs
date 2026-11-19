@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { cp, mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -59,14 +59,18 @@ export async function dryRun(collector, kind, deviceId, { pricingFrom } = {}) {
 		CODEX_HOME: join(realHome, '.codex'),
 		[kind === 'site' ? 'USAGE_DEVICE_ID' : 'BIG_SPENDER_DEVICE_ID']: deviceId
 	};
-	const { stdout, stderr } = await execFileAsync(process.execPath, [collector, '--dry-run'], {
-		env,
-		maxBuffer: 512 * 1024 * 1024
-	});
-	return {
-		snapshot: JSON.parse(stdout),
-		stderr
-	};
+	try {
+		const { stdout, stderr } = await execFileAsync(process.execPath, [collector, '--dry-run'], {
+			env,
+			maxBuffer: 512 * 1024 * 1024
+		});
+		return {
+			snapshot: JSON.parse(stdout),
+			stderr
+		};
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 }
 
 const PRICING_URL =

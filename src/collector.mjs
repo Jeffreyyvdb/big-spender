@@ -542,7 +542,8 @@ const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name],
 /**
  * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
- *   paths: () => string[],
+ *   paths: string[],
+ *   envPaths: () => string[],
  *   read: (paths: string[], ctx: ReadContext, provider: string) => Promise<void>,
  *   priceKeys: (model: string) => string[]
  * }} Source
@@ -552,9 +553,11 @@ const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name],
  * Every agent the collector reads, keyed by the provider id its rows carry. Each id must also be
  * in PROVIDERS in src/schema.ts, or the server rejects the snapshot.
  *
- * - `paths`: where its data lives, the defaults first and then env-var overrides. Called after
- *   the env file is loaded.
- * - `read`: adds its usage with addRecord. `jsonlReader` reads append-only JSONL by byte offset.
+ * - `paths`: where its data lives by default.
+ * - `envPaths`: where env-var overrides point. Called after the env file is loaded.
+ * - `read`: adds the usage under the paths it is given with addRecord. scan calls it with
+ *   `paths`, and once every source has read those, with `envPaths`, so a file two sources reach
+ *   goes to the one it is a default of. `jsonlReader` reads append-only JSONL by byte offset.
  *   Any other reader (a SQLite file through openSqlite, a JSON file rewritten in place) reads its
  *   data whole on every run and skips what it counted before through `state.seen`, keyed with a
  *   provider prefix and valued with the record's timestamp so pruneState can drop it.
@@ -564,16 +567,14 @@ const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name],
  */
 const SOURCES = {
 	claude: {
-		paths: () => [
-			join(HOME, '.claude', 'projects'),
-			join(HOME, '.config', 'claude', 'projects'),
-			...fromEnv('CLAUDE_CONFIG_DIR', 'projects')
-		],
+		paths: [join(HOME, '.claude', 'projects'), join(HOME, '.config', 'claude', 'projects')],
+		envPaths: () => fromEnv('CLAUDE_CONFIG_DIR', 'projects'),
 		read: jsonlReader((ctx) => claudeLineHandler(ctx.state, ctx.resolvePrice, ctx.cutoffMs)),
 		priceKeys: litellmKeys('anthropic')
 	},
 	codex: {
-		paths: () => [join(HOME, '.codex', 'sessions'), ...fromEnv('CODEX_HOME', 'sessions')],
+		paths: [join(HOME, '.codex', 'sessions')],
+		envPaths: () => fromEnv('CODEX_HOME', 'sessions'),
 		read: jsonlReader((ctx, file, path) =>
 			codexLineHandler(
 				ctx.state,
@@ -590,9 +591,9 @@ const SOURCES = {
 async function scan(state, resolvePrice, cutoffMs) {
 	/** @type {ReadContext} */
 	const ctx = { state, resolvePrice, cutoffMs, seenPaths: new Set(), filesRead: 0, parsedBytes: 0 };
-	for (const [provider, source] of Object.entries(SOURCES)) {
-		await source.read(source.paths(), ctx, provider);
-	}
+	const sources = Object.entries(SOURCES);
+	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
+	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
 	for (const path of Object.keys(state.files)) {
 		if (!ctx.seenPaths.has(path)) delete state.files[path];
 	}
