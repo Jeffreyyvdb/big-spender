@@ -837,3 +837,34 @@ test('a push sends at most the 5000 newest limit records the server accepts', as
 		});
 	});
 });
+
+test('a refusal logged before the full reading of its window still starts the lockout', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLog(box, [
+			sharingRefusal(REFUSED_AT),
+			codexTokenCount(REFUSED_AT + HOUR / 3, 300, 100, OLD_FIVE_HOUR)
+		]);
+		await withUsageApi(async (_api, _seen, url) => {
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)]]);
+		});
+	});
+});
+
+test('a weekly the poll reports as null is not ruled out', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLog());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = {
+				rate_limit: {
+					primary_window: polledWindow(5, 18000, NEXT_HOUR + 3 * HOUR),
+					secondary_window: null
+				}
+			};
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
+		});
+	});
+});

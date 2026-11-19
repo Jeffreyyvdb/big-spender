@@ -366,8 +366,9 @@ function codexWindowMs(window) {
 // already seen full that was open at the time. With none seen full, it falls to elimination.
 // Usage within an instance only rises until its reset, so this run's poll reading below 100%
 // (taken after the refusal) proves the instance was not full at ts. That only settles it when
-// every limit the poll reports had an instance on file at ts and exactly one is not ruled out.
-// polled holds this run's Codex poll readings; it is empty when the poll was off or failed.
+// the poll read both Codex windows, every limit it reports had an instance on file at ts, and
+// exactly one is not ruled out. polled holds this run's Codex poll readings; it is empty when
+// the poll was off or failed. Runs after the whole scan, once every log reading is on file.
 function codexRefusal(state, ts, polled) {
 	const open = Object.values(state.limits ?? {}).filter((l) => {
 		const resetsAtMs = Date.parse(l.resetsAt);
@@ -381,8 +382,12 @@ function codexRefusal(state, ts, polled) {
 				r.window === l.window &&
 				Math.abs(r.resetsAtMs - Date.parse(l.resetsAt)) <= RESET_SLACK_MS
 		);
+	// A window the poll reports as null (not in use now) may have blocked and reset since, so
+	// elimination needs a reading of both Codex windows.
+	const polledNames = new Set(polled.map((r) => r.window));
 	const accountedFor =
-		polled.length > 0 && polled.every((r) => open.some((l) => l.window === r.window));
+		Object.values(CODEX_WINDOW_NAMES).every((n) => polledNames.has(n)) &&
+		[...polledNames].every((n) => open.some((l) => l.window === n));
 	const left = accountedFor ? open.filter((l) => !readBelowFull(l)) : [];
 	const blockers = full.length ? full : left.length === 1 ? left : [];
 	for (const l of blockers) {
@@ -832,7 +837,7 @@ function claudeLineHandler(state, resolvePrice, cutoffMs) {
 
 // Codex: token_count events carry per-request usage in info.last_token_usage.
 // input_tokens includes cached_input_tokens. output_tokens includes reasoning.
-function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSession, polled) {
+function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSession, refusals) {
 	return (line) => {
 		const o = parseJson(line);
 		if (!o) return;
@@ -847,7 +852,7 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 		}
 		if (o.type === 'event_msg' && p && isCodexRefusal(p)) {
 			const ts = Date.parse(o.timestamp);
-			if (Number.isFinite(ts)) codexRefusal(state, ts, polled);
+			if (Number.isFinite(ts)) refusals.push(ts);
 			return;
 		}
 		if (o.type !== 'event_msg' || p?.type !== 'token_count') return;
@@ -1969,7 +1974,7 @@ function antigravityPriceKeys(model) {
 }
 
 /**
- * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, polled: { window: string, resetsAtMs: number, percent: number }[], seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
+ * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, codexRefusals: number[], seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
  *   paths: string[],
  *   envPaths: () => string[],
@@ -2013,7 +2018,7 @@ const SOURCES = {
 				ctx.resolvePrice,
 				ctx.cutoffMs,
 				path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path,
-				ctx.polled
+				ctx.codexRefusals
 			)
 		),
 		priceKeys: litellmKeys('openai')
@@ -2095,13 +2100,15 @@ async function scan(state, resolvePrice, cutoffMs, sources, polled) {
 		state,
 		resolvePrice,
 		cutoffMs,
-		polled,
+		codexRefusals: [],
 		seenPaths: new Set(),
 		filesRead: 0,
 		parsedBytes: 0
 	};
 	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
 	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
+	// After every file: a full reading of the refused window can come later in the logs.
+	for (const ts of ctx.codexRefusals) codexRefusal(state, ts, polled);
 	for (const path of Object.keys(state.files)) {
 		if (!ctx.seenPaths.has(path)) delete state.files[path];
 	}
