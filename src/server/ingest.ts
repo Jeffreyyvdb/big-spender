@@ -1,20 +1,11 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { CURSOR_DEVICE_ID, usageSnapshotSchema } from '../schema.ts';
 import type { SnapshotStore } from '../store.ts';
+import { authorized } from './auth.ts';
 
 // Collectors POST one device's full snapshot here (optionally gzip-encoded).
 
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_DECODED_BYTES = 16 * 1024 * 1024;
-
-const digest = (s: string) => createHash('sha256').update(s).digest();
-
-function authorized(header: string | null, expected: string): boolean {
-	const match = /^Bearer (.+)$/.exec(header ?? '');
-	if (!match) return false;
-	// Hash both sides so the comparison is constant-time regardless of length.
-	return timingSafeEqual(digest(match[1]), digest(expected));
-}
 
 class TooLarge extends Error {}
 

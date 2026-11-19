@@ -1,7 +1,8 @@
 import type { DeviceConfig } from '../devices.ts';
 import { fileStore } from '../store.ts';
-import { summarizeLimits, type LimitsSummary } from '../limits.ts';
+import { limitHits, summarizeLimits, type LimitHitsReport, type LimitsSummary } from '../limits.ts';
 import { summarize, type UsageSummary } from '../summary.ts';
+import { authorized } from './auth.ts';
 import { createIngest } from './ingest.ts';
 
 export {
@@ -19,7 +20,11 @@ export {
 	type UsageSnapshot
 } from '../schema.ts';
 export {
+	limitHits,
 	summarizeLimits,
+	type LimitHit,
+	type LimitHitDevice,
+	type LimitHitsReport,
 	type LimitsSeries,
 	type LimitsSummary,
 	type LimitWindowSummary
@@ -44,6 +49,11 @@ export type BigSpenderOptions = {
 	dataDir: string;
 	/** Bearer token collectors must send. Missing or empty turns ingest off (503). */
 	ingestToken: string | undefined;
+	/**
+	 * Bearer token for `limitHits`. Missing or empty turns it off (503), and so does a token equal to
+	 * `ingestToken`: every collector holds that one.
+	 */
+	adminToken?: string | undefined;
 	devices: DeviceConfig;
 };
 
@@ -54,9 +64,17 @@ export type BigSpender = {
 	summary(now?: number): Promise<UsageSummary>;
 	/** Subscription limit hits over the last 90 UTC days, cached like `summary`. */
 	limits(now?: number): Promise<LimitsSummary>;
+	/** Admin only: exact time and devices of every recorded limit hit. Never cached. */
+	limitHits(request: Request): Promise<Response>;
 };
 
-export function createBigSpender({ dataDir, ingestToken, devices }: BigSpenderOptions): BigSpender {
+export function createBigSpender({
+	dataDir,
+	ingestToken,
+	adminToken,
+	devices
+}: BigSpenderOptions): BigSpender {
+	const admin = adminToken?.trim();
 	const store = fileStore(dataDir);
 	let cache: { value: UsageSummary; computedAt: number } | null = null;
 	let limitsCache: { value: LimitsSummary; computedAt: number } | null = null;
@@ -81,6 +99,21 @@ export function createBigSpender({ dataDir, ingestToken, devices }: BigSpenderOp
 			const value = summarizeLimits(await store.list(), now);
 			limitsCache = { value, computedAt: now };
 			return value;
+		},
+		async limitHits(request) {
+			if (!admin) return Response.json({ error: 'admin is not configured' }, { status: 503 });
+			if (admin === ingestToken?.trim()) {
+				return Response.json(
+					{ error: 'admin token must differ from the ingest token' },
+					{ status: 503 }
+				);
+			}
+			if (!authorized(request.headers.get('authorization'), admin)) {
+				return Response.json({ error: 'unauthorized' }, { status: 401 });
+			}
+			return Response.json(limitHits(await store.list(), Date.now()), {
+				headers: { 'cache-control': 'no-store' }
+			});
 		}
 	};
 }

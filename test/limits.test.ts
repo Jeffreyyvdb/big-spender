@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { mergeSnapshots } from '../src/history.ts';
-import { mergeLimits } from '../src/limits.ts';
+import { limitHits, mergeLimits } from '../src/limits.ts';
 import {
 	MAX_LIMIT_WINDOWS,
 	usageSnapshotSchema,
@@ -231,4 +231,76 @@ test('GET /api/usage/limits answers JSON', async () => {
 			await new Promise((resolve) => server.close(resolve));
 		}
 	});
+});
+
+test('limitHits lists the devices that hit one window instance, earliest first', () => {
+	const mac = withLimits('mac', [
+		win({
+			resetsAt: '2026-11-14T20:00:00.000Z',
+			hitAt: '2026-11-14T17:30:00.000Z',
+			peakPercent: 100
+		})
+	]);
+	const pi = withLimits('pi', [
+		win({
+			resetsAt: '2026-11-14T20:01:00.000Z',
+			hitAt: '2026-11-14T17:20:00.000Z',
+			peakPercent: 99
+		})
+	]);
+	const quiet = withLimits('nas', [
+		win({ resetsAt: '2026-11-14T20:00:30.000Z', hitAt: undefined, peakPercent: 70 })
+	]);
+	const report = limitHits([mac, pi, quiet], Date.parse('2026-11-15T00:00:00Z'));
+	assert.equal(report.generatedAt, '2026-11-15T00:00:00.000Z');
+	assert.deepEqual(report.hits, [
+		{
+			provider: 'claude',
+			window: 'five_hour',
+			resetsAt: '2026-11-14T20:00:00.000Z',
+			hitAt: '2026-11-14T17:20:00.000Z',
+			devices: [
+				{ deviceId: 'pi', hitAt: '2026-11-14T17:20:00.000Z', peakPercent: 99 },
+				{ deviceId: 'mac', hitAt: '2026-11-14T17:30:00.000Z', peakPercent: 100 }
+			]
+		}
+	]);
+});
+
+test('limitHits skips windows nobody hit and sorts hits by time', () => {
+	const snap = withLimits('mac', [
+		win({
+			window: 'seven_day',
+			resetsAt: '2026-11-20T00:00:00.000Z',
+			hitAt: '2026-11-14T10:00:00.000Z'
+		}),
+		win({ hitAt: undefined, peakPercent: 50, resetsAt: '2026-11-14T15:00:00.000Z' }),
+		win({ resetsAt: '2026-11-14T20:00:00.000Z', hitAt: '2026-11-14T09:00:00.000Z' })
+	]);
+	const { hits } = limitHits([snap], 0);
+	assert.deepEqual(
+		hits.map((h) => [h.window, h.hitAt]),
+		[
+			['five_hour', '2026-11-14T09:00:00.000Z'],
+			['seven_day', '2026-11-14T10:00:00.000Z']
+		]
+	);
+});
+
+test('limitHits keeps the earliest hit and highest peak when one device reports an instance twice', () => {
+	const snap = withLimits('mac', [
+		win({
+			resetsAt: '2026-11-14T20:00:10.000Z',
+			hitAt: '2026-11-14T17:40:00.000Z',
+			peakPercent: 90
+		}),
+		win({
+			resetsAt: '2026-11-14T20:00:50.000Z',
+			hitAt: '2026-11-14T17:30:00.000Z',
+			peakPercent: 100
+		})
+	]);
+	assert.deepEqual(limitHits([snap], 0).hits[0].devices, [
+		{ deviceId: 'mac', hitAt: '2026-11-14T17:30:00.000Z', peakPercent: 100 }
+	]);
 });

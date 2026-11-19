@@ -149,13 +149,14 @@ Cursor.
 
 `big-spender serve` is a small `node:http` server:
 
-| Route                    | What it does                                                                                                                                             |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /api/usage/ingest` | Collectors post a snapshot here (gzip or plain JSON, bearer token).                                                                                      |
-| `GET /api/usage`         | Merged totals for 7, 30 and 90 days and all time as JSON, with `cache-control: public, max-age=300, stale-while-revalidate=900`.                         |
-| `GET /api/usage/limits`  | Subscription limit hits per provider and window over the last 90 UTC days, per day, same cache header. See [Usage limits](#usage-limits).                |
-| `GET /`                  | A plain server-rendered page: totals per range, devices with colour swatches, top models, limit hits. No JavaScript, no external assets, light and dark. |
-| `GET /healthz`           | `ok`, for load balancers and Docker.                                                                                                                     |
+| Route                        | What it does                                                                                                                                                                                             |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /api/usage/ingest`     | Collectors post a snapshot here (gzip or plain JSON, bearer token).                                                                                                                                      |
+| `GET /api/usage`             | Merged totals for 7, 30 and 90 days and all time as JSON, with `cache-control: public, max-age=300, stale-while-revalidate=900`.                                                                         |
+| `GET /api/usage/limits`      | Subscription limit hits per provider and window over the last 90 UTC days, per day, same cache header. See [Usage limits](#usage-limits).                                                                |
+| `GET /api/usage/limits/hits` | Admin only: bearer `BIG_SPENDER_ADMIN_TOKEN`. Every recorded limit hit with its exact time and the device ids that saw it, earliest first. `cache-control: no-store`. See [Usage limits](#usage-limits). |
+| `GET /`                      | A plain server-rendered page: totals per range, devices with colour swatches, top models, limit hits. No JavaScript, no external assets, light and dark.                                                 |
+| `GET /healthz`               | `ok`, for load balancers and Docker.                                                                                                                                                                     |
 
 Configuration comes from flags or environment variables (flags win):
 
@@ -166,6 +167,7 @@ Configuration comes from flags or environment variables (flags win):
 | `--data`    | `BIG_SPENDER_DATA_DIR`     | `./data` (`/data` in the Docker image)               |
 | `--devices` | `BIG_SPENDER_DEVICES_FILE` | none: `{ "devices": {}, "unknownDevices": "by-id" }` |
 |             | `BIG_SPENDER_INGEST_TOKEN` | none: ingest is off and answers `503`                |
+|             | `BIG_SPENDER_ADMIN_TOKEN`  | none: the hits endpoint is off and answers `503`     |
 
 The data directory holds one `<device>.json` file per device, written atomically. Put it on a
 persistent volume. Each snapshot is merged into the device's stored history. A day the snapshot
@@ -232,7 +234,7 @@ export const GET = async ({ setHeaders }) => {
 Hono is the same shape (`app.post('/api/usage/ingest', (c) => bs.ingest(c.req.raw))`), and so is a
 Next.js route handler (`export const POST = (request: Request) => bs.ingest(request)`).
 
-`createBigSpender({ dataDir, ingestToken, devices })` returns:
+`createBigSpender({ dataDir, ingestToken, adminToken?, devices })` returns:
 
 - `ingest(request)`: handles a collector's `POST` and returns a `Response` (`503` when
   `ingestToken` is missing or empty, `401`, `413`, `415`, `422`, or `200` with
@@ -240,8 +242,9 @@ Next.js route handler (`export const POST = (request: Request) => bs.ingest(requ
 - `summary(now?)`: the merged totals for every range. The result is cached for five minutes and
   recomputed right after an ingest.
 - `limits(now?)`: the [usage limit](#usage-limits) summary, cached the same way.
+- `limitHits(request)`: the admin-only hit list as a `Response`. It answers `503` when `adminToken` is missing, empty or equal to `ingestToken`, `401` for a wrong bearer token, and `200` with `cache-control: no-store`. It is computed fresh on each call.
 
-The module also exports `summarize(snapshots, now, config)`, `summarizeLimits(snapshots, now)`, the
+The module also exports `summarize(snapshots, now, config)`, `summarizeLimits(snapshots, now)`, `limitHits(snapshots, now)`, the
 snapshot schema (`usageSnapshotSchema`, `limitWindowSchema`, `MAX_LIMIT_WINDOWS`), `resolveDevices`, `RANGES`, `PROVIDERS` and the types, for building your
 own storage or charts.
 
@@ -287,6 +290,13 @@ so far. It follows the same privacy rule as the rest: nothing
 finer than a UTC day, no device names, no report times. It is separate from `/api/usage`, whose
 shape did not change. `big-spender status` also lists the limits hit in the last 7 days, to the
 minute, because that output never leaves the machine.
+
+`GET /api/usage/limits/hits` is the admin view. It needs `Authorization: Bearer <BIG_SPENDER_ADMIN_TOKEN>`
+and returns every recorded hit with its exact `hitAt`, the window's reset and the devices that saw it,
+earliest first. The public endpoint stays day-level with no devices. The admin token must differ from
+the ingest token, because every collector machine holds that one. A hit found by polling carries the
+poll time, not the exact refusal time. Two devices that show the same `hitAt` to the millisecond read
+the same log line.
 
 ### Polling usage endpoints
 

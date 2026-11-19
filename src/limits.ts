@@ -88,6 +88,57 @@ export function mergeLimits(...lists: (LimitWindow[] | undefined)[]): LimitWindo
 	return sorted.slice(Math.max(0, sorted.length - MAX_LIMIT_WINDOWS));
 }
 
+export type LimitHitDevice = { deviceId: string; hitAt: string; peakPercent: number };
+
+export type LimitHit = {
+	provider: UsageProvider;
+	window: string;
+	/** Earliest reset of the window instance, as mergeLimits keeps it. */
+	resetsAt: string;
+	/** Earliest hitAt across devices. */
+	hitAt: string;
+	/** Devices that recorded a hit for this instance, earliest first (ties by deviceId). */
+	devices: LimitHitDevice[];
+};
+
+export type LimitHitsReport = { generatedAt: string; hits: LimitHit[] };
+
+/**
+ * Every recorded limit hit with its exact time and the devices that saw it, earliest device
+ * first. Not public: it names devices.
+ */
+export function limitHits(snapshots: UsageSnapshot[], now: number): LimitHitsReport {
+	const groups = groupWindows(
+		snapshots.flatMap((s) => (s.limits ?? []).map((window) => ({ window, deviceId: s.deviceId })))
+	);
+	const hits = groups.flatMap((group): LimitHit[] => {
+		const byDevice = new Map<string, LimitHitDevice>();
+		for (const { window: w, deviceId } of group) {
+			if (!w.hitAt || deviceId === undefined) continue;
+			const seen = byDevice.get(deviceId);
+			byDevice.set(deviceId, {
+				deviceId,
+				hitAt: seen && byTime(seen.hitAt, w.hitAt) <= 0 ? seen.hitAt : w.hitAt,
+				peakPercent: Math.max(seen?.peakPercent ?? 0, w.peakPercent)
+			});
+		}
+		const devices = [...byDevice.values()].sort(
+			(a, b) => byTime(a.hitAt, b.hitAt) || a.deviceId.localeCompare(b.deviceId)
+		);
+		if (!devices.length) return [];
+		const { provider, window, resetsAt } = group[0].window;
+		return [{ provider, window, resetsAt, hitAt: devices[0].hitAt, devices }];
+	});
+	hits.sort(
+		(a, b) =>
+			byTime(a.hitAt, b.hitAt) ||
+			a.provider.localeCompare(b.provider) ||
+			a.window.localeCompare(b.window) ||
+			byTime(a.resetsAt, b.resetsAt)
+	);
+	return { generatedAt: new Date(now).toISOString(), hits };
+}
+
 export type LimitsSeries = {
 	hits: number[];
 	lockedHours: number[];
