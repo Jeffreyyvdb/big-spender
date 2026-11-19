@@ -1,11 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBigSpender } from '../src/server/index.ts';
+import { usageSnapshotSchema } from '../src/schema.ts';
 import { createHttpServer } from '../src/serve.ts';
 import { run, seedPricing, withSandbox } from './helpers.ts';
 
@@ -122,5 +124,114 @@ test('a token that cannot go in an HTTP header fails at once and is never printe
 			server.closeAllConnections();
 			await new Promise((resolve) => server.close(resolve));
 		}
+	});
+});
+
+const HOUR_MS = 3_600_000;
+
+async function writeClaudeMessage(home: string, ts: number, outputs: number[]) {
+	const dir = join(home, '.claude', 'projects', 'p');
+	await mkdir(dir, { recursive: true });
+	const path = join(dir, 'session.jsonl');
+	const lines = outputs.map((output) => ({
+		type: 'assistant',
+		timestamp: new Date(ts).toISOString(),
+		requestId: 'req-1',
+		sessionId: 'session-1',
+		message: {
+			id: 'msg-1',
+			model: 'claude-test',
+			usage: { input_tokens: 1000, output_tokens: output }
+		}
+	}));
+	await writeFile(path, lines.map((l) => `${JSON.stringify(l)}\n`).join(''));
+	return path;
+}
+
+test('state from before the output fix re-reads the Claude logs once and adds the missed output', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const cache = join(env.XDG_CACHE_HOME, 'big-spender');
+		await seedPricing(cache);
+		const ts = Math.floor(Date.now() / HOUR_MS) * HOUR_MS - HOUR_MS;
+		const path = await writeClaudeMessage(home, ts, [10, 500]);
+		const st = await stat(path);
+		const dedupe = `c:${createHash('sha256').update('msg-1:req-1').digest('base64url').slice(0, 16)}`;
+		await writeFile(
+			join(cache, 'state.json'),
+			JSON.stringify({
+				version: 1,
+				files: { [path]: { size: st.size, mtimeMs: st.mtimeMs, offset: st.size } },
+				seen: { [dedupe]: ts },
+				buckets: {
+					[`${ts}|claude|claude-test|0`]: {
+						input: 1000,
+						cacheRead: 0,
+						cacheWrite5m: 0,
+						cacheWrite1h: 0,
+						output: 10,
+						sessions: ['s']
+					}
+				}
+			})
+		);
+
+		for (const pass of ['fixing run', 'next run']) {
+			const res = await run(COLLECTOR, ['--dry-run'], env);
+			assert.equal(res.code, 0, res.stderr);
+			const [row] = JSON.parse(res.stdout).hourly;
+			assert.deepEqual([row.inputTokens, row.outputTokens], [1000, 500], pass);
+		}
+	});
+});
+
+test('a device that used only Claude sends claude and codex session counts and no others', async () => {
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeMessage(home, Date.now() - HOUR_MS, [500]);
+		const res = await run(COLLECTOR, ['--dry-run'], { ...env, BIG_SPENDER_DEVICE_ID: 'laptop' });
+		assert.equal(res.code, 0, res.stderr);
+		const snapshot = usageSnapshotSchema.parse(JSON.parse(res.stdout));
+		assert.deepEqual(snapshot.sessionCounts?.['7d'], { claude: 1, codex: 0, all: 1 });
+	});
+});
+
+test('a file that a default path and an override both reach goes to the provider it is a default of', async () => {
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		// $CLAUDE_CONFIG_DIR/projects is HOME, so it also reaches HOME/.codex/sessions.
+		const projects = join(home, 'projects');
+		const dir = join(projects, '.codex', 'sessions', '2026', '11', '19');
+		await mkdir(dir, { recursive: true });
+		const ts = new Date(Date.now() - HOUR_MS).toISOString();
+		const lines = [
+			{ timestamp: ts, type: 'session_meta', payload: { id: 'codex-session' } },
+			{ timestamp: ts, type: 'turn_context', payload: { model: 'gpt-test' } },
+			{
+				timestamp: ts,
+				type: 'event_msg',
+				payload: {
+					type: 'token_count',
+					info: {
+						total_token_usage: { total_tokens: 250 },
+						last_token_usage: { input_tokens: 200, cached_input_tokens: 0, output_tokens: 50 }
+					}
+				}
+			}
+		];
+		await writeFile(
+			join(dir, 'rollout-2026-11-19T00-00-00-00000000-0000-0000-0000-000000000001.jsonl'),
+			lines.map((l) => `${JSON.stringify(l)}\n`).join('')
+		);
+		const res = await run(COLLECTOR, ['--dry-run'], {
+			...env,
+			HOME: projects,
+			CLAUDE_CONFIG_DIR: home
+		});
+		assert.equal(res.code, 0, res.stderr);
+		const rows = JSON.parse(res.stdout).hourly.map((r: { provider: string; model: string }) => [
+			r.provider,
+			r.model
+		]);
+		assert.deepEqual(rows, [['codex', 'gpt-test']]);
 	});
 });

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // big-spender collector.
 //
-// Reads this machine's Claude Code and Codex session logs, works out hourly
+// Reads the usage logs of the coding agents listed in SOURCES, works out hourly
 // token and cost aggregates (LiteLLM API prices), and POSTs one full snapshot
 // to your big-spender server's ingest endpoint. Only numbers, model names, timestamps and the
 // device id leave the machine: no paths, prompts, session ids or branches.
@@ -120,11 +120,12 @@ async function acquireLock() {
 /**
  * @typedef {{ input: number, cacheRead: number, cacheWrite: number, output: number, savings: number }} Cost
  * @typedef {{ input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number, sessions: string[], cost?: Cost }} Bucket
+ * A JSONL file's read position. Readers may keep their own fields on it (Codex: model, sessionId, lastTotal).
  * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean, cursorBackfills?: string[] }} State
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
  * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
  * account's full history. Hashed, because an ingest URL can carry a credential.
  */
@@ -151,7 +152,7 @@ async function loadState() {
 			// Older versions kept the first log line of a Claude message, whose output count can be
 			// partial. Re-read the Claude logs once so later lines add what was missed.
 			s.fixes.push(FIX_CLAUDE_OUTPUT);
-			s.rescanClaude = true;
+			s.rescan = ['claude'];
 		}
 		return s;
 	} catch {
@@ -233,7 +234,12 @@ async function loadPricing() {
 	}
 }
 
-/** Builds a model -> price entry resolver over the LiteLLM document. */
+const litellmKeys = (prefix) => (model) =>
+	[model, model.replace(/-\d{8}$/, ''), model.replace(/@.*$/, '')].flatMap((base) => [
+		base,
+		`${prefix}/${base}`
+	]);
+
 function makePriceResolver(models) {
 	const memo = new Map();
 	const warned = new Set();
@@ -241,18 +247,8 @@ function makePriceResolver(models) {
 	return (provider, model) => {
 		const memoKey = `${provider}|${model}`;
 		if (memo.has(memoKey)) return memo.get(memoKey);
-		const prefix = provider === 'claude' ? 'anthropic' : 'openai';
-		const bases = [model, model.replace(/-\d{8}$/, ''), model.replace(/@.*$/, '')];
-		let entry = null;
-		for (const base of bases) {
-			for (const key of [base, `${prefix}/${base}`]) {
-				if (usable(models[key])) {
-					entry = models[key];
-					break;
-				}
-			}
-			if (entry) break;
-		}
+		const key = SOURCES[provider]?.priceKeys(model).find((k) => usable(models[k]));
+		const entry = key ? models[key] : null;
 		if (!entry && !warned.has(memoKey)) {
 			warned.add(memoKey);
 			log(`warning: no LiteLLM price for ${provider} model "${model}"; counting its cost as 0`);
@@ -480,27 +476,18 @@ function codexLineHandler(state, fileState, resolvePrice, cutoffMs, fallbackSess
 	};
 }
 
-async function scan(state, resolvePrice, cutoffMs) {
-	const sources = [
-		{ provider: 'claude', dir: join(HOME, '.claude', 'projects') },
-		{ provider: 'claude', dir: join(HOME, '.config', 'claude', 'projects') },
-		{ provider: 'codex', dir: join(HOME, '.codex', 'sessions') }
-	];
-	if (process.env.CLAUDE_CONFIG_DIR) {
-		sources.push({ provider: 'claude', dir: join(process.env.CLAUDE_CONFIG_DIR, 'projects') });
-	}
-	if (process.env.CODEX_HOME) {
-		sources.push({ provider: 'codex', dir: join(process.env.CODEX_HOME, 'sessions') });
-	}
-
-	const seenPaths = new Set();
-	let parsedBytes = 0;
-	let filesRead = 0;
-	for (const { provider, dir } of sources) {
+/**
+ * A reader for JSONL logs that only grow: walks `*.jsonl` under each path and parses only the
+ * bytes added since the last run. `lines` builds the line handler for one file.
+ * @param {(ctx: ReadContext, file: FileState, path: string) => (line: string) => void} lines
+ */
+const jsonlReader = (lines) => async (paths, ctx, provider) => {
+	const { state } = ctx;
+	for (const dir of paths) {
 		if (!existsSync(dir)) continue;
 		for await (const path of walk(dir)) {
-			if (seenPaths.has(path)) continue;
-			seenPaths.add(path);
+			if (ctx.seenPaths.has(path)) continue;
+			ctx.seenPaths.add(path);
 			let st;
 			try {
 				st = await stat(path);
@@ -508,44 +495,112 @@ async function scan(state, resolvePrice, cutoffMs) {
 				continue;
 			}
 			// Untouched for longer than the window: nothing in it can count.
-			if (st.mtimeMs < cutoffMs) {
+			if (st.mtimeMs < ctx.cutoffMs) {
 				delete state.files[path];
 				continue;
 			}
-			const prev = provider === 'claude' && state.rescanClaude ? undefined : state.files[path];
+			const prev = state.rescan?.includes(provider) ? undefined : state.files[path];
 			if (prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) continue;
 			// File shrank (rewritten/truncated): start over. Dedupe keys stop double counting.
 			/** @type {FileState} */
 			const fs = prev && st.size >= prev.offset ? { ...prev } : { size: 0, mtimeMs: 0, offset: 0 };
-			const handler =
-				provider === 'claude'
-					? claudeLineHandler(state, resolvePrice, cutoffMs)
-					: codexLineHandler(
-							state,
-							fs,
-							resolvePrice,
-							cutoffMs,
-							path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path
-						);
 			const start = fs.offset;
 			try {
-				fs.offset = await readLinesFrom(path, start, handler);
+				fs.offset = await readLinesFrom(path, start, lines(ctx, fs, path));
 			} catch (err) {
 				log(`skipping unreadable file: ${err.message}`);
 				continue;
 			}
-			parsedBytes += fs.offset - start;
-			filesRead++;
+			ctx.parsedBytes += fs.offset - start;
+			ctx.filesRead++;
 			fs.size = st.size;
 			fs.mtimeMs = st.mtimeMs;
 			state.files[path] = fs;
 		}
 	}
-	for (const path of Object.keys(state.files)) {
-		if (!seenPaths.has(path)) delete state.files[path];
+};
+
+/** @type {Promise<any> | undefined} */
+let sqlite;
+
+/**
+ * Opens a SQLite file read-only, or returns null when this runtime has no `node:sqlite` (Node
+ * 22.13+, or 22.5+ with --experimental-sqlite). Imported on first use, never at the top level,
+ * so the other sources still run on Node 20; the warning is logged once per run.
+ */
+async function openSqlite(path) {
+	sqlite ??= import('node:sqlite').catch(() => {
+		log('warning: this runtime has no node:sqlite (Node 22.13 or newer); skipping SQLite sources');
+		return null;
+	});
+	const mod = await sqlite;
+	return mod && new mod.DatabaseSync(path, { readOnly: true });
+}
+
+const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name], ...rest)] : []);
+
+/**
+ * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
+ * @typedef {{
+ *   paths: string[],
+ *   envPaths: () => string[],
+ *   read: (paths: string[], ctx: ReadContext, provider: string) => Promise<void>,
+ *   priceKeys: (model: string) => string[]
+ * }} Source
+ */
+
+/**
+ * Every agent the collector reads, keyed by the provider id its rows carry. Each id must also be
+ * in PROVIDERS in src/schema.ts, or the server rejects the snapshot.
+ *
+ * - `paths`: where its data lives by default.
+ * - `envPaths`: where env-var overrides point. Called after the env file is loaded.
+ * - `read`: adds the usage under the paths it is given with addRecord. scan calls it with
+ *   `paths`, and once every source has read those, with `envPaths`, so a file two sources reach
+ *   goes to the one it is a default of. `jsonlReader` reads append-only JSONL by byte offset.
+ *   Any other reader (a SQLite file through openSqlite, a JSON file rewritten in place) reads its
+ *   data whole on every run and skips what it counted before through `state.seen`, keyed with a
+ *   provider prefix and valued with the record's timestamp so pruneState can drop it.
+ * - `priceKeys`: the LiteLLM keys to try for a model, in order.
+ *
+ * @type {Record<string, Source>}
+ */
+const SOURCES = {
+	claude: {
+		paths: [join(HOME, '.claude', 'projects'), join(HOME, '.config', 'claude', 'projects')],
+		envPaths: () => fromEnv('CLAUDE_CONFIG_DIR', 'projects'),
+		read: jsonlReader((ctx) => claudeLineHandler(ctx.state, ctx.resolvePrice, ctx.cutoffMs)),
+		priceKeys: litellmKeys('anthropic')
+	},
+	codex: {
+		paths: [join(HOME, '.codex', 'sessions')],
+		envPaths: () => fromEnv('CODEX_HOME', 'sessions'),
+		read: jsonlReader((ctx, file, path) =>
+			codexLineHandler(
+				ctx.state,
+				file,
+				ctx.resolvePrice,
+				ctx.cutoffMs,
+				path.match(/([0-9a-f-]{36})\.jsonl$/)?.[1] ?? path
+			)
+		),
+		priceKeys: litellmKeys('openai')
 	}
-	delete state.rescanClaude;
-	log(`read ${filesRead} changed file(s), ${(parsedBytes / 1e6).toFixed(1)} MB of new log data`);
+};
+
+async function scan(state, resolvePrice, cutoffMs) {
+	/** @type {ReadContext} */
+	const ctx = { state, resolvePrice, cutoffMs, seenPaths: new Set(), filesRead: 0, parsedBytes: 0 };
+	const sources = Object.entries(SOURCES);
+	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
+	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
+	for (const path of Object.keys(state.files)) {
+		if (!ctx.seenPaths.has(path)) delete state.files[path];
+	}
+	delete state.rescan;
+	log(
+		`read ${ctx.filesRead} changed file(s), ${(ctx.parsedBytes / 1e6).toFixed(1)} MB of new log data`
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -980,13 +1035,18 @@ async function main() {
 		await scan(state, resolvePrice, coverageStartMs);
 		await saveState(state);
 
+		const used = new Set(Object.keys(state.buckets).map((k) => k.split('|')[1]));
 		const device = buildSnapshot(
 			state.buckets,
 			(b, provider, model, tier) => costOf(resolvePrice(provider, model), tier, b),
 			{
 				deviceId: setting('DEVICE_ID'),
 				pricingSource: `litellm@${new Date(pricing.fetchedAt).toISOString().slice(0, 10)}`,
-				providers: ['claude', 'codex'],
+				// Older servers require the claude and codex counts and reject any other key, so another
+				// provider's count is sent only once this device has used it.
+				providers: Object.keys(SOURCES).filter(
+					(p) => p === 'claude' || p === 'codex' || used.has(p)
+				),
 				nowMs,
 				coverageStartMs
 			}
