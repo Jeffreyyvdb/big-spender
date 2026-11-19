@@ -40,6 +40,7 @@ async function collect({ env }: Sandbox, args: string[] = [], extra: Record<stri
 	const res = await run(COLLECTOR, ['--dry-run', ...args], {
 		...env,
 		BIG_SPENDER_DEVICE_ID: 'laptop',
+		BIG_SPENDER_EXPERIMENTAL: 'antigravity',
 		...extra
 	});
 	assert.equal(res.code, 0, res.stderr);
@@ -123,6 +124,30 @@ test('Antigravity usage is counted once per response, per day and model', { skip
 		assert.doesNotMatch(stderr, /empty\.db|conversation_summaries/);
 	});
 });
+
+test(
+	'Antigravity is read and sent only while BIG_SPENDER_EXPERIMENTAL names it',
+	{ skip },
+	async () => {
+		await withSandbox(async (box) => {
+			await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'), PRICES);
+			const { day0 } = buildAntigravityHome(box.home);
+			const off = { BIG_SPENDER_EXPERIMENTAL: 'cursor, pi' };
+
+			const never = await collect(box, [], off);
+			assert.deepEqual(never.snapshot.hourly, []);
+			assert.equal(never.snapshot.sessionCounts?.['7d'].antigravity, undefined);
+			assert.doesNotMatch(never.stderr, /Antigravity/);
+
+			const on = await collect(box, [], { BIG_SPENDER_EXPERIMENTAL: 'pi, antigravity' });
+			assert.deepEqual(tokens(byDayAndModel(on.snapshot, day0)), FIXTURE_TOKENS);
+
+			assert.deepEqual((await collect(box, [], off)).snapshot.hourly, []);
+			const again = await collect(box);
+			assert.deepEqual(again.snapshot.hourly, on.snapshot.hourly);
+		});
+	}
+);
 
 test(
 	'Antigravity cost uses the seeded prices, with reasoning billed as output',

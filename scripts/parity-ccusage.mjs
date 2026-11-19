@@ -94,7 +94,8 @@ try {
 		XDG_CACHE_HOME: cache,
 		BIG_SPENDER_ENV_FILE: join(tmp, 'no-env-file'),
 		BIG_SPENDER_DEVICE_ID: 'parity',
-		BIG_SPENDER_CURSOR_API_KEY: ''
+		BIG_SPENDER_CURSOR_API_KEY: '',
+		BIG_SPENDER_EXPERIMENTAL: provider
 	};
 	const run = async (file, args, env) =>
 		(await execFileAsync(file, args, { env, maxBuffer: 1024 * 1024 * 1024 })).stdout;

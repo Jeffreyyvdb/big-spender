@@ -18,7 +18,7 @@
 //   node collector.mjs --reset      # forget local state and rescan everything
 //
 // Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
-// BIG_SPENDER_CURSOR_API_KEY (see templates/env.example).
+// BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_EXPERIMENTAL (see templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
@@ -1678,7 +1678,8 @@ function antigravityPriceKeys(model) {
  *   paths: string[],
  *   envPaths: () => string[],
  *   read: (paths: string[], ctx: ReadContext, provider: string) => Promise<void>,
- *   priceKeys: (model: string) => string[]
+ *   priceKeys: (model: string) => string[],
+ *   experimental?: boolean
  * }} Source
  */
 
@@ -1695,6 +1696,7 @@ function antigravityPriceKeys(model) {
  *   data whole on every run and skips what it counted before through `state.seen`, keyed with a
  *   provider prefix and valued with the record's timestamp so pruneState can drop it.
  * - `priceKeys`: the LiteLLM keys to try for a model, in order.
+ * - `experimental`: read only when BIG_SPENDER_EXPERIMENTAL names it; see enabledSources.
  *
  * @type {Record<string, Source>}
  */
@@ -1771,6 +1773,7 @@ const SOURCES = {
 		}
 	},
 	antigravity: {
+		experimental: true,
 		paths: ANTIGRAVITY_ROOTS.map((root) => join(HOME, root, 'conversations')),
 		envPaths: antigravityEnvDirs,
 		read: readAntigravity,
@@ -1778,10 +1781,20 @@ const SOURCES = {
 	}
 };
 
-async function scan(state, resolvePrice, cutoffMs) {
+// An experimental source has not been checked against real usage yet, so it is read and sent only
+// when BIG_SPENDER_EXPERIMENTAL (comma-separated provider ids) names it. Turned off, its counted rows
+// stay in the state, so turning it on again replaces them instead of counting them twice.
+function enabledSources() {
+	const optIn = new Set(
+		(process.env.BIG_SPENDER_EXPERIMENTAL ?? '').split(',').map((id) => id.trim())
+	);
+	return Object.entries(SOURCES).filter(([id, source]) => !source.experimental || optIn.has(id));
+}
+
+/** @param {[string, Source][]} sources */
+async function scan(state, resolvePrice, cutoffMs, sources) {
 	/** @type {ReadContext} */
 	const ctx = { state, resolvePrice, cutoffMs, seenPaths: new Set(), filesRead: 0, parsedBytes: 0 };
-	const sources = Object.entries(SOURCES);
 	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
 	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
 	for (const path of Object.keys(state.files)) {
@@ -2263,21 +2276,24 @@ async function main() {
 		const resolvePrice = makePriceResolver(pricing.models);
 		const state = await loadState();
 		pruneState(state, coverageStartMs);
-		await scan(state, resolvePrice, coverageStartMs);
+		const sources = enabledSources();
+		const enabled = new Set(sources.map(([id]) => id));
+		await scan(state, resolvePrice, coverageStartMs, sources);
 		await saveState(state);
 
-		const used = new Set(Object.keys(state.buckets).map((k) => k.split('|')[1]));
+		const buckets = Object.fromEntries(
+			Object.entries(state.buckets).filter(([key]) => enabled.has(key.split('|')[1]))
+		);
+		const used = new Set(Object.keys(buckets).map((k) => k.split('|')[1]));
 		const device = buildSnapshot(
-			state.buckets,
+			buckets,
 			(b, provider, model, tier) => costOf(resolvePrice(provider, model), tier, b),
 			{
 				deviceId: setting('DEVICE_ID'),
 				pricingSource: `litellm@${new Date(pricing.fetchedAt).toISOString().slice(0, 10)}`,
 				// Older servers require the claude and codex counts and reject any other key, so another
 				// provider's count is sent only once this device has used it.
-				providers: Object.keys(SOURCES).filter(
-					(p) => p === 'claude' || p === 'codex' || used.has(p)
-				),
+				providers: [...enabled].filter((p) => p === 'claude' || p === 'codex' || used.has(p)),
 				nowMs,
 				coverageStartMs,
 				limits: state.limits
