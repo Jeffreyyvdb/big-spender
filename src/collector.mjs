@@ -35,7 +35,7 @@ import {
 	writeFile
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, extname, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, resolve, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
 const SCHEMA_VERSION = 1;
@@ -136,7 +136,9 @@ async function acquireLock() {
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * Antigravity keeps a merged response under each of its ids: see agStoreGroup.
  * Gemini keeps a file's counts under `gm:` and its path: [latest hour, counts]; see readGemini.
- * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]] | [number, Record<string, any>]} Seen
+ * For OpenCode it is [timestamp, tier, input, output, cache read, cache write, model, upstream,
+ * session].
+ * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]] | [number, Record<string, any>] | (number | string)[]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
  * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
@@ -1898,6 +1900,249 @@ function antigravityPriceKeys(model) {
 	return [...names].flatMap((name) => prefixes.map((prefix) => prefix + name));
 }
 
+// OpenCode keeps one record per assistant message and rewrites it while the message runs: in
+// SQLite (`message` in 1.x; `session_message` from 2.0, which copies the 1.x rows under the same
+// ids) and, before SQLite, in `storage/message/<session>/<message>.json`. A message id counts
+// from the first store that has it, 1.x rows first, so every `session_message` row left was
+// written by 2.x.
+
+/**
+ * @typedef {{ id: string, session: string, ts: number, model: string, upstream: string, tokens: any, separateReasoning: boolean }} OpenCodeMessage
+ */
+
+/** @type {Map<string, string>} */
+const opencodeUpstreams = new Map();
+
+const OPENCODE_ALIASES = new Map([
+	['gemini-3-pro-high', 'gemini-3-pro-preview'],
+	['k2p6', 'kimi-k2.6']
+]);
+const CLAUDE_DOTTED = /^(claude-(?:haiku|opus|sonnet)-)(\d+)\.(\d)/;
+
+function opencodePriceKeys(model) {
+	const resolved = OPENCODE_ALIASES.get(model) ?? model;
+	// LiteLLM spells claude-opus-4.5 and claude-opus-45 as claude-opus-4-5.
+	const normalized = CLAUDE_DOTTED.test(resolved)
+		? resolved.replace(CLAUDE_DOTTED, '$1$2-$3')
+		: resolved.replace(/^(claude-(?:haiku|opus|sonnet)-\d)(\d)/, '$1-$2');
+	const bases = [...new Set([resolved, normalized])];
+	const upstream = opencodeUpstreams.get(model);
+	// The upstream as ccusage spells it (zai_coding_plan), then its first word (zai).
+	const prefixes = upstream
+		? [...new Set([upstream.replaceAll('-', '_'), upstream.split('-')[0]])]
+		: [];
+	return [...bases, ...prefixes.flatMap((p) => bases.map((b) => `${p}/${b}`))];
+}
+
+/**
+ * Cache reads and writes are outside `input`. OpenCode 1.x counts reasoning inside `output` and
+ * records `total`. 2.x stores the visible output only (`output` minus reasoning) and no `total`,
+ * so its reasoning is added back.
+ */
+function opencodeTokens(t, separateReasoning) {
+	const input = num(t?.input);
+	const cacheRead = num(t?.cache?.read);
+	const cacheWrite = num(t?.cache?.write);
+	let output = num(t?.output);
+	const total = num(t?.total);
+	if (total) output = Math.max(output, total - input - cacheRead - cacheWrite);
+	else if (separateReasoning) output += num(t?.reasoning);
+	return { input, output, cacheRead, cacheWrite };
+}
+
+async function opencodeDbPath(dir) {
+	if (existsSync(join(dir, 'opencode.db'))) return join(dir, 'opencode.db');
+	const names = await readdir(dir).catch(() => []);
+	const channel = names.filter((n) => /^opencode-[A-Za-z0-9_-]+\.db$/.test(n)).sort()[0];
+	return channel ? join(dir, channel) : null;
+}
+
+function readOpenCodeDb(db, sinceMs, out) {
+	const columns = (table) =>
+		new Set(
+			db
+				.prepare('SELECT name FROM pragma_table_info(?)')
+				.all(table)
+				.map((r) => r.name)
+		);
+	const add = (r, separateReasoning) => {
+		if (out.has(r.id)) return;
+		out.set(r.id, { ...r, tokens: parseJson(r.tokens ?? 'null'), separateReasoning });
+	};
+	const v1 = columns('message');
+	if (v1.has('data')) {
+		const since = v1.has('time_created') ? 'time_created >= ? AND' : '';
+		const rows = db
+			.prepare(
+				`SELECT id, session_id AS session, json_extract(data, '$.time.created') AS ts,
+				 json_extract(data, '$.modelID') AS model, json_extract(data, '$.providerID') AS upstream,
+				 json_extract(data, '$.tokens') AS tokens
+				 FROM message WHERE ${since} json_valid(data)`
+			)
+			.all(...(since ? [sinceMs] : []));
+		for (const r of rows) add(r, false);
+	}
+	const v2 = columns('session_message');
+	if (!v2.has('data') || !v2.has('type')) return;
+	const sessions = columns('session_v2');
+	// A 2.x fork starts with copies of its parent's rows, made when the fork is, that keep the
+	// parent rows' time_created. OpenCode's own usage stats skip them the same way, and this needs
+	// no parent row, so it holds after the parent is deleted.
+	const forks =
+		v2.has('time_created') && sessions.has('fork_session_id') && sessions.has('time_created');
+	const since = v2.has('time_created') ? 'm.time_created >= ? AND' : '';
+	const rows = db
+		.prepare(
+			`SELECT m.id, m.session_id AS session,
+			 coalesce(json_extract(m.data, '$.time.created'), ${v2.has('time_created') ? 'm.time_created' : 'NULL'}) AS ts,
+			 coalesce(json_extract(m.data, '$.model.id'), json_extract(m.data, '$.model.modelID'),
+			   json_extract(m.data, '$.modelID')) AS model,
+			 coalesce(json_extract(m.data, '$.model.providerID'), json_extract(m.data, '$.providerID')) AS upstream,
+			 json_extract(m.data, '$.tokens') AS tokens
+			 FROM session_message m
+			 ${forks ? 'LEFT JOIN session_v2 s ON s.id = m.session_id' : ''}
+			 WHERE ${since} json_valid(m.data) AND (m.type = 'assistant'
+			   OR (m.type = 'compaction' AND json_extract(m.data, '$.status') = 'completed'))
+			 ${forks ? 'AND (s.fork_session_id IS NULL OR m.time_created >= s.time_created)' : ''}`
+		)
+		.all(...(since ? [sinceMs] : []));
+	for (const r of rows) add(r, true);
+}
+
+async function readOpenCodeFiles(dir, sinceMs, out) {
+	for await (const path of walk(join(dir, 'storage', 'message'), (name) =>
+		name.endsWith('.json')
+	)) {
+		if (out.has(basename(path, '.json'))) continue;
+		const st = await stat(path).catch(() => null);
+		if (!st || st.mtimeMs < sinceMs) continue;
+		const o = parseJson(await readFile(path, 'utf8').catch(() => ''));
+		const id = typeof o?.id === 'string' ? o.id : basename(path, '.json');
+		if (!o || out.has(id)) continue;
+		out.set(id, {
+			id,
+			session: o.sessionID,
+			ts: o.time?.created,
+			model: o.modelID,
+			upstream: o.providerID,
+			tokens: o.tokens,
+			separateReasoning: false
+		});
+	}
+}
+
+const MODEL_FILE = /\.(?:gguf|ggml|bin|safetensors|onnx|pt|pth|ckpt|llamafile)$/i;
+
+/**
+ * A local model can be named by its path or a URL, which can carry a login, a query or a folder
+ * name. Only a file name leaves the machine; an address without one becomes `local`.
+ */
+function opencodeModelName(id) {
+	const scheme = /^[A-Za-z][A-Za-z0-9+.-]*:/.exec(id)?.[0] ?? '';
+	const rest = id.slice(scheme.length);
+	// `scheme:/...`, `//host/...`, or anything with a query, fragment or login after a scheme.
+	const address = /^[/\\]{2}/.test(rest) || (scheme !== '' && /^[/\\]|[?#@]/.test(rest));
+	const path = address || /^[/~.\\]|\\/.test(rest) || (rest.includes('/') && MODEL_FILE.test(rest));
+	const clean = (name) => name.replace(/[^A-Za-z0-9._:/@-]/g, '-').slice(0, 100);
+	if (!path) return clean(id.replace(/[?#].*$/s, ''));
+	const local = address ? rest.replace(/[?#].*$/s, '').replace(/^[/\\]{2}[^/\\]*/, '') : rest;
+	const name = local
+		.split(/[/\\]/)
+		.pop()
+		.replace(/[?#].*$/s, '');
+	return clean(!name || name.includes('@') ? 'local' : name);
+}
+
+function countOpenCode(ctx, provider, m) {
+	if (typeof m.model !== 'string' || !m.model || typeof m.upstream !== 'string') return;
+	// Claude Code writes its own transcript of these turns, and the claude source reads it.
+	if (m.upstream === 'claude-agent') return;
+	const ts = Number(m.ts);
+	if (!Number.isFinite(ts) || ts < ctx.cutoffMs) return;
+
+	const model = opencodeModelName(m.model);
+	if (!opencodeUpstreams.has(model)) opencodeUpstreams.set(model, m.upstream);
+	const t = opencodeTokens(m.tokens, m.separateReasoning);
+	const session = shortHash(`opencode:${m.session ?? 'unknown'}`);
+	const counted =
+		t.input || t.output || t.cacheRead || t.cacheWrite
+			? [
+					ts,
+					tierFor(ctx.resolvePrice(provider, model), t.input + t.cacheRead + t.cacheWrite),
+					t.input,
+					t.output,
+					t.cacheRead,
+					t.cacheWrite,
+					model,
+					m.upstream,
+					session
+				]
+			: null;
+	const key = `o:${shortHash(m.id)}`;
+	const prev = Array.isArray(ctx.state.seen[key]) ? ctx.state.seen[key] : null;
+	if (!prev ? !counted : counted?.every((v, i) => v === prev[i])) return;
+
+	const add = ([at, tier, input, output, cacheRead, cacheWrite, modelAt = model], sign) => {
+		addRecord(ctx.state, {
+			ts: at,
+			provider,
+			model: modelAt,
+			tier,
+			session,
+			input: sign * input,
+			cacheRead: sign * cacheRead,
+			cacheWrite5m: sign * cacheWrite,
+			cacheWrite1h: 0,
+			output: sign * output
+		});
+	};
+	if (prev) add(prev, -1);
+	if (counted) {
+		add(counted, 1);
+		ctx.state.seen[key] = counted;
+	} else delete ctx.state.seen[key];
+	// The session leaves the bucket the message left, unless another of its messages is there.
+	const bucketOf = (c) => bucketKey(Math.floor(c[0] / HOUR_MS) * HOUR_MS, provider, c[6], c[1]);
+	const left = prev && bucketOf(prev);
+	if (left && (!counted || bucketOf(counted) !== left) && ctx.state.buckets[left]) {
+		const stays = Object.entries(ctx.state.seen).some(
+			([k, v]) => k.startsWith('o:') && Array.isArray(v) && v[8] === session && bucketOf(v) === left
+		);
+		if (!stays) {
+			const b = ctx.state.buckets[left];
+			b.sessions = b.sessions.filter((s) => s !== session);
+		}
+	}
+}
+
+async function readOpenCode(paths, ctx, provider) {
+	// Usage kept from messages no longer on disk still needs its upstream to be priced.
+	for (const [key, v] of Object.entries(ctx.state.seen)) {
+		if (key.startsWith('o:') && Array.isArray(v) && !opencodeUpstreams.has(v[6])) {
+			if (typeof v[7] === 'string') opencodeUpstreams.set(v[6], v[7]);
+		}
+	}
+	if (!paths.length) return;
+	/** @type {Map<string, OpenCodeMessage>} */
+	const messages = new Map();
+	for (const dir of new Set(paths.map((p) => resolve(p)))) {
+		const file = await opencodeDbPath(dir);
+		if (file) {
+			let db;
+			try {
+				db = await openSqlite(file);
+				if (db) readOpenCodeDb(db, ctx.cutoffMs, messages);
+			} catch (err) {
+				log(`skipping unreadable OpenCode database: ${err.message}`);
+			} finally {
+				db?.close();
+			}
+		}
+		await readOpenCodeFiles(dir, ctx.cutoffMs, messages);
+	}
+	for (const m of messages.values()) countOpenCode(ctx, provider, m);
+}
+
 /**
  * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
@@ -2018,6 +2263,19 @@ const SOURCES = {
 			...['gemini', 'vertex_ai', 'openrouter/google'].map((p) => `${p}/${model}`),
 			model
 		]
+	},
+	opencode: {
+		// Its default dir depends on XDG_DATA_HOME and, as in ccusage, OPENCODE_DATA_DIR
+		// (comma-separated) replaces it, so both come from envPaths. No other source reads these files.
+		paths: [],
+		envPaths: () => {
+			const dirs = process.env.OPENCODE_DATA_DIR?.split(',').map((p) => p.trim());
+			if (dirs) return dirs.filter(Boolean);
+			const xdg = process.env.XDG_DATA_HOME;
+			return [join(xdg && isAbsolute(xdg) ? xdg : join(HOME, '.local', 'share'), 'opencode')];
+		},
+		read: readOpenCode,
+		priceKeys: opencodePriceKeys
 	}
 };
 
