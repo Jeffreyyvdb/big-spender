@@ -261,7 +261,14 @@ their local logs, and it polls their usage endpoints (see [Polling](#polling-usa
   window counts as hit when its share reaches 100%. A refused turn is logged too, but names no
   window and no reset. It starts the lockout of each Codex window already seen full (by a poll or
   an earlier log line) that was open at that moment, so the lockout begins at the first logged
-  refusal instead of at the next poll. A refusal with no such window changes nothing.
+  refusal instead of at the next poll. When no open window was seen full, a lockout that began and
+  ended between two runs can still be placed by elimination. Usage in a window instance only rises
+  until it resets, so a poll that read an instance below 100% after the refusal proves it was not
+  the one blocking. This needs a successful poll in the same run, and every limit it reports must
+  have an instance on file that was open at the refusal. If exactly one open window is then left,
+  it gets the hit at the refusal. The gap that remains is a refusal whose window no reading ever
+  saw, one where several windows stay possible, and any refusal read while polling is off or
+  failing. These change nothing.
 
 A record is one window instance, identified by provider, window name and reset time rounded down
 to the minute. Reports whose resets are at most two minutes apart are the same window, because one
