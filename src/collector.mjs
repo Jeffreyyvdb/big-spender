@@ -140,9 +140,7 @@ async function acquireLock() {
  * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[], limitAliases?: Record<string, Record<string, string>> }} State
- * limitAliases maps a provider's raw window name to the name a poll gave it, applied when a
- * record is created (the server merges pushes by name, so a later rename would leave a duplicate).
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
  * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
  * account's full history. Hashed, because an ingest URL can carry a credential.
  */
@@ -270,7 +268,7 @@ const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
  * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
  */
 function addLimit(state, w) {
-	const window = state.limitAliases?.[w.provider]?.[w.window] ?? w.window;
+	const { window } = w;
 	let resetsAtMs = Math.floor(w.resetsAtMs / MINUTE_MS) * MINUTE_MS;
 	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(window)) return;
 	if (w.hitMs !== undefined && !plausibleTime(w.hitMs)) return;
@@ -298,6 +296,11 @@ function addLimit(state, w) {
 	return { window, resetsAtMs };
 }
 
+// Claude Code logs Fable's weekly as seven_day_overage_included and labels it "Fable limit". The
+// usage endpoint calls the same limit seven_day_fable, and the server merges pushes by name, so the
+// name has to be right when the record is created or the limit would show as two rows.
+const CLAUDE_LOG_WINDOWS = { seven_day_overage_included: 'seven_day_fable' };
+
 // Claude Code logs a refused request as a synthetic assistant line carrying quotaLimits.
 // One blocked window repeats on every retry; the key makes the repeats one record.
 function claudeLimit(state, o) {
@@ -305,12 +308,13 @@ function claudeLimit(state, o) {
 	if (q?.status !== 'rejected' || typeof q.rateLimitType !== 'string') return;
 	const ts = Date.parse(o.timestamp);
 	if (!Number.isFinite(ts) || !(q.resetsAt > 0)) return;
+	const raw = q.rateLimitType
+		.toLowerCase()
+		.replace(/[^a-z0-9_]/g, '_')
+		.slice(0, 40);
 	addLimit(state, {
 		provider: 'claude',
-		window: q.rateLimitType
-			.toLowerCase()
-			.replace(/[^a-z0-9_]/g, '_')
-			.slice(0, 40),
+		window: CLAUDE_LOG_WINDOWS[raw] ?? raw,
 		resetsAtMs: q.resetsAt * 1000,
 		percent: 100,
 		hitMs: ts
@@ -416,9 +420,9 @@ const claudeResetMs = (resetsAt) => (typeof resetsAt === 'string' ? Date.parse(r
 
 function claudeWindows(body) {
 	const out = [];
-	const add = (window, percent, resetsAtMs, modelScoped = false) => {
+	const add = (window, percent, resetsAtMs) => {
 		if (Number.isFinite(percent) && Number.isFinite(resetsAtMs)) {
-			out.push({ window: window.slice(0, 40), percent, resetsAtMs, modelScoped });
+			out.push({ window: window.slice(0, 40), percent, resetsAtMs });
 		}
 	};
 	for (const [key, w] of Object.entries(body)) {
@@ -429,7 +433,7 @@ function claudeWindows(body) {
 	for (const l of Array.isArray(body.limits) ? body.limits : []) {
 		const model = l?.scope?.model?.display_name;
 		if (l?.kind === 'weekly_scoped' && typeof model === 'string' && slug(model)) {
-			add(`seven_day_${slug(model)}`, l.percent, claudeResetMs(l.resets_at), true);
+			add(`seven_day_${slug(model)}`, l.percent, claudeResetMs(l.resets_at));
 		}
 	}
 	return out;
@@ -477,8 +481,6 @@ function jwtExpiresMs(token) {
 }
 
 // headers() returns the request headers, or a string saying why this provider is skipped.
-// modelWeeklyLog is the name the provider's log gives its model-specific weekly refusal; the
-// poll says which model that is.
 const LIMIT_POLLERS = {
 	claude: {
 		credentialsPath: () =>
@@ -499,8 +501,7 @@ const LIMIT_POLLERS = {
 				'user-agent': 'big-spender'
 			};
 		},
-		windows: claudeWindows,
-		modelWeeklyLog: 'seven_day_overage_included'
+		windows: claudeWindows
 	},
 	codex: {
 		credentialsPath: () => join(process.env.CODEX_HOME || join(HOME, '.codex'), 'auth.json'),
@@ -565,18 +566,8 @@ async function pollLimit(state, provider, poller, nowMs, polled) {
 		throw new Error('the answer was not a JSON object');
 	}
 
-	const windows = poller.windows(body, nowMs);
-	if (poller.modelWeeklyLog) {
-		// With zero or several model weeklies the refused one is unknown, so its raw name stays.
-		const scoped = windows.filter((w) => w.modelScoped);
-		const aliases = { ...state.limitAliases };
-		if (scoped.length === 1) aliases[provider] = { [poller.modelWeeklyLog]: scoped[0].window };
-		else delete aliases[provider];
-		state.limitAliases = aliases;
-	}
-
 	const seen = [];
-	for (const w of windows) {
+	for (const w of poller.windows(body, nowMs)) {
 		const stored = addLimit(state, {
 			provider,
 			window: w.window,
