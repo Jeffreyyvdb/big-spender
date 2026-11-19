@@ -9,6 +9,8 @@ export type Totals = {
 	output: number;
 	/** Null where ccusage gives no per-model cost. */
 	cost: number | null;
+	/** Collector rows summed in; each adds rounding to the cost. */
+	rows: number;
 };
 
 export type Rows = Map<string, Totals>;
@@ -53,10 +55,9 @@ export type DayResult = {
 };
 
 const TOKEN_FIELDS = ['input', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'output'] as const;
-const HOURS_PER_DAY = 24;
 const COST_PARTS = 4;
 const COLLECTOR_ROUNDS_TO_USD = 1e-6;
-const ROUNDING_USD = 2 * HOURS_PER_DAY * COST_PARTS * (COLLECTOR_ROUNDS_TO_USD / 2);
+const roundingUsd = (rows: number) => rows * COST_PARTS * (COLLECTOR_ROUNDS_TO_USD / 2);
 
 const zero = (): Totals => ({
 	input: 0,
@@ -64,7 +65,8 @@ const zero = (): Totals => ({
 	cacheWrite: 0,
 	cacheWrite1h: 0,
 	output: 0,
-	cost: 0
+	cost: 0,
+	rows: 0
 });
 const missing = (): Totals => ({ ...zero(), cacheWrite1h: null, cost: null });
 
@@ -77,6 +79,7 @@ export function collectorRows(snapshot: UsageSnapshot, provider: string): Rows {
 		if (r.provider !== provider) continue;
 		const key = `${r.hour.slice(0, 10)}|${r.model}`;
 		const t = out.get(key) ?? zero();
+		t.rows++;
 		t.input += r.inputTokens;
 		t.cacheRead += r.cacheReadTokens;
 		t.cacheWrite += r.cacheWrite5mTokens + r.cacheWrite1hTokens;
@@ -117,8 +120,10 @@ export function ccusageRows(report: CcusageReport, renameModel: (m: string) => s
 	return { rows, dayCost };
 }
 
-const costGap = (a: number, b: number) =>
-	Math.abs(a - b) <= ROUNDING_USD ? 0 : Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b));
+const costGap = (a: number, b: number, rows: number) =>
+	Math.abs(a - b) <= roundingUsd(rows) ? 0 : Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b));
+
+const counted = (t: Totals) => tokenSum(t) > 0 || (t.cost ?? 0) > 0;
 
 export function compare(
 	ours: Rows,
@@ -126,11 +131,11 @@ export function compare(
 	{ fromDay, tolerance }: { fromDay: string; tolerance: number }
 ): { rows: RowResult[]; days: DayResult[] } {
 	const keys = new Set<string>();
-	for (const [key, t] of ours) if (tokenSum(t) > 0) keys.add(key);
-	for (const [key, t] of theirs.rows) if (tokenSum(t) > 0 && key >= fromDay) keys.add(key);
+	for (const [key, t] of ours) if (counted(t)) keys.add(key);
+	for (const [key, t] of theirs.rows) if (counted(t) && key >= fromDay) keys.add(key);
 
 	const rows: RowResult[] = [];
-	const ourDayCost = new Map<string, number>();
+	const ourDay = new Map<string, { cost: number; rows: number }>();
 	const daysWithoutModelCost = new Set<string>();
 	for (const key of [...keys].sort()) {
 		const [day, model] = key.split('|');
@@ -140,7 +145,7 @@ export function compare(
 			(f) => `${f} ${a[f]} vs ${b[f]}`
 		);
 		if (b.cost === null) daysWithoutModelCost.add(day);
-		const costDiff = b.cost === null ? null : costGap(a.cost!, b.cost);
+		const costDiff = b.cost === null ? null : costGap(a.cost!, b.cost, a.rows);
 		rows.push({
 			day,
 			model,
@@ -151,14 +156,17 @@ export function compare(
 			tokenDiffs,
 			ok: tokenDiffs.length === 0 && (costDiff === null || costDiff <= tolerance)
 		});
-		ourDayCost.set(day, (ourDayCost.get(day) ?? 0) + a.cost!);
+		const d = ourDay.get(day) ?? { cost: 0, rows: 0 };
+		d.cost += a.cost!;
+		d.rows += a.rows;
+		ourDay.set(day, d);
 	}
 
 	const days = [...daysWithoutModelCost].sort().map((day) => {
-		const a = ourDayCost.get(day) ?? 0;
+		const a = ourDay.get(day) ?? { cost: 0, rows: 0 };
 		const b = theirs.dayCost.get(day) ?? 0;
-		const costDiff = costGap(a, b);
-		return { day, ours: a, theirs: b, costDiff, ok: costDiff <= tolerance };
+		const costDiff = costGap(a.cost, b, a.rows);
+		return { day, ours: a.cost, theirs: b, costDiff, ok: costDiff <= tolerance };
 	});
 	return { rows, days };
 }

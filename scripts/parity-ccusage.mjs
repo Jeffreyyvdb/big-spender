@@ -19,9 +19,9 @@ import { ccusageRows, collectorRows, compare } from './lib/ccusage-parity.ts';
 
 const execFileAsync = promisify(execFile);
 
-/** @type {Record<string, { agent: string, renameModel?: (ccusageModel: string) => string }>} */
+/** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string }>} */
 const AGENTS = {
-	claude: { agent: 'claude' },
+	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
 	codex: { agent: 'codex' }
 };
 
@@ -50,6 +50,10 @@ if (!mapping) {
 	process.exit(2);
 }
 const tolerance = Number(values.tolerance);
+if (!(tolerance >= 0)) {
+	console.error(`--tolerance must be a fraction such as 0.001, not "${values.tolerance}"`);
+	process.exit(2);
+}
 
 const { stdout: version } = await execFileAsync(CCUSAGE_BIN, ['--version']);
 if (!version.includes(CCUSAGE_VERSION)) {
@@ -88,7 +92,16 @@ try {
 			run(process.execPath, [values.collector, '--dry-run'], collectorEnv),
 			run(
 				CCUSAGE_BIN,
-				[mapping.agent, 'daily', '--json', '--breakdown', '--timezone', 'UTC', '--offline'],
+				[
+					mapping.agent,
+					'daily',
+					'--json',
+					'--breakdown',
+					'--timezone',
+					'UTC',
+					'--offline',
+					...(mapping.args ?? [])
+				],
 				base
 			)
 		]);

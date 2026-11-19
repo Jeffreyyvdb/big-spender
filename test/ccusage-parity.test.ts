@@ -117,8 +117,20 @@ test('cost outside the tolerance fails, inside it passes, and rounding never fai
 	report.daily![1].modelBreakdowns![0].cost = 6.06;
 	assert.equal(run(report, 0.001).rows.find((r) => r.model === 'opus' && !r.ok)?.day, '2026-11-14');
 	assert.ok(run(report, 0.01).rows.every((r) => r.ok));
-	report.daily![1].modelBreakdowns![0].cost = 6.00005;
+	report.daily![1].modelBreakdowns![0].cost = 6.000002;
 	assert.ok(run(report, 0).rows.every((r) => r.ok));
+	report.daily![0].modelBreakdowns![0].cost = 1.00006;
+	assert.equal(run(report, 0).rows.find((r) => !r.ok)?.day, '2026-11-13');
+});
+
+test('a cost on a row without tokens is compared', () => {
+	const report = matching();
+	report.daily![0].modelBreakdowns!.push({ ...breakdown('sonnet', 0, 0), cost: 2 });
+	const bad = run(report).rows.filter((r) => !r.ok);
+	assert.deepEqual(
+		bad.map((r) => [r.day, r.model, r.ours, r.theirs]),
+		[['2026-11-13', 'sonnet', 0, 2]]
+	);
 });
 
 test('a model only one tool reports is a mismatch', () => {
