@@ -68,7 +68,7 @@ const run = (report: CcusageReport, tolerance = 0.001) =>
 	});
 
 test('identical tokens and cost match on every day and model', () => {
-	const { rows, days } = run(matching());
+	const { rows, days, dayOutputs } = run(matching());
 	assert.deepEqual(
 		rows.map((r) => [r.day, r.model, r.ok]),
 		[
@@ -78,6 +78,7 @@ test('identical tokens and cost match on every day and model', () => {
 		]
 	);
 	assert.deepEqual(days, []);
+	assert.deepEqual(dayOutputs, []);
 });
 
 test('a changed token total is reported with both values', () => {
@@ -178,6 +179,105 @@ test('without per-model cost, tokens are compared per model and cost per day', (
 			['2026-11-14', false]
 		]
 	);
+});
+
+function withoutReasoning(): CcusageReport {
+	const report = matching();
+	for (const day of report.daily!) {
+		let total = 0;
+		day.inputTokens = day.cacheReadTokens = day.cacheCreationTokens = 0;
+		for (const m of day.modelBreakdowns!) {
+			const reasoning = m.outputTokens! / 3;
+			m.outputTokens! -= reasoning;
+			day.inputTokens += m.inputTokens!;
+			day.cacheReadTokens += m.cacheReadTokens!;
+			day.cacheCreationTokens += m.cacheCreationTokens!;
+			total += m.inputTokens! + m.cacheReadTokens! + m.cacheCreationTokens! + m.outputTokens!;
+			total += reasoning;
+		}
+		day.totalTokens = total;
+	}
+	return report;
+}
+
+const runWithoutReasoning = (report: CcusageReport) =>
+	compare(
+		collectorRows(ours, 'claude'),
+		ccusageRows(report, undefined, { outputExcludesReasoning: true }),
+		{ fromDay: '2026-08-17', tolerance: 0.001 }
+	);
+
+test('output without reasoning is compared per day against the day total', () => {
+	const { rows, dayOutputs } = runWithoutReasoning(withoutReasoning());
+	assert.ok(rows.every((r) => r.ok));
+	assert.deepEqual(dayOutputs, [
+		{ day: '2026-11-13', ours: 21, theirs: 21, ok: true },
+		{ day: '2026-11-14', ours: 480, theirs: 480, ok: true }
+	]);
+	assert.ok(
+		run(withoutReasoning()).rows.every((r) => !r.ok),
+		'the same report fails per row'
+	);
+});
+
+test('a day whose output with reasoning differs is reported', () => {
+	const report = withoutReasoning();
+	report.daily![1].totalTokens! += 1;
+	const { rows, dayOutputs } = runWithoutReasoning(report);
+	assert.ok(rows.every((r) => r.ok));
+	assert.deepEqual(
+		dayOutputs.filter((d) => !d.ok),
+		[{ day: '2026-11-14', ours: 480, theirs: 481, ok: false }]
+	);
+
+	delete report.daily![0].totalTokens;
+	assert.deepEqual(
+		runWithoutReasoning(report).dayOutputs.map((d) => d.ok),
+		[false, false]
+	);
+});
+
+test('a day that only ccusage has, with nothing but reasoning, is reported', () => {
+	const report = withoutReasoning();
+	report.daily!.unshift({
+		date: '2026-11-12',
+		inputTokens: 0,
+		cacheReadTokens: 0,
+		cacheCreationTokens: 0,
+		totalTokens: 7,
+		modelBreakdowns: [{ ...breakdown('opus', 0, 0), outputTokens: 0 }]
+	});
+	const { dayOutputs } = runWithoutReasoning(report);
+	assert.deepEqual(
+		dayOutputs.filter((d) => !d.ok),
+		[{ day: '2026-11-12', ours: 0, theirs: 7, ok: false }]
+	);
+});
+
+test('the other token counts stay exact per row when output is compared per day', () => {
+	const report = withoutReasoning();
+	report.daily![1].modelBreakdowns![0].inputTokens! += 1;
+	report.daily![1].inputTokens! += 1;
+	report.daily![1].totalTokens! += 1;
+	const { rows, dayOutputs } = runWithoutReasoning(report);
+	assert.deepEqual(
+		rows.filter((r) => !r.ok).map((r) => [r.day, r.model, r.tokenDiffs]),
+		[['2026-11-14', 'opus', ['input 150 vs 151']]]
+	);
+	assert.ok(dayOutputs.every((d) => d.ok));
+});
+
+test('output moved to another model on the same day is reported for the row that lost it', () => {
+	const report = withoutReasoning();
+	const [opus, haiku] = report.daily![1].modelBreakdowns!;
+	opus.outputTokens! -= 15;
+	haiku.outputTokens! += 15;
+	const { rows, dayOutputs } = runWithoutReasoning(report);
+	assert.deepEqual(
+		rows.filter((r) => !r.ok).map((r) => [r.day, r.model, r.tokenDiffs]),
+		[['2026-11-14', 'haiku', ['output 30 below 35']]]
+	);
+	assert.ok(dayOutputs.every((d) => d.ok));
 });
 
 test('nothing reported on either side leaves nothing to compare', () => {

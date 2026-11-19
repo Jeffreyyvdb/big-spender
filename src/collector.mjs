@@ -18,14 +18,24 @@
 //   node collector.mjs --reset      # forget local state and rescan everything
 //
 // Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
-// BIG_SPENDER_CURSOR_API_KEY (see templates/env.example).
+// BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_EXPERIMENTAL (see templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
-import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import {
+	mkdir,
+	open,
+	readdir,
+	readFile,
+	realpath,
+	rename,
+	rm,
+	stat,
+	writeFile
+} from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
 const SCHEMA_VERSION = 1;
@@ -124,7 +134,8 @@ async function acquireLock() {
  * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number, forkCalls?: string[], models?: Record<string, { input: number, cacheRead: number, cacheWrite: number, output: number, requests?: number }>, callsSinceShutdown?: boolean }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
- * @typedef {number | [number, number]} Seen
+ * Antigravity keeps a merged response under each of its ids: see agStoreGroup.
+ * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
  * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
@@ -183,14 +194,16 @@ const shortHash = (s) => createHash('sha256').update(s).digest('base64url').slic
 // Bucket key: hour start (ms) | provider | model | pricing tier (prompt-size threshold, 0 = base).
 const bucketKey = (hourMs, provider, model, tier) => `${hourMs}|${provider}|${model}|${tier}`;
 
+const BUCKET_COUNTS = ['input', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'output'];
+const recordBucketKey = (r) =>
+	bucketKey(Math.floor(r.ts / HOUR_MS) * HOUR_MS, r.provider, r.model, r.tier);
+
 /**
  * @param {State} state
  * @param {{ ts: number, provider: string, model: string, tier: number, session: string, input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number }} r
  */
 function addRecord(state, r) {
-	const hourMs = Math.floor(r.ts / HOUR_MS) * HOUR_MS;
-	const key = bucketKey(hourMs, r.provider, r.model, r.tier);
-	const b = (state.buckets[key] ??= {
+	const b = (state.buckets[recordBucketKey(r)] ??= {
 		input: 0,
 		cacheRead: 0,
 		cacheWrite5m: 0,
@@ -198,12 +211,22 @@ function addRecord(state, r) {
 		output: 0,
 		sessions: []
 	});
-	b.input += r.input;
-	b.cacheRead += r.cacheRead;
-	b.cacheWrite5m += r.cacheWrite5m;
-	b.cacheWrite1h += r.cacheWrite1h;
-	b.output += r.output;
+	for (const k of BUCKET_COUNTS) b[k] += r[k];
 	if (!b.sessions.includes(r.session)) b.sessions.push(r.session);
+}
+
+/**
+ * Takes back what addRecord added for `r`. Its session stays listed, since a bucket does not
+ * know which of its records named it, unless nothing is left of the bucket. An emptied bucket
+ * stays as a zero row until it ages out: the server keeps a day and model that a snapshot stops
+ * reporting, so only a zero row takes back what an earlier snapshot sent.
+ * @type {typeof addRecord}
+ */
+function removeRecord(state, r) {
+	const b = state.buckets[recordBucketKey(r)];
+	if (!b) return;
+	for (const k of BUCKET_COUNTS) b[k] = Math.max(0, b[k] - r[k]);
+	if (BUCKET_COUNTS.every((k) => b[k] === 0)) b.sessions = [];
 }
 
 /** @param {State} state @param {number} cutoffMs */
@@ -392,8 +415,10 @@ function costOf(entry, tier, t) {
 	if (!entry) return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, savings: 0 };
 	const inP = price(entry, 'input_cost_per_token', tier) ?? 0;
 	const outP = price(entry, 'output_cost_per_token', tier) ?? 0;
-	const readP = price(entry, 'cache_read_input_token_cost', tier) ?? inP * 0.1;
-	const write5mP = price(entry, 'cache_creation_input_token_cost', tier) ?? inP * 1.25;
+	// A missing cache rate derives from the base input rate, also above a tier, as in ccusage.
+	const baseInP = price(entry, 'input_cost_per_token', 0) ?? 0;
+	const readP = price(entry, 'cache_read_input_token_cost', tier) ?? baseInP * 0.1;
+	const write5mP = price(entry, 'cache_creation_input_token_cost', tier) ?? baseInP * 1.25;
 	const write1hP = tier
 		? (entry[`cache_creation_input_token_cost_above_1hr_above_${tier / 1000}k_tokens`] ??
 			entry.cache_creation_input_token_cost_above_1hr ??
@@ -993,13 +1018,685 @@ async function* sessionEvents(dir) {
 
 const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name], ...rest)] : []);
 
+// One SQLite database per conversation; its blobs are protobuf. `gen_metadata` rows (one per model
+// call) and `steps` rows each carry a usage message plus the usage of earlier attempts. The same
+// response is written to several rows and to several databases, sometimes with partial counts, so
+// usage messages that share a response, provider or message id merge and keep the largest counts.
+// This follows ccusage's antigravity adapter (v20.0.51) read for read: the order of reads decides
+// which copy's timestamp and model win, and the numbers only match when it is the same.
+
+const ANTIGRAVITY_ROOTS = [
+	'.gemini/antigravity',
+	'.gemini/antigravity-cli',
+	'.gemini/antigravity-ide',
+	'.gemini/antigravity-backup',
+	'.gemini/antigravity-acp',
+	'.config/antigravity'
+];
+const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-internal-model';
+
+const isDir = (path) => {
+	try {
+		return statSync(path).isDirectory();
+	} catch {
+		return false;
+	}
+};
+
+const antigravityEnvDirs = () =>
+	(process.env.ANTIGRAVITY_DATA_DIR ?? '')
+		.split(',')
+		.map((root) => root.trim())
+		.filter(Boolean)
+		.map((root) => (isDir(join(root, 'conversations')) ? join(root, 'conversations') : root));
+
+function byPathComponents(a, b) {
+	const x = a.split(sep);
+	const y = b.split(sep);
+	for (let i = 0; i < Math.min(x.length, y.length); i++) {
+		if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+	}
+	return x.length - y.length;
+}
+
+/** @returns {Promise<{ path: string, real: string }[]>} */
+async function antigravityDatabases(dirs) {
+	const byRealPath = new Map();
+	for (const dir of dirs) {
+		for await (const path of walk(dir, (name) => name.endsWith('.db'))) {
+			const real = await realpath(path).catch(() => path);
+			if (!byRealPath.has(real)) byRealPath.set(real, { path, real });
+		}
+	}
+	return [...byRealPath.values()].sort((a, b) => byPathComponents(a.path, b.path));
+}
+
+function pbVarint(buf, pos) {
+	let value = 0;
+	for (let i = 0; i < 10; i++) {
+		if (pos.i >= buf.length) throw new Error('truncated protobuf varint');
+		const byte = buf[pos.i++];
+		const payload = byte & 0x7f;
+		if (i === 9 && payload > 1) break;
+		value += payload * 2 ** (7 * i);
+		if (!(byte & 0x80)) return value;
+	}
+	throw new Error('protobuf varint overflow');
+}
+
+/** @returns {{ number: number, varint?: number, bytes?: Uint8Array }[]} */
+function pbDecode(buf) {
+	const fields = [];
+	const pos = { i: 0 };
+	while (pos.i < buf.length) {
+		const tag = pbVarint(buf, pos);
+		const number = Math.floor(tag / 8);
+		if (number === 0) throw new Error('protobuf field number is zero');
+		const wire = tag % 8;
+		if (wire === 0) fields.push({ number, varint: pbVarint(buf, pos) });
+		else if (wire === 1 || wire === 5 || wire === 2) {
+			const length = wire === 1 ? 8 : wire === 5 ? 4 : pbVarint(buf, pos);
+			if (buf.length - pos.i < length) throw new Error('truncated protobuf value');
+			if (wire === 2) fields.push({ number, bytes: buf.subarray(pos.i, pos.i + length) });
+			else fields.push({ number });
+			pos.i += length;
+		} else throw new Error('unsupported protobuf wire type');
+	}
+	return fields;
+}
+
+const pbLastVarint = (fields, n) =>
+	fields.findLast((f) => f.number === n && f.varint !== undefined)?.varint;
+const pbFirstBytes = (fields, n) => fields.find((f) => f.number === n && f.bytes)?.bytes;
+const pbStrictUtf8 = new TextDecoder('utf-8', { fatal: true });
+function pbLastText(fields, n) {
+	const bytes = fields.findLast((f) => f.number === n && f.bytes)?.bytes;
+	if (!bytes) return undefined;
+	try {
+		const text = pbStrictUtf8.decode(bytes);
+		return text.trim() ? text : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+const AG_COUNTS = ['input', 'totalOutput', 'cacheWrite', 'cacheRead', 'reasoning', 'visible'];
+
+function agUsage(buf) {
+	const f = pbDecode(buf);
+	return {
+		modelId: pbLastVarint(f, 1) || undefined,
+		input: pbLastVarint(f, 2) ?? 0,
+		totalOutput: pbLastVarint(f, 3) ?? 0,
+		cacheWrite: pbLastVarint(f, 4) ?? 0,
+		cacheRead: pbLastVarint(f, 5) ?? 0,
+		reasoning: pbLastVarint(f, 9) ?? 0,
+		visible: pbLastVarint(f, 10) ?? 0,
+		messageId: pbLastText(f, 7),
+		responseId: pbLastText(f, 11),
+		providerMessageId: pbLastText(f, 12)
+	};
+}
+
+const agIdentities = (u) =>
+	[
+		u.responseId && `response:${u.responseId}`,
+		u.providerMessageId && `provider:${u.providerMessageId}`,
+		u.messageId && `message:${u.messageId}`
+	].filter(Boolean);
+
+/**
+ * The usage of a row's earlier attempts. The list also repeats the attempt already reported as
+ * the row's primary usage, so one entry equal to the primary is dropped.
+ */
+function agRetries(fields, n, primary) {
+	const retries = fields
+		.filter((f) => f.number === n && f.bytes)
+		.map((f) => pbFirstBytes(pbDecode(f.bytes), 2))
+		.filter(Boolean)
+		.map(agUsage);
+	if (!primary) return retries;
+	const keys = agIdentities(primary);
+	const mirror = retries.findIndex(
+		(r) =>
+			r.modelId === primary.modelId &&
+			AG_COUNTS.every((k) => r[k] === primary[k]) &&
+			agIdentities(r).every((id) => keys.includes(id))
+	);
+	if (mirror >= 0) retries.splice(mirror, 1);
+	return retries;
+}
+
+function agTimestamp(buf) {
+	if (!buf) return undefined;
+	const f = pbDecode(buf);
+	const seconds = pbLastVarint(f, 1);
+	if (!seconds || seconds > Number.MAX_SAFE_INTEGER / 1000) return undefined;
+	const nanos = Math.min(pbLastVarint(f, 2) ?? 0, 999_999_999);
+	const ms = seconds * 1000 + Math.floor(nanos / 1e6);
+	// An implausible time falls through to the next source, so it cannot put a row in year 58854.
+	return plausibleTime(ms) ? ms : undefined;
+}
+
+function agStepIndices(root) {
+	const out = [];
+	for (const f of root) {
+		if (f.number !== 2) continue;
+		if (f.varint !== undefined) {
+			if (f.varint <= Number.MAX_SAFE_INTEGER) out.push(f.varint);
+		} else if (f.bytes) {
+			const pos = { i: 0 };
+			while (pos.i < f.bytes.length) {
+				try {
+					out.push(pbVarint(f.bytes, pos));
+				} catch {
+					break;
+				}
+			}
+		}
+	}
+	return out;
+}
+
+function agGeneration(buf) {
+	const root = pbDecode(buf);
+	const chatBytes = pbFirstBytes(root, 1);
+	if (!chatBytes) throw new Error('missing chat model field 1');
+	const chat = pbDecode(chatBytes);
+	const usageBytes = pbFirstBytes(chat, 4);
+	const usage = usageBytes && agUsage(usageBytes);
+	const info = pbFirstBytes(chat, 9);
+	return {
+		model: pbLastText(chat, 19) ?? pbLastText(chat, 21),
+		modelId: pbLastVarint(chat, 3) || undefined,
+		usage,
+		retries: agRetries(chat, 17, usage),
+		ts: agTimestamp(info && pbFirstBytes(pbDecode(info), 4)),
+		steps: agStepIndices(root)
+	};
+}
+
+function agStep(buf) {
+	const f = pbDecode(buf);
+	const usageBytes = pbFirstBytes(f, 9);
+	const usage = usageBytes && agUsage(usageBytes);
+	const infoBytes = pbFirstBytes(f, 24);
+	const info = infoBytes ? pbDecode(infoBytes) : [];
+	return {
+		model: pbLastText(info, 12) ?? pbLastText(info, 8),
+		modelId: pbLastVarint(info, 1) || undefined,
+		usage,
+		retries: agRetries(f, 28, usage),
+		ts: agTimestamp(pbFirstBytes(f, 8) ?? pbFirstBytes(f, 1))
+	};
+}
+
+const AG_ID_MODELS = {
+	246: 'gemini-2.5-pro',
+	312: 'gemini-2.5-flash',
+	313: 'gemini-2.5-flash-thinking',
+	329: 'gemini-2.5-flash-thinking',
+	330: 'gemini-2.5-flash-lite',
+	281: 'claude-4-sonnet',
+	282: 'claude-4-sonnet',
+	290: 'claude-4-opus',
+	291: 'claude-4-opus',
+	333: 'claude-4.5-sonnet',
+	334: 'claude-4.5-sonnet',
+	340: 'claude-4.5-haiku',
+	341: 'claude-4.5-haiku',
+	342: 'model_openai_gpt_oss_120b_medium',
+	1318: 'gemini-3.8-flash-high',
+	1319: 'gemini-3.8-flash-medium',
+	1320: 'gemini-3.8-flash-low',
+	1298: 'gemini-3.7-flash-high',
+	1299: 'gemini-3.7-flash-medium',
+	1300: 'gemini-3.7-flash-low',
+	1071: 'gemini-3.6-flash-high',
+	1072: 'gemini-3.6-flash-medium',
+	1073: 'gemini-3.6-flash-low',
+	1417: 'gemini-4-argon',
+	1418: 'gemini-4-argon',
+	1419: 'gemini-4-argon',
+	1402: 'claude-opus-5-5',
+	1050: 'gemini-3.1-flash-lite'
+};
+const AG_PLACEHOLDER = 'model_placeholder_m';
+const AG_UNRESOLVED_ID = 'antigravity-model-';
+const AG_EFFORT_NAME = /^gemini (3\.[678]) flash \((high|medium|low)\)$/;
+const AG_NAMES = {
+	'gemini 3.8 flash': 'gemini-3.8-flash',
+	'gemini 3.8 flash thinking': 'gemini-3.8-flash',
+	'gemini 3.7 flash': 'gemini-3.7-flash',
+	'gemini 3.7 flash thinking': 'gemini-3.7-flash',
+	'gemini 3.7 pro': 'gemini-3.7-pro',
+	'gemini 3.7 pro thinking': 'gemini-3.7-pro',
+	'gemini 3.6 flash': 'gemini-3.6-flash',
+	'gemini 3 flash': 'gemini-3.6-flash',
+	'gemini 3.6 pro': 'gemini-3.6-pro',
+	'gemini 3 pro': 'gemini-3-pro',
+	'gemini 3 pro thinking': 'gemini-3-pro',
+	'gemini 2.5 flash': 'gemini-2.5-flash',
+	'gemini 2.5 pro': 'gemini-2.5-pro',
+	'gemini 2.0 flash': 'gemini-2.0-flash',
+	'gemini 2 flash': 'gemini-2.0-flash',
+	'gemini 2.0 pro': 'gemini-2.0-pro',
+	'gemini 1.5 flash': 'gemini-1.5-flash',
+	'gemini 1.5 pro': 'gemini-1.5-pro',
+	model_placeholder_m318: 'gemini-3.8-flash-high',
+	model_placeholder_m319: 'gemini-3.8-flash-medium',
+	model_placeholder_m320: 'gemini-3.8-flash-low',
+	model_placeholder_m298: 'gemini-3.7-flash-high',
+	model_placeholder_m299: 'gemini-3.7-flash-medium',
+	model_placeholder_m300: 'gemini-3.7-flash-low',
+	model_placeholder_m71: 'gemini-3.6-flash-high',
+	model_placeholder_m72: 'gemini-3.6-flash-medium',
+	model_placeholder_m73: 'gemini-3.6-flash-low',
+	model_placeholder_m417: 'gemini-4-argon',
+	model_placeholder_m418: 'gemini-4-argon',
+	model_placeholder_m419: 'gemini-4-argon',
+	model_placeholder_m402: 'claude-opus-5-5',
+	model_placeholder_m50: 'gemini-3.1-flash-lite',
+	model_placeholder_m26: 'claude-opus-4-6',
+	model_placeholder_m35: 'claude-sonnet-4-6',
+	model_placeholder_m36: 'gemini-3.1-pro',
+	model_placeholder_m37: 'gemini-3.1-pro',
+	model_placeholder_m16: 'gemini-3.1-pro',
+	model_placeholder_m18: 'gemini-3-flash-preview',
+	model_placeholder_m84: 'gemini-3-flash-preview',
+	model_placeholder_m47: 'gemini-3-flash-preview',
+	model_placeholder_m132: 'gemini-3.5-flash-high',
+	model_placeholder_m133: 'gemini-3.5-flash-high',
+	model_placeholder_m187: 'gemini-3.5-flash-extra-low',
+	model_placeholder_m20: 'gemini-3.5-flash-medium',
+	model_openai_gpt_oss_120b_medium: 'gpt-oss-120b-medium',
+	'gemini-pro-default': 'gemini-3.1-pro',
+	'gemini-pro-agent': 'gemini-3.1-pro',
+	'gemini-3-flash-agent': 'gemini-3.5-flash-high',
+	'gemini-3-flash-agent-a': 'gemini-3.5-flash-high',
+	'gemini-3-flash-agent-b': 'gemini-3.5-flash-high',
+	'gemini-3-flash-a': 'gemini-3.5-flash-high',
+	'gemini-3-flash-b': 'gemini-3.5-flash-high',
+	'gemini-3-flash-c': 'gemini-3-flash-preview',
+	'gemini-3-flash': 'gemini-3-flash-preview',
+	'gemini-3.5-flash-low': 'gemini-3.5-flash-medium',
+	'gemini-3.1-pro-high': 'gemini-3.1-pro',
+	'gemini-3.1-pro-low': 'gemini-3.1-pro',
+	'gemini-3-pro-high': 'gemini-3-pro',
+	'gemini-3-pro-low': 'gemini-3-pro',
+	'claude 3.7 sonnet': 'claude-3-7-sonnet',
+	'claude 3.7 sonnet thinking': 'claude-3-7-sonnet',
+	'claude 3.5 sonnet': 'claude-3-5-sonnet',
+	'claude 3.5 haiku': 'claude-3-5-haiku',
+	'claude 3 opus': 'claude-3-opus'
+};
+
+function agModelName(raw) {
+	const trimmed = raw?.trim();
+	if (!trimmed) return undefined;
+	const lower = trimmed.toLowerCase();
+	const effort = AG_EFFORT_NAME.exec(lower);
+	if (effort) return `gemini-${effort[1]}-flash-${effort[2]}`;
+	const paren = lower.indexOf('(');
+	const base = paren >= 0 ? lower.slice(0, paren).trim() : lower;
+	if (Object.hasOwn(AG_NAMES, base)) return AG_NAMES[base];
+	const dashed = base.replaceAll(' ', '-');
+	return /^(gemini|claude|gpt)-/.test(dashed) ? dashed : trimmed;
+}
+
+const agModelFromId = (id) =>
+	id
+		? agModelName(
+				AG_ID_MODELS[id] ??
+					(id >= 1000 ? `${AG_PLACEHOLDER}${id - 1000}` : `${AG_UNRESOLVED_ID}${id}`)
+			)
+		: undefined;
+
+const AG_MODEL = { DEFAULT: 0, PLACEHOLDER: 1, RESOLVED: 2 };
+const agResolution = (model) =>
+	model === ANTIGRAVITY_DEFAULT_MODEL
+		? AG_MODEL.DEFAULT
+		: model.startsWith(AG_PLACEHOLDER) || model.startsWith(AG_UNRESOLVED_ID)
+			? AG_MODEL.PLACEHOLDER
+			: AG_MODEL.RESOLVED;
+const agResolved = (model) =>
+	model !== undefined && agResolution(model) === AG_MODEL.RESOLVED ? model : undefined;
+
+// Where an event's timestamp came from; a merge keeps the better source.
+const AG_TS = { FILE_MTIME: 0, TRAJECTORY: 1, OWN_ROW: 3 };
+
+/**
+ * One response, or after a merge every copy of it. `mtimeOf` names the database whose modification
+ * time is the timestamp (rank FILE_MTIME), and is empty for any other rank.
+ * @typedef {{ ts: number, rank: number, mtimeOf: string, session: string, model: string, input: number, output: number, cacheWrite: number, cacheRead: number, reasoning: number, totalOutput: number, identities: string[], tier?: number }} AgEvent
+ */
+
+/**
+ * @param {AgEvent[]} events
+ * @param {Map<string, [number, number]>} idTimestamps
+ */
+function agAppendEvent(events, idTimestamps, usage, row) {
+	if (!AG_COUNTS.some((k) => usage[k] > 0)) return;
+	let identities = agIdentities(usage);
+	if (!identities.length) identities = row.fallbackIdentities;
+	const [ts, rank] =
+		row.ts !== undefined
+			? [row.ts, AG_TS.OWN_ROW]
+			: (identities.map((id) => idTimestamps.get(id)).find(Boolean) ??
+				(row.trajectoryTs !== undefined
+					? [row.trajectoryTs, AG_TS.TRAJECTORY]
+					: [row.fallbackTs, AG_TS.FILE_MTIME]));
+	const totalOutput = Math.max(usage.totalOutput, usage.visible + usage.reasoning);
+	const output = Math.max(usage.visible, totalOutput - usage.reasoning);
+	const fromId = agModelFromId(usage.modelId);
+	const rowModel = agModelName(row.model);
+	const model =
+		agResolved(fromId) ??
+		(row.modelId === usage.modelId ? agResolved(rowModel) : undefined) ??
+		fromId ??
+		rowModel ??
+		ANTIGRAVITY_DEFAULT_MODEL;
+	for (const id of identities) {
+		const old = idTimestamps.get(id);
+		if (!old || rank > old[1] || (rank === old[1] && ts < old[0])) idTimestamps.set(id, [ts, rank]);
+	}
+	events.push({
+		ts,
+		rank,
+		mtimeOf: '',
+		session: row.session,
+		model,
+		input: usage.input,
+		output,
+		cacheWrite: usage.cacheWrite,
+		cacheRead: usage.cacheRead,
+		reasoning: Math.max(usage.reasoning, totalOutput - output),
+		totalOutput,
+		identities: [...identities]
+	});
+}
+
+/** @returns {AgEvent[]} */
+function agDatabaseEvents(db, path, fallbackTs) {
+	const session = basename(path, extname(path));
+	db.exec('BEGIN');
+	if (db.prepare('PRAGMA page_count').get().page_count === 0) return [];
+	const hasTable = (name) =>
+		!!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(name);
+	// CAST keeps a blob stored as TEXT byte for byte; read as a string, its invalid UTF-8 is lost.
+	const blob = (v) => (v instanceof Uint8Array ? v : new Uint8Array());
+
+	let trajectoryTs;
+	if (hasTable('trajectory_metadata_blob')) {
+		const rows = db
+			.prepare('SELECT CAST(data AS BLOB) AS data FROM trajectory_metadata_blob ORDER BY rowid ASC')
+			.all();
+		for (const row of rows) {
+			const ts = agTimestamp(pbFirstBytes(pbDecode(blob(row.data)), 2));
+			trajectoryTs ??= ts;
+		}
+	}
+	const generations = db
+		.prepare('SELECT idx, CAST(data AS BLOB) AS data FROM gen_metadata ORDER BY idx ASC')
+		.all()
+		.map((row) => [row.idx, agGeneration(blob(row.data))]);
+	const steps = hasTable('steps')
+		? db
+				.prepare(
+					'SELECT idx, CAST(metadata AS BLOB) AS metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC'
+				)
+				.all()
+				.map((row) => [row.idx, agStep(blob(row.metadata))])
+		: [];
+	const rowModel = (m) => agModelName(m.model) ?? agModelFromId(m.modelId);
+	const lastGenerationModel = generations.map(([, m]) => rowModel(m)).findLast(Boolean);
+
+	/** @type {AgEvent[]} */
+	const events = [];
+	const idTimestamps = new Map();
+	const append = (usage, row) =>
+		agAppendEvent(events, idTimestamps, usage, { trajectoryTs, fallbackTs, session, ...row });
+	const appendRow = (kind, idx, m, row, fallbackIdentities) => {
+		if (m.usage) append(m.usage, { ...row, fallbackIdentities });
+		m.retries.forEach((retry, n) =>
+			append(retry, {
+				...row,
+				// ccusage never merges a retry without ids, so each database counts its own. Naming the
+				// file keeps the identity unique and lets a later run find the retry it counted.
+				fallbackIdentities: [`retry:${path}:${kind}:${idx}:${n}`]
+			})
+		);
+	};
+	for (const [idx, m] of steps) {
+		const row = { model: rowModel(m) ?? lastGenerationModel, modelId: m.modelId, ts: m.ts };
+		appendRow('step', idx, m, row, [`step:${session}:${idx}`]);
+	}
+	let current;
+	for (const [idx, m] of generations) {
+		current = rowModel(m) ?? agModelFromId(m.usage?.modelId) ?? current;
+		const row = { model: current, modelId: m.modelId, ts: m.ts };
+		const linked = m.steps.map((step) => `step:${session}:${step}`);
+		appendRow('gen', idx, m, row, linked.length ? linked : [`gen:${session}:${idx}`]);
+	}
+	return events;
+}
+
+function agMergeInto(target, copy) {
+	for (const k of ['input', 'output', 'cacheWrite', 'cacheRead', 'reasoning']) {
+		target[k] = Math.max(target[k], copy[k]);
+	}
+	target.totalOutput = Math.max(
+		target.totalOutput,
+		copy.totalOutput,
+		target.output + target.reasoning
+	);
+	if (agResolution(copy.model) > agResolution(target.model)) target.model = copy.model;
+	if (copy.rank > target.rank || (copy.rank === target.rank && copy.ts < target.ts)) {
+		target.ts = copy.ts;
+		target.rank = copy.rank;
+		target.mtimeOf = copy.mtimeOf;
+	}
+	for (const id of copy.identities) {
+		if (!target.identities.includes(id)) target.identities.push(id);
+	}
+}
+
+function agMergeEvents(events) {
+	const slots = [];
+	const slotOf = new Map();
+	for (const event of events) {
+		const hits = [
+			...new Set(event.identities.map((id) => slotOf.get(id)).filter((i) => i !== undefined))
+		].sort((a, b) => a - b);
+		if (!hits.length) {
+			for (const id of event.identities) slotOf.set(id, slots.length);
+			slots.push(event);
+			continue;
+		}
+		const target = slots[hits[0]];
+		for (const i of hits.slice(1)) {
+			if (slots[i]) agMergeInto(target, slots[i]);
+			slots[i] = null;
+		}
+		agMergeInto(target, event);
+		for (const id of target.identities) slotOf.set(id, hits[0]);
+	}
+	return slots.filter(Boolean);
+}
+
+// No Antigravity model name has a slash, so one that does may be a file path, which must not leave
+// the machine.
+const agSchemaModel = (model) =>
+	(!/[\\/]/.test(model) &&
+		model
+			.replace(/[^A-Za-z0-9._:@-]+/g, '-')
+			.replace(/^-+|-+$/g, '')
+			.slice(0, 100)) ||
+	ANTIGRAVITY_DEFAULT_MODEL;
+
+const AG_STORED = [
+	'ts',
+	'rank',
+	'model',
+	'input',
+	'output',
+	'cacheWrite',
+	'cacheRead',
+	'reasoning',
+	'totalOutput',
+	'tier',
+	'session',
+	'mtimeOf'
+];
+
+/**
+ * Keeps a counted group in `seen` so a later run can merge new copies into it and replace what it
+ * added to its bucket. The first identity holds the AG_STORED fields followed by the group's other
+ * identities, and each of those holds [ts, first identity]. Every entry starts with the group's
+ * timestamp, which is what pruneState reads.
+ * @param {State['seen']} seen @param {AgEvent} group
+ */
+function agStoreGroup(seen, group) {
+	const [first, ...others] = group.identities;
+	seen[first] = [...AG_STORED.map((field) => group[field]), ...others];
+	for (const key of others) seen[key] = [group.ts, first];
+}
+
+/** @param {State['seen']} seen @param {string} key @returns {AgEvent | undefined} */
+function agStoredGroup(seen, key) {
+	let record = seen[key];
+	if (Array.isArray(record) && typeof record[1] === 'string') {
+		key = record[1];
+		record = seen[key];
+	}
+	if (!Array.isArray(record) || typeof record[2] !== 'string') return undefined;
+	return {
+		...Object.fromEntries(AG_STORED.map((field, i) => [field, record[i]])),
+		identities: [key, ...record.slice(AG_STORED.length)]
+	};
+}
+
+const agBucketRecord = (provider, group) => ({
+	ts: group.ts,
+	provider,
+	model: group.model,
+	tier: group.tier,
+	session: group.session,
+	input: group.input,
+	cacheRead: group.cacheRead,
+	cacheWrite5m: group.cacheWrite,
+	cacheWrite1h: 0,
+	output: group.totalOutput
+});
+
+/** @type {Source['read']} */
+async function readAntigravity(dirs, ctx, provider) {
+	const { state } = ctx;
+	/** @type {AgEvent[]} */
+	const events = [];
+	const read = new Set();
+	// Keyed by the real path: a root in ANTIGRAVITY_DATA_DIR can be a link to a default one, which
+	// scan reads in an earlier pass.
+	for (const { real: path } of await antigravityDatabases(dirs)) {
+		if (ctx.seenPaths.has(path)) continue;
+		ctx.seenPaths.add(path);
+		let st;
+		try {
+			// A write in WAL mode may leave the main file as it was.
+			const [main, wal] = await Promise.all([stat(path), stat(`${path}-wal`).catch(() => null)]);
+			st = {
+				size: main.size + (wal?.size ?? 0),
+				mtimeMs: Math.max(main.mtimeMs, wal?.mtimeMs ?? 0),
+				mainMtimeMs: Math.floor(main.mtimeMs)
+			};
+		} catch {
+			continue;
+		}
+		if (st.mtimeMs < ctx.cutoffMs) {
+			delete state.files[path];
+			continue;
+		}
+		const prev = state.rescan?.includes(provider) ? undefined : state.files[path];
+		if (prev && prev.size === st.size && prev.mtimeMs === st.mtimeMs) continue;
+		let db;
+		try {
+			db = await openSqlite(path);
+			if (!db) return;
+			const database = shortHash(`antigravity-db:${path}`);
+			for (const e of agDatabaseEvents(db, path, st.mainMtimeMs)) {
+				events.push({
+					...e,
+					model: agSchemaModel(e.model),
+					mtimeOf: e.rank === AG_TS.FILE_MTIME ? database : '',
+					session: shortHash(`antigravity:${e.session}`),
+					identities: e.identities.map((id) => `ag:${shortHash(id)}`)
+				});
+			}
+			read.add(database);
+			state.files[path] = { size: st.size, mtimeMs: st.mtimeMs, offset: 0 };
+			ctx.filesRead++;
+			ctx.parsedBytes += st.size;
+		} catch (err) {
+			log(`skipping unreadable Antigravity database ${basename(path)}: ${err.message}`);
+		} finally {
+			db?.close();
+		}
+	}
+
+	// An unchanged database is not read again, so its copies are known only through the groups
+	// earlier runs stored. Merging those first, as ccusage would have read them first, and counting
+	// the result in their place gives what one scan of every database gives.
+	/** @type {Map<string, AgEvent>} */
+	const stored = new Map();
+	for (const key of events.flatMap((e) => e.identities)) {
+		const group = agStoredGroup(state.seen, key);
+		if (group) stored.set(group.identities[0], group);
+	}
+	for (const group of stored.values()) {
+		removeRecord(state, agBucketRecord(provider, group));
+		for (const key of group.identities) delete state.seen[key];
+		// Its timestamp was that database's modification time, which this read replaces.
+		if (group.rank === AG_TS.FILE_MTIME && read.has(group.mtimeOf)) group.ts = Infinity;
+	}
+	for (const group of agMergeEvents([...stored.values(), ...events])) {
+		if (group.ts < ctx.cutoffMs) continue;
+		group.tier = tierFor(
+			ctx.resolvePrice(provider, group.model),
+			group.input + group.cacheRead + group.cacheWrite
+		);
+		agStoreGroup(state.seen, group);
+		addRecord(state, agBucketRecord(provider, group));
+	}
+}
+
+const GOOGLE_PRICE_PREFIXES = ['google/', 'gemini/', 'vertex_ai/', 'openrouter/google/'];
+
+/**
+ * Antigravity's names are not LiteLLM's: `claude-4.5-sonnet` is LiteLLM's `claude-sonnet-4-5`, and
+ * some Gemini models are listed only as `-preview`.
+ */
+function antigravityPriceKeys(model) {
+	const base = model.replace(/-(?:extra-low|low|medium|high|thinking)$/, '');
+	const claude = /^claude-(\d+(?:\.\d+)?)-(opus|sonnet|haiku)$/.exec(base);
+	const names = new Set([model, base]);
+	if (claude) names.add(`claude-${claude[2]}-${claude[1].replace('.', '-')}`);
+	names.add(`${base}-preview`);
+	// LiteLLM dropped Anthropic's own keys for retired Claude models; this gateway still lists them
+	// at Anthropic's price, and it is the entry ccusage's lookup lands on.
+	const prefixes = base.startsWith('claude-')
+		? ['', 'vercel_ai_gateway/anthropic/', ...GOOGLE_PRICE_PREFIXES]
+		: ['', ...GOOGLE_PRICE_PREFIXES];
+	return [...names].flatMap((name) => prefixes.map((prefix) => prefix + name));
+}
+
 /**
  * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
  *   paths: string[],
  *   envPaths: () => string[],
  *   read: (paths: string[], ctx: ReadContext, provider: string) => Promise<void>,
- *   priceKeys: (model: string) => string[]
+ *   priceKeys: (model: string) => string[],
+ *   experimental?: boolean
  * }} Source
  */
 
@@ -1016,6 +1713,7 @@ const fromEnv = (name, ...rest) => (process.env[name] ? [join(process.env[name],
  *   data whole on every run and skips what it counted before through `state.seen`, keyed with a
  *   provider prefix and valued with the record's timestamp so pruneState can drop it.
  * - `priceKeys`: the LiteLLM keys to try for a model, in order.
+ * - `experimental`: read only when BIG_SPENDER_EXPERIMENTAL names it; see enabledSources.
  *
  * @type {Record<string, Source>}
  */
@@ -1090,13 +1788,30 @@ const SOURCES = {
 			const prefix = claude ? 'anthropic' : model.startsWith('gemini-') ? 'gemini' : 'openai';
 			return [...new Set([...litellmKeys(prefix)(name), `github_copilot/${model}`])];
 		}
+	},
+	antigravity: {
+		experimental: true,
+		paths: ANTIGRAVITY_ROOTS.map((root) => join(HOME, root, 'conversations')),
+		envPaths: antigravityEnvDirs,
+		read: readAntigravity,
+		priceKeys: antigravityPriceKeys
 	}
 };
 
-async function scan(state, resolvePrice, cutoffMs) {
+// An experimental source has not been checked against real usage yet, so it is read and sent only
+// when BIG_SPENDER_EXPERIMENTAL (comma-separated provider ids) names it. Turned off, its counted rows
+// stay in the state, so turning it on again replaces them instead of counting them twice.
+function enabledSources() {
+	const optIn = new Set(
+		(process.env.BIG_SPENDER_EXPERIMENTAL ?? '').split(',').map((id) => id.trim())
+	);
+	return Object.entries(SOURCES).filter(([id, source]) => !source.experimental || optIn.has(id));
+}
+
+/** @param {[string, Source][]} sources */
+async function scan(state, resolvePrice, cutoffMs, sources) {
 	/** @type {ReadContext} */
 	const ctx = { state, resolvePrice, cutoffMs, seenPaths: new Set(), filesRead: 0, parsedBytes: 0 };
-	const sources = Object.entries(SOURCES);
 	for (const [provider, source] of sources) await source.read(source.paths, ctx, provider);
 	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
 	for (const path of Object.keys(state.files)) {
@@ -1578,21 +2293,24 @@ async function main() {
 		const resolvePrice = makePriceResolver(pricing.models);
 		const state = await loadState();
 		pruneState(state, coverageStartMs);
-		await scan(state, resolvePrice, coverageStartMs);
+		const sources = enabledSources();
+		const enabled = new Set(sources.map(([id]) => id));
+		await scan(state, resolvePrice, coverageStartMs, sources);
 		await saveState(state);
 
-		const used = new Set(Object.keys(state.buckets).map((k) => k.split('|')[1]));
+		const buckets = Object.fromEntries(
+			Object.entries(state.buckets).filter(([key]) => enabled.has(key.split('|')[1]))
+		);
+		const used = new Set(Object.keys(buckets).map((k) => k.split('|')[1]));
 		const device = buildSnapshot(
-			state.buckets,
+			buckets,
 			(b, provider, model, tier) => costOf(resolvePrice(provider, model), tier, b),
 			{
 				deviceId: setting('DEVICE_ID'),
 				pricingSource: `litellm@${new Date(pricing.fetchedAt).toISOString().slice(0, 10)}`,
 				// Older servers require the claude and codex counts and reject any other key, so another
 				// provider's count is sent only once this device has used it.
-				providers: Object.keys(SOURCES).filter(
-					(p) => p === 'claude' || p === 'codex' || used.has(p)
-				),
+				providers: [...enabled].filter((p) => p === 'claude' || p === 'codex' || used.has(p)),
 				nowMs,
 				coverageStartMs,
 				limits: state.limits

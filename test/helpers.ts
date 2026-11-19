@@ -70,11 +70,14 @@ export async function withSandbox<T>(fn: (box: Sandbox) => Promise<T>): Promise<
 	});
 }
 
-export async function seedPricing(cacheDir: string): Promise<void> {
+export async function seedPricing(
+	cacheDir: string,
+	models: Record<string, Record<string, number>> = {}
+): Promise<void> {
 	await mkdir(cacheDir, { recursive: true });
 	await writeFile(
 		join(cacheDir, 'litellm-prices.json'),
-		JSON.stringify({ fetchedAt: Date.now(), models: {} })
+		JSON.stringify({ fetchedAt: Date.now(), models })
 	);
 }
 

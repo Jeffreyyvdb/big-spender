@@ -335,19 +335,31 @@ about 15 to 20 percent less.
 | pi                                | `~/.pi/agent/sessions/**/*.jsonl`, `$PI_CODING_AGENT_DIR/sessions`, `$PI_CODING_AGENT_SESSION_DIR`, `$PI_AGENT_DIR` (comma-separated, as in ccusage) | Assistant `message` entries with `usage`; `input` excludes cached tokens, reasoning is part of `output`, and `cacheWrite` counts as 5-minute writes except its `cacheWrite1h` part. Calls with no tokens (aborted, failed before a retry) are skipped, and a call with only `totalTokens` counts it as output. A fork's file starts with a copy of its parent's calls up to the fork; those leading calls are skipped when the parent file has them. ccusage looks only at the parent's current branch, so it counts the copy again once the parent moves to another branch. A model id that is a file path (absolute, a `file://` or `host:/` URL, or ending in `.gguf` and similar) is reduced to its file name. `subagent-artifacts/` transcripts are skipped. Cost is LiteLLM's, not the cost pi stores.                                                                         |
 | Grok Build (experimental)         | `~/.grok/sessions/**/updates.jsonl`, `$GROK_HOME/sessions`                                                                                           | **Experimental:** checked against ccusage on test fixtures built from its Grok parser tests, not yet against real Grok Build logs. `turn_completed` lines, one row per model in `usage.modelUsage` (the top-level usage under `summary.json`'s `current_model_id` when that map is missing). De-duplicated by `eventId` + model, also across sessions, since one event can be exported into several; a row without `eventId` by its full content within its file. `cachedReadTokens` and `cacheCreationTokens` are part of `inputTokens`; reasoning is part of `outputTokens`. Always the base rate: a turn sums several API requests, so its total cannot pick the long-context tier; a request of its own above 200K tokens is under-priced. A model id that is a file path is reduced to its file name. A turn cut off before it completes is never logged, so it is not counted. |
 | GitHub Copilot CLI (experimental) | `~/.copilot/session-state/*/events.jsonl`, `$COPILOT_HOME/session-state`                                                                             | Experimental: so far compared with ccusage only on a few sessions from one machine and on ccusage's test fixtures, not on regular use. `session.usage_record` events (one per model call). Older versions log only `session.shutdown`; its cumulative `modelMetrics` count as the growth since the previous shutdown, and only when no per-call record came in that interval. `inputTokens` includes cache reads and writes, so input counts uncached tokens only. Reasoning is part of `outputTokens`. A `-1m` or `-1m-internal` model suffix is dropped. Only the top-level `events.jsonl` of each session is read, not the OpenTelemetry export or `session-store.db`.                                                                                                                                                                                                            |
+| Antigravity (experimental)        | `~/.gemini/antigravity*/conversations/**/*.db`, `~/.config/antigravity/conversations`                                                                | **Experimental:** read only with `BIG_SPENDER_EXPERIMENTAL=antigravity`; checked against ccusage on test fixtures, not yet against real Antigravity data. `antigravity*` is `antigravity` and its `-cli`, `-ide`, `-backup` and `-acp` variants; `$ANTIGRAVITY_DATA_DIR` (comma-separated) is read too. Read with `node:sqlite` (Node 22.13+, else skipped with a warning). Usage messages in `gen_metadata` and `steps`, retries included; copies sharing a response, provider or message id merge and keep the largest counts. A later copy can move a response to another day or model; the day and model it left are sent as a zero row, which takes them back on the server. A model name with a slash (possibly a path) becomes `gemini-internal-model`. Reasoning is part of output.                                                                                          |
 
-**Pricing.** Claude Code, Codex, pi, Grok Build and GitHub Copilot CLI use LiteLLM
+**Pricing.** Claude Code, Codex, pi, Grok Build, GitHub Copilot CLI and Antigravity use LiteLLM
 `model_prices_and_context_window.json`, cached for 24 hours in `~/.cache/big-spender/`. Each source lists the LiteLLM keys to try for a model. Claude
 Code and Codex try the exact model, then the `anthropic/` or `openai/` prefix, then without a date
 suffix. pi tries the LiteLLM prefixes of the providers pi supports too (`openrouter/`, `fireworks_ai/`,
 `groq/` and others). For an OpenRouter id such as `anthropic/claude-sonnet-4.5` it then tries
 `claude-sonnet-4.5` and `claude-sonnet-4-5`. Grok Build tries the model and its `xai/` key, then
-both without a trailing `-build`. Unknown models count with cost 0 and log a warning.
+both without a trailing `-build`. Antigravity tries the model, the model without an effort or `-thinking`
+suffix, Anthropic's spelling of a Claude name (`claude-sonnet-4-5` for `claude-4.5-sonnet`) and the
+`-preview` name, each bare and with the `google/`, `gemini/`, `vertex_ai/` and `openrouter/google/`
+prefixes (a Claude name also with `vercel_ai_gateway/anthropic/`, which still lists retired models).
+Unknown models count with cost 0 and log a warning.
 Long-context tiers
-(`*_above_<N>k_tokens`) are applied per request; 1-hour cache writes use
+(`*_above_<N>k_tokens`) are applied per request; a missing cache price is derived from the base
+input price, also above a tier, as ccusage does. 1-hour cache writes use
 `cache_creation_input_token_cost_above_1hr`. Cache savings are cache-read tokens times (input price
 minus cache-read price). Copilot also tries `github_copilot/<model>`, and swaps a dot between digits
 for a dash in Claude model names (`claude-opus-4.6` is priced as `claude-opus-4-6`).
+
+**Experimental sources.** A source whose counts match ccusage on test data but have not been checked
+against real usage yet is marked `experimental` in `SOURCES`. The collector reads and sends it only
+when `BIG_SPENDER_EXPERIMENTAL` (comma-separated provider ids, in the environment or the env file)
+names it. Antigravity is the only source gated this way. Removing it from the list stops sending its rows on the
+next run; adding it back recounts them without counting anything twice.
 
 **Adding a provider.** Add an entry to `SOURCES` in `src/collector.mjs`, the provider id to
 `PROVIDERS` in `src/schema.ts`, a row to the table above, and a test with a fixture log. The entry

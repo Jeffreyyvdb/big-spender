@@ -30,6 +30,10 @@ export type CcusageReport = {
 		date: string;
 		totalCost?: number;
 		costUSD?: number;
+		totalTokens?: number;
+		inputTokens?: number;
+		cacheCreationTokens?: number;
+		cacheReadTokens?: number;
 		modelBreakdowns?: CcusageModel[];
 		models?: Record<string, CcusageModel>;
 	}>;
@@ -53,6 +57,8 @@ export type DayResult = {
 	costDiff: number;
 	ok: boolean;
 };
+
+export type DayOutputResult = { day: string; ours: number; theirs: number | null; ok: boolean };
 
 const TOKEN_FIELDS = ['input', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'output'] as const;
 const COST_PARTS = 4;
@@ -94,12 +100,29 @@ export function collectorRows(snapshot: UsageSnapshot, provider: string): Rows {
 /**
  * ccusage's daily JSON. With `--breakdown`, agents list `modelBreakdowns` with a cost each.
  * Others (codex) list `models` with tokens only, so their cost is compared per day instead.
+ *
+ * `outputExcludesReasoning` is for agents (antigravity) whose `outputTokens` leave reasoning
+ * out, while the collector counts it as output. Their rows have no reasoning field; only a day's
+ * `totalTokens` includes it. So output is compared exactly per day, and per row only as a floor:
+ * a collector row below ccusage's has lost output to another model.
  */
-export function ccusageRows(report: CcusageReport, renameModel: (m: string) => string = (m) => m) {
+export function ccusageRows(
+	report: CcusageReport,
+	renameModel: (m: string) => string = (m) => m,
+	{ outputExcludesReasoning = false }: { outputExcludesReasoning?: boolean } = {}
+) {
 	const rows: Rows = new Map();
 	const dayCost = new Map<string, number>();
+	const dayOutput = outputExcludesReasoning ? new Map<string, number | null>() : undefined;
 	for (const day of report.daily ?? []) {
 		dayCost.set(day.date, day.totalCost ?? day.costUSD ?? 0);
+		const totals = [day.totalTokens, day.inputTokens, day.cacheCreationTokens, day.cacheReadTokens];
+		dayOutput?.set(
+			day.date,
+			totals.every((n) => typeof n === 'number')
+				? day.totalTokens! - day.inputTokens! - day.cacheCreationTokens! - day.cacheReadTokens!
+				: null
+		);
 		const models: Array<[string, CcusageModel]> = day.modelBreakdowns
 			? day.modelBreakdowns.map((m) => [m.modelName ?? 'unknown', m])
 			: Object.entries(day.models ?? {});
@@ -117,7 +140,7 @@ export function ccusageRows(report: CcusageReport, renameModel: (m: string) => s
 			rows.set(key, t);
 		}
 	}
-	return { rows, dayCost };
+	return { rows, dayCost, dayOutput };
 }
 
 const costGap = (a: number, b: number, rows: number) =>
@@ -129,21 +152,22 @@ export function compare(
 	ours: Rows,
 	theirs: ReturnType<typeof ccusageRows>,
 	{ fromDay, tolerance }: { fromDay: string; tolerance: number }
-): { rows: RowResult[]; days: DayResult[] } {
+): { rows: RowResult[]; days: DayResult[]; dayOutputs: DayOutputResult[] } {
 	const keys = new Set<string>();
 	for (const [key, t] of ours) if (counted(t)) keys.add(key);
 	for (const [key, t] of theirs.rows) if (counted(t) && key >= fromDay) keys.add(key);
 
 	const rows: RowResult[] = [];
-	const ourDay = new Map<string, { cost: number; rows: number }>();
+	const ourDay = new Map<string, { cost: number; rows: number; output: number }>();
 	const daysWithoutModelCost = new Set<string>();
 	for (const key of [...keys].sort()) {
 		const [day, model] = key.split('|');
 		const a = ours.get(key) ?? zero();
 		const b = theirs.rows.get(key) ?? missing();
-		const tokenDiffs = TOKEN_FIELDS.filter((f) => b[f] !== null && a[f] !== b[f]).map(
-			(f) => `${f} ${a[f]} vs ${b[f]}`
-		);
+		const outputIsFloor = (f: (typeof TOKEN_FIELDS)[number]) => f === 'output' && theirs.dayOutput;
+		const tokenDiffs = TOKEN_FIELDS.filter(
+			(f) => b[f] !== null && (outputIsFloor(f) ? a[f]! < b[f]! : a[f] !== b[f])
+		).map((f) => `${f} ${a[f]} ${outputIsFloor(f) ? 'below' : 'vs'} ${b[f]}`);
 		if (b.cost === null) daysWithoutModelCost.add(day);
 		const costDiff = b.cost === null ? null : costGap(a.cost!, b.cost, a.rows);
 		rows.push({
@@ -156,9 +180,10 @@ export function compare(
 			tokenDiffs,
 			ok: tokenDiffs.length === 0 && (costDiff === null || costDiff <= tolerance)
 		});
-		const d = ourDay.get(day) ?? { cost: 0, rows: 0 };
+		const d = ourDay.get(day) ?? { cost: 0, rows: 0, output: 0 };
 		d.cost += a.cost!;
 		d.rows += a.rows;
+		d.output += a.output;
 		ourDay.set(day, d);
 	}
 
@@ -168,5 +193,17 @@ export function compare(
 		const costDiff = costGap(a.cost, b, a.rows);
 		return { day, ours: a.cost, theirs: b, costDiff, ok: costDiff <= tolerance };
 	});
-	return { rows, days };
+	// A day can hold only reasoning, which no ccusage row shows, so days come from both sides.
+	const outputDays = new Set([
+		...ourDay.keys(),
+		...[...(theirs.dayOutput?.keys() ?? [])].filter((day) => day >= fromDay)
+	]);
+	const dayOutputs = theirs.dayOutput
+		? [...outputDays].sort().map((day) => {
+				const ours = ourDay.get(day)?.output ?? 0;
+				const b = theirs.dayOutput!.get(day) ?? null;
+				return { day, ours, theirs: b, ok: ours === b };
+			})
+		: [];
+	return { rows, days, dayOutputs };
 }

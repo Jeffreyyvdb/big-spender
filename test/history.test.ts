@@ -72,6 +72,24 @@ test('a reported day replaces the stored one per provider and model', () => {
 	assert.deepEqual(byKey, { 'claude/a': 1, 'claude/b': 4, 'codex/a': 7 });
 });
 
+test('a zero row takes back a stored day and model and is not kept', () => {
+	const zero = { inputTokens: 0, cacheReadTokens: 0, cacheWrite1hTokens: 0, outputTokens: 0 };
+	const stored = snap([row('2026-11-10T03:00:00Z', 'a', 2), row('2026-11-10T04:00:00Z', 'b', 2)]);
+	const next = snap([
+		row('2026-11-10T03:00:00Z', 'a', 0, { ...zero, sessions: 0 }),
+		row('2026-11-09T03:00:00Z', 'a', 2)
+	]);
+	const { snapshot } = mergeSnapshots(stored, next);
+	assert.deepEqual(
+		snapshot.hourly.map((r) => [r.hour, r.model]),
+		[
+			['2026-11-09T03:00:00Z', 'a'],
+			['2026-11-10T00:00:00.000Z', 'b']
+		]
+	);
+	assert.deepEqual(mergeSnapshots(undefined, next).snapshot.hourly.length, 1);
+});
+
 test('a day that moves from hourly rows to a daily row is not double counted', () => {
 	const stored = snap([row('2026-11-10T03:00:00Z', 'm', 2), row('2026-11-10T15:00:00Z', 'm', 2)]);
 	const next = snap([row('2026-11-10T00:00:00Z', 'm', 6, { granularity: 'day' })]);

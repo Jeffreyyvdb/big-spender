@@ -19,13 +19,25 @@ import { ccusageRows, collectorRows, compare } from './lib/ccusage-parity.ts';
 
 const execFileAsync = promisify(execFile);
 
-/** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string }>} */
+/** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string, outputExcludesReasoning?: boolean }>} */
 const AGENTS = {
 	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
 	codex: { agent: 'codex' },
 	pi: { agent: 'pi', args: ['--mode', 'calculate'], renameModel: (m) => m.replace(/^\[pi\] /, '') },
 	grok: { agent: 'grok', renameModel: (m) => m.replace(/^\[grok\] /, '') },
-	copilot: { agent: 'copilot' }
+	copilot: { agent: 'copilot' },
+	antigravity: {
+		agent: 'antigravity',
+		outputExcludesReasoning: true,
+		// ccusage keeps an unknown display name as written; the collector fits it to the schema.
+		renameModel: (m) =>
+			(!/[\\/]/.test(m) &&
+				m
+					.replace(/[^A-Za-z0-9._:@-]+/g, '-')
+					.replace(/^-+|-+$/g, '')
+					.slice(0, 100)) ||
+			'gemini-internal-model'
+	}
 };
 
 const CCUSAGE_VERSION = '20.0.51';
@@ -84,7 +96,8 @@ try {
 		XDG_CACHE_HOME: cache,
 		BIG_SPENDER_ENV_FILE: join(tmp, 'no-env-file'),
 		BIG_SPENDER_DEVICE_ID: 'parity',
-		BIG_SPENDER_CURSOR_API_KEY: ''
+		BIG_SPENDER_CURSOR_API_KEY: '',
+		BIG_SPENDER_EXPERIMENTAL: provider
 	};
 	const run = async (file, args, env) =>
 		(await execFileAsync(file, args, { env, maxBuffer: 1024 * 1024 * 1024 })).stdout;
@@ -112,10 +125,17 @@ try {
 		snapshot = JSON.parse(ours);
 		result = compare(
 			collectorRows(snapshot, provider),
-			ccusageRows(JSON.parse(theirs), mapping.renameModel),
+			ccusageRows(JSON.parse(theirs), mapping.renameModel, {
+				outputExcludesReasoning: mapping.outputExcludesReasoning
+			}),
 			{ fromDay: snapshot.coverageStart.slice(0, 10), tolerance }
 		);
-		if (result.rows.every((r) => r.tokenDiffs.length === 0)) break;
+		if (
+			result.rows.every((r) => r.tokenDiffs.length === 0) &&
+			result.dayOutputs.every((d) => d.ok)
+		) {
+			break;
+		}
 		if (attempt < ATTEMPTS) console.error(`attempt ${attempt}: token counts differ, retrying`);
 	}
 	process.exitCode = report(result, snapshot);
@@ -123,7 +143,7 @@ try {
 	await rm(tmp, { recursive: true, force: true });
 }
 
-function report({ rows, days }, snapshot) {
+function report({ rows, days, dayOutputs }, snapshot) {
 	const usd = (n) => (n === null ? '-' : `$${n.toFixed(4)}`);
 	const pct = (n) => (n === null ? '-' : `${(n * 100).toFixed(3)}%`);
 	console.log(
@@ -156,6 +176,18 @@ function report({ rows, days }, snapshot) {
 		}
 	}
 
+	const shownOutputs = dayOutputs.filter((d) => values.all || !d.ok);
+	if (shownOutputs.length) {
+		console.log(
+			`\nper-day output with reasoning (ccusage lists reasoning only in a day's totalTokens)`
+		);
+		for (const d of shownOutputs) {
+			console.log(
+				`${d.day}  ${String(d.ours).padStart(12)}  ${String(d.theirs ?? '-').padStart(12)}  ${d.ok ? 'equal' : 'differ'}`
+			);
+		}
+	}
+
 	const byModel = new Map();
 	for (const r of rows) {
 		const m = byModel.get(r.model) ?? { rows: 0, tokens: 0, ours: 0, theirs: 0, priced: true };
@@ -178,12 +210,16 @@ function report({ rows, days }, snapshot) {
 	const tokenBad = rows.filter((r) => r.tokenDiffs.length).length;
 	const costBad = rows.filter((r) => r.costDiff !== null && r.costDiff > tolerance).length;
 	const dayBad = days.filter((d) => !d.ok).length;
+	const outputBad = dayOutputs.filter((d) => !d.ok).length;
 	console.log(
 		`\n${rows.length} day-model rows: tokens ${tokenBad ? `differ on ${tokenBad}` : 'identical'}; ` +
 			`cost ${costBad ? `over tolerance on ${costBad}` : 'within tolerance'}` +
 			(days.length
 				? `; ${days.length} day totals ${dayBad ? `over tolerance on ${dayBad}` : 'within tolerance'}`
+				: '') +
+			(dayOutputs.length
+				? `; ${dayOutputs.length} day outputs ${outputBad ? `differ on ${outputBad}` : 'identical'}`
 				: '')
 	);
-	return tokenBad || costBad || dayBad ? 1 : 0;
+	return tokenBad || costBad || dayBad || outputBad ? 1 : 0;
 }
