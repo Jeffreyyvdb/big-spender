@@ -50,7 +50,7 @@ if (!mapping) {
 	process.exit(2);
 }
 const tolerance = Number(values.tolerance);
-if (!Number.isFinite(tolerance) || tolerance < 0) {
+if (!(tolerance >= 0 && tolerance < 1) || values.tolerance.trim() === '') {
 	console.error(`--tolerance must be a fraction such as 0.001, not "${values.tolerance}"`);
 	process.exit(2);
 }

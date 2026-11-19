@@ -194,3 +194,44 @@ test('a device that used only Claude sends claude and codex session counts and n
 		assert.deepEqual(snapshot.sessionCounts?.['7d'], { claude: 1, codex: 0, all: 1 });
 	});
 });
+
+test('a file that a default path and an override both reach goes to the provider it is a default of', async () => {
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		// $CLAUDE_CONFIG_DIR/projects is HOME, so it also reaches HOME/.codex/sessions.
+		const projects = join(home, 'projects');
+		const dir = join(projects, '.codex', 'sessions', '2026', '11', '19');
+		await mkdir(dir, { recursive: true });
+		const ts = new Date(Date.now() - HOUR_MS).toISOString();
+		const lines = [
+			{ timestamp: ts, type: 'session_meta', payload: { id: 'codex-session' } },
+			{ timestamp: ts, type: 'turn_context', payload: { model: 'gpt-test' } },
+			{
+				timestamp: ts,
+				type: 'event_msg',
+				payload: {
+					type: 'token_count',
+					info: {
+						total_token_usage: { total_tokens: 250 },
+						last_token_usage: { input_tokens: 200, cached_input_tokens: 0, output_tokens: 50 }
+					}
+				}
+			}
+		];
+		await writeFile(
+			join(dir, 'rollout-2026-11-19T00-00-00-00000000-0000-0000-0000-000000000001.jsonl'),
+			lines.map((l) => `${JSON.stringify(l)}\n`).join('')
+		);
+		const res = await run(COLLECTOR, ['--dry-run'], {
+			...env,
+			HOME: projects,
+			CLAUDE_CONFIG_DIR: home
+		});
+		assert.equal(res.code, 0, res.stderr);
+		const rows = JSON.parse(res.stdout).hourly.map((r: { provider: string; model: string }) => [
+			r.provider,
+			r.model
+		]);
+		assert.deepEqual(rows, [['codex', 'gpt-test']]);
+	});
+});

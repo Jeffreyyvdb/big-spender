@@ -18,10 +18,11 @@ const strip = ({ generatedAt, ...rest }) => rest;
 const same = (a, b) => JSON.stringify(strip(a)) === JSON.stringify(strip(b));
 
 const dir = await mkdtemp(join(tmpdir(), 'big-spender-ref-'));
+let pricing;
 try {
 	const old = join(dir, 'collector.mjs');
 	await writeFile(old, execFileSync('git', ['show', `${ref}:src/collector.mjs`]));
-	const pricing = await fetchPricing();
+	pricing = await fetchPricing();
 
 	const dryRun = async (collector, name) => {
 		const cache = join(dir, name, 'cache');
@@ -50,7 +51,6 @@ try {
 		if (same(before, after)) break;
 		console.error(`attempt ${attempt}: snapshots differ, retrying`);
 	}
-	await rm(join(pricing, '..'), { recursive: true, force: true });
 
 	const files = ['before', 'after'].map((name) => join(dir, `${name}.json`));
 	await writeFile(files[0], JSON.stringify(before, null, 2) + '\n');
@@ -76,5 +76,6 @@ try {
 		console.log('ok: only generatedAt may differ');
 	}
 } finally {
+	if (pricing) await rm(join(pricing, '..'), { recursive: true, force: true });
 	await rm(dir, { recursive: true, force: true });
 }
