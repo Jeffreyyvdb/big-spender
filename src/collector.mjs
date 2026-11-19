@@ -258,6 +258,9 @@ const MINUTE_MS = 60_000;
 const RESET_SLACK_MS = 2 * MINUTE_MS;
 // Times outside this range are malformed (milliseconds read as seconds, say) and are skipped,
 // never thrown, so a bad limit line cannot stop the usage on the lines after it.
+// The server rejects a push with more limit records than this (MAX_LIMIT_WINDOWS in src/schema.ts),
+// and it keeps the newest, so a push sends the newest.
+const MAX_LIMIT_WINDOWS = 5_000;
 const LIMIT_TIMES_FROM = Date.parse('2020-01-01T00:00:00Z');
 const LIMIT_TIMES_TO = Date.parse('2100-01-01T00:00:00Z');
 const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
@@ -2228,7 +2231,8 @@ function buildSnapshot(
 				a.resetsAt.localeCompare(b.resetsAt) ||
 				a.provider.localeCompare(b.provider) ||
 				a.window.localeCompare(b.window)
-		);
+		)
+		.slice(-MAX_LIMIT_WINDOWS);
 	if (limits.length) snapshot.limits = limits;
 	return { snapshot, sessions24h };
 }

@@ -801,3 +801,39 @@ test('a polled limit with no window on file at the refusal leaves it unattribute
 		});
 	});
 });
+
+test('a push sends at most the 5000 newest limit records the server accepts', async () => {
+	await withSandbox(async (box) => {
+		const MINUTE = 60_000;
+		const first = NEXT_HOUR - 5001 * MINUTE;
+		const limits: Record<string, Win> = {};
+		for (let i = 0; i < 5001; i++) {
+			const resetsAt = first + i * MINUTE;
+			limits[`codex|five_hour|${resetsAt}`] = {
+				provider: 'codex',
+				window: 'five_hour',
+				resetsAt: iso(resetsAt),
+				peakPercent: 10
+			};
+		}
+		const dir = join(box.env.XDG_CACHE_HOME, 'big-spender');
+		await mkdir(dir, { recursive: true });
+		await writeFile(
+			join(dir, 'state.json'),
+			JSON.stringify({
+				version: 1,
+				files: {},
+				seen: {},
+				buckets: {},
+				limits,
+				fixes: ['claude-final-output', 'usage-limits', 'codex-refusals']
+			})
+		);
+		await withUsageApi(async (_api, _seen, url) => {
+			const res = await collect(box, url, { BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(res.snap.limits.length, 5000);
+			assert.equal(res.snap.limits[0].resetsAt, iso(first + MINUTE));
+		});
+	});
+});
