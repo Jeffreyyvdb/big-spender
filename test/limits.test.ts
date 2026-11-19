@@ -175,6 +175,27 @@ test('limits() shows a window that resets after today on today, with its peak so
 	assert.deepEqual(w.series.peakPercent.slice(-2), [null, 66]);
 });
 
+test('limits() counts a block before the previous reset as one lockout that ran longer', async () => {
+	// Claude moved the reset while blocked: 20:46 said 00:20, 22:23 said 01:40.
+	const { limits } = await limitsOf(
+		{
+			mac: [
+				win({ hitAt: '2026-11-13T20:46:00.000Z', resetsAt: '2026-11-14T00:20:00.000Z' }),
+				win({ hitAt: '2026-11-13T22:23:00.000Z', resetsAt: '2026-11-14T01:40:00.000Z' }),
+				win({ hitAt: '2026-11-14T02:05:00.000Z', resetsAt: '2026-11-14T06:40:00.000Z' })
+			]
+		},
+		Date.parse('2026-11-14T22:30:00Z')
+	);
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 2);
+	assert.equal(w.hit, 2);
+	// 20:46 to 01:40 is 4.9 h, then 02:05 to 06:40 is 4.6 h (4.58).
+	assert.equal(w.lockedHours, 9.5);
+	assert.deepEqual(w.series.hits.slice(-2), [1, 1]);
+	assert.deepEqual(w.series.lockedHours.slice(-2), [4.9, 4.6]);
+});
+
 test('limits() leaves out windows older than 90 days and the public summary is unchanged', async () => {
 	const old = win({ resetsAt: '2026-06-01T00:00:00.000Z', hitAt: '2026-06-01T00:00:00.000Z' });
 	const withWindows = await limitsOf({ mac: [old, win()] });

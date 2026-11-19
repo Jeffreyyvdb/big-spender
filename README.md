@@ -269,7 +269,8 @@ server, like day rows.
 
 `GET /api/usage/limits` returns, for each provider and window over the last 90 UTC days, how many
 window instances were seen, how many were hit, the hours locked out (first refusal until reset),
-the day of the last hit and a per-day series. A window counts on the day of its first refusal, or
+the day of the last hit and a per-day series. Claude can move a window's reset later while you are
+blocked, so a refusal before the previous reset extends that lockout instead of counting a new hit. A window counts on the day of its first refusal, or
 of its reset when it was never refused; a window that is still open counts on today with its peak
 so far. It follows the same privacy rule as the rest: nothing
 finer than a UTC day, no device names, no report times. It is separate from `/api/usage`, whose

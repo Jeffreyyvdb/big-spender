@@ -81,9 +81,12 @@ export type LimitWindowSummary = {
 	window: string;
 	/** Window instances seen in range, after de-duplicating across devices. */
 	observed: number;
-	/** Instances where a request was blocked. */
+	/**
+	 * Lockouts: instances where a request was blocked. A block before the previous lockout's reset
+	 * extends that lockout (the provider moved its reset) instead of counting again.
+	 */
 	hit: number;
-	/** Hours from the first block to the reset, summed over hit instances. */
+	/** Hours from the first block of each lockout to its last reset. */
 	lockedHours: number;
 	/** UTC day (YYYY-MM-DD) of the latest hit. */
 	lastHit: string | null;
@@ -137,21 +140,41 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 				let lastHit: number | null = null;
 				let hit = 0;
 				let locked = 0;
-				for (const w of list) {
+				let absorbed = 0;
+				// The lockout in progress: its day, and when it ends so far.
+				let lockout: { day: number; endMs: number } | undefined;
+				const byHit = list.sort(
+					(a, b) => Date.parse(a.hitAt ?? a.resetsAt) - Date.parse(b.hitAt ?? b.resetsAt)
+				);
+				for (const w of byHit) {
 					const day = Math.floor((anchor(w) - from) / DAY_MS);
 					series.peakPercent[day] = Math.max(series.peakPercent[day] ?? 0, w.peakPercent);
 					if (!w.hitAt) continue;
-					const hours = Math.max(0, Date.parse(w.resetsAt) - Date.parse(w.hitAt)) / HOUR_MS;
+					const hitMs = Date.parse(w.hitAt);
+					const resetMs = Date.parse(w.resetsAt);
+					lastHit = Math.max(lastHit ?? 0, hitMs);
+					// A provider can move the reset of a window while it is blocked (Claude does: a
+					// refusal at 20:46 said 00:20, one at 22:23 said 01:40). A hit before the current
+					// lockout ends is that lockout running longer, not a second one.
+					if (lockout && hitMs < lockout.endMs) {
+						absorbed++;
+						const extra = Math.max(0, resetMs - lockout.endMs) / HOUR_MS;
+						lockout.endMs = Math.max(lockout.endMs, resetMs);
+						locked += extra;
+						series.lockedHours[lockout.day] += extra;
+						continue;
+					}
+					const hours = Math.max(0, resetMs - hitMs) / HOUR_MS;
+					lockout = { day, endMs: resetMs };
 					hit++;
 					locked += hours;
 					series.hits[day]++;
 					series.lockedHours[day] += hours;
-					lastHit = Math.max(lastHit ?? 0, Date.parse(w.hitAt));
 				}
 				series.lockedHours = series.lockedHours.map(tenth);
 				return {
 					window,
-					observed: list.length,
+					observed: list.length - absorbed,
 					hit,
 					lockedHours: tenth(locked),
 					lastHit: lastHit === null ? null : new Date(lastHit).toISOString().slice(0, 10),
