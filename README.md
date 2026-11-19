@@ -259,20 +259,21 @@ their local logs, and it polls their usage endpoints (see [Polling](#polling-usa
 - **Codex.** `token_count` events carry `rate_limits` with the used percentage and reset time of the
   5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). A
   window counts as hit when its share reaches 100%. A refused turn is logged too, but names no
-  window and no reset. It starts the lockout of each Codex window already seen full (by a poll or
-  an earlier log line) that was open at that moment, so the lockout begins at the first logged
-  refusal instead of at the next poll. When no open window was seen full, a lockout that began and
+  window and no reset. It starts the lockout of each Codex window seen full (by a poll or any log
+  line) that was open at that moment, so the lockout begins at the first logged refusal instead of
+  at the next poll. When no open window was seen full, a lockout that began and
   ended between two runs can still be placed by elimination. Usage in a window instance only rises
   until it resets, so a poll that read an instance below 100% after the refusal proves it was not
-  the one blocking. This needs a successful poll in the same run, and every limit it reports must
-  have an instance on file that was open at the refusal. If exactly one open window is then left,
+  the one blocking. This needs a successful poll in the same run that read both Codex windows, and
+  every limit it reports must have an instance on file that was open at the refusal. If exactly one open window is then left,
   it gets the hit at the refusal. The gap that remains is a refusal whose window no reading ever
   saw, one where several windows stay possible, and any refusal read while polling is off or
   failing. These change nothing.
 
 A record is one window instance, identified by provider, window name and reset time rounded down
 to the minute. Reports whose resets are at most two minutes apart are the same window, because one
-window's reported reset can drift by a few seconds. It holds the peak percentage seen and the time of the first refusal. Limits belong
+window's reported reset can drift by a few seconds. A push sends at most the 5,000 newest records,
+the most the server accepts. It holds the peak percentage seen and the time of the first refusal. Limits belong
 to the account, not the machine, so merging keeps the highest peak and the earliest refusal, and
 two machines that report the same window count once. Records are kept for 90 days on the collector and up to 5,000 windows on the
 server, like day rows.
@@ -303,14 +304,9 @@ Each reading is a peak for the same window record the logs feed. Windows are nam
 `seven_day_opus`). Codex's extra limits become `<window>_<limit name>`. Only the window name, reset
 time and percentage are stored or sent.
 
-Claude Code logs a refusal of Fable's weekly as `seven_day_overage_included`, which is the same
-limit the endpoint reports as `seven_day_fable`. Once a poll has reported exactly one model-specific
-weekly, refusals logged under that name are recorded as that window, so they join its polled
-readings in one record. With none or several, the raw name stays. The name is applied when a record
-is created and is kept between runs; an earlier record is not renamed.
-
-A lockout that starts and ends between two collector runs, with no full reading from a poll or the
-logs, is still missed.
+Claude Code logs a refusal of Fable's weekly as `seven_day_overage_included` and labels it "Fable
+limit". The endpoint reports the same limit as `seven_day_fable`, so the collector records those
+refusals as `seven_day_fable`, and they join the polled readings in one record.
 
 To turn polling off, set `BIG_SPENDER_POLL_LIMITS=off` in the env file.
 
