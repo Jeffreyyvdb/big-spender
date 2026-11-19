@@ -217,15 +217,16 @@ function addRecord(state, r) {
 
 /**
  * Takes back what addRecord added for `r`. Its session stays listed, since a bucket does not
- * know which of its records named it, unless nothing is left of the bucket.
+ * know which of its records named it, unless nothing is left of the bucket. An emptied bucket
+ * stays as a zero row until it ages out: the server keeps a day and model that a snapshot stops
+ * reporting, so only a zero row takes back what an earlier snapshot sent.
  * @type {typeof addRecord}
  */
 function removeRecord(state, r) {
-	const key = recordBucketKey(r);
-	const b = state.buckets[key];
+	const b = state.buckets[recordBucketKey(r)];
 	if (!b) return;
 	for (const k of BUCKET_COUNTS) b[k] = Math.max(0, b[k] - r[k]);
-	if (BUCKET_COUNTS.every((k) => b[k] === 0)) delete state.buckets[key];
+	if (BUCKET_COUNTS.every((k) => b[k] === 0)) b.sessions = [];
 }
 
 /** @param {State} state @param {number} cutoffMs */
@@ -414,8 +415,10 @@ function costOf(entry, tier, t) {
 	if (!entry) return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, savings: 0 };
 	const inP = price(entry, 'input_cost_per_token', tier) ?? 0;
 	const outP = price(entry, 'output_cost_per_token', tier) ?? 0;
-	const readP = price(entry, 'cache_read_input_token_cost', tier) ?? inP * 0.1;
-	const write5mP = price(entry, 'cache_creation_input_token_cost', tier) ?? inP * 1.25;
+	// A missing cache rate derives from the base input rate, also above a tier, as in ccusage.
+	const baseInP = price(entry, 'input_cost_per_token', 0) ?? 0;
+	const readP = price(entry, 'cache_read_input_token_cost', tier) ?? baseInP * 0.1;
+	const write5mP = price(entry, 'cache_creation_input_token_cost', tier) ?? baseInP * 1.25;
 	const write1hP = tier
 		? (entry[`cache_creation_input_token_cost_above_1hr_above_${tier / 1000}k_tokens`] ??
 			entry.cache_creation_input_token_cost_above_1hr ??
@@ -1056,15 +1059,16 @@ function byPathComponents(a, b) {
 	return x.length - y.length;
 }
 
+/** @returns {Promise<{ path: string, real: string }[]>} */
 async function antigravityDatabases(dirs) {
 	const byRealPath = new Map();
 	for (const dir of dirs) {
 		for await (const path of walk(dir, (name) => name.endsWith('.db'))) {
 			const real = await realpath(path).catch(() => path);
-			if (!byRealPath.has(real)) byRealPath.set(real, path);
+			if (!byRealPath.has(real)) byRealPath.set(real, { path, real });
 		}
 	}
-	return [...byRealPath.values()].sort(byPathComponents);
+	return [...byRealPath.values()].sort((a, b) => byPathComponents(a.path, b.path));
 }
 
 function pbVarint(buf, pos) {
@@ -1169,7 +1173,9 @@ function agTimestamp(buf) {
 	const seconds = pbLastVarint(f, 1);
 	if (!seconds || seconds > Number.MAX_SAFE_INTEGER / 1000) return undefined;
 	const nanos = Math.min(pbLastVarint(f, 2) ?? 0, 999_999_999);
-	return seconds * 1000 + Math.floor(nanos / 1e6);
+	const ms = seconds * 1000 + Math.floor(nanos / 1e6);
+	// An implausible time falls through to the next source, so it cannot put a row in year 58854.
+	return plausibleTime(ms) ? ms : undefined;
 }
 
 function agStepIndices(root) {
@@ -1417,24 +1423,28 @@ function agDatabaseEvents(db, path, fallbackTs) {
 	if (db.prepare('PRAGMA page_count').get().page_count === 0) return [];
 	const hasTable = (name) =>
 		!!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").get(name);
-	// SQLite hands a TEXT value back as a string; ccusage reads its bytes.
-	const blob = (v) => (v instanceof Uint8Array ? v : new TextEncoder().encode(String(v ?? '')));
+	// CAST keeps a blob stored as TEXT byte for byte; read as a string, its invalid UTF-8 is lost.
+	const blob = (v) => (v instanceof Uint8Array ? v : new Uint8Array());
 
 	let trajectoryTs;
 	if (hasTable('trajectory_metadata_blob')) {
-		const rows = db.prepare('SELECT data FROM trajectory_metadata_blob ORDER BY rowid ASC').all();
+		const rows = db
+			.prepare('SELECT CAST(data AS BLOB) AS data FROM trajectory_metadata_blob ORDER BY rowid ASC')
+			.all();
 		for (const row of rows) {
 			const ts = agTimestamp(pbFirstBytes(pbDecode(blob(row.data)), 2));
 			trajectoryTs ??= ts;
 		}
 	}
 	const generations = db
-		.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC')
+		.prepare('SELECT idx, CAST(data AS BLOB) AS data FROM gen_metadata ORDER BY idx ASC')
 		.all()
 		.map((row) => [row.idx, agGeneration(blob(row.data))]);
 	const steps = hasTable('steps')
 		? db
-				.prepare('SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC')
+				.prepare(
+					'SELECT idx, CAST(metadata AS BLOB) AS metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx ASC'
+				)
 				.all()
 				.map((row) => [row.idx, agStep(blob(row.metadata))])
 		: [];
@@ -1514,11 +1524,15 @@ function agMergeEvents(events) {
 	return slots.filter(Boolean);
 }
 
+// No Antigravity model name has a slash, so one that does may be a file path, which must not leave
+// the machine.
 const agSchemaModel = (model) =>
-	model
-		.replace(/[^A-Za-z0-9._:/@-]+/g, '-')
-		.replace(/^-+|-+$/g, '')
-		.slice(0, 100) || ANTIGRAVITY_DEFAULT_MODEL;
+	(!/[\\/]/.test(model) &&
+		model
+			.replace(/[^A-Za-z0-9._:@-]+/g, '-')
+			.replace(/^-+|-+$/g, '')
+			.slice(0, 100)) ||
+	ANTIGRAVITY_DEFAULT_MODEL;
 
 const AG_STORED = [
 	'ts',
@@ -1565,7 +1579,7 @@ function agStoredGroup(seen, key) {
 const agBucketRecord = (provider, group) => ({
 	ts: group.ts,
 	provider,
-	model: agSchemaModel(group.model),
+	model: group.model,
 	tier: group.tier,
 	session: group.session,
 	input: group.input,
@@ -1581,7 +1595,9 @@ async function readAntigravity(dirs, ctx, provider) {
 	/** @type {AgEvent[]} */
 	const events = [];
 	const read = new Set();
-	for (const path of await antigravityDatabases(dirs)) {
+	// Keyed by the real path: a root in ANTIGRAVITY_DATA_DIR can be a link to a default one, which
+	// scan reads in an earlier pass.
+	for (const { real: path } of await antigravityDatabases(dirs)) {
 		if (ctx.seenPaths.has(path)) continue;
 		ctx.seenPaths.add(path);
 		let st;
@@ -1610,6 +1626,7 @@ async function readAntigravity(dirs, ctx, provider) {
 			for (const e of agDatabaseEvents(db, path, st.mainMtimeMs)) {
 				events.push({
 					...e,
+					model: agSchemaModel(e.model),
 					mtimeOf: e.rank === AG_TS.FILE_MTIME ? database : '',
 					session: shortHash(`antigravity:${e.session}`),
 					identities: e.identities.map((id) => `ag:${shortHash(id)}`)
@@ -1644,7 +1661,7 @@ async function readAntigravity(dirs, ctx, provider) {
 	for (const group of agMergeEvents([...stored.values(), ...events])) {
 		if (group.ts < ctx.cutoffMs) continue;
 		group.tier = tierFor(
-			ctx.resolvePrice(provider, agSchemaModel(group.model)),
+			ctx.resolvePrice(provider, group.model),
 			group.input + group.cacheRead + group.cacheWrite
 		);
 		agStoreGroup(state.seen, group);

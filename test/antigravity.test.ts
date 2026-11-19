@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mergeSnapshots } from '../src/history.ts';
 import { usageSnapshotSchema, type UsageSnapshot } from '../src/schema.ts';
 import {
 	addGenerations,
@@ -233,7 +234,10 @@ const plain = (input: number, output: number): Usage => ({
 	visible: output
 });
 
-/** Runs the collector after each step, then checks the last snapshot against a fresh scan. */
+/**
+ * Runs the collector after each step and posts each snapshot to a server's history, then checks
+ * what the server holds against a fresh scan.
+ */
 async function converges(
 	steps: ((home: string) => void)[],
 	expected: Record<string, { input: number; output: number }>
@@ -241,9 +245,12 @@ async function converges(
 	await withSandbox(async (box) => {
 		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
 		let hourly: UsageSnapshot['hourly'] = [];
+		let server: UsageSnapshot | undefined;
 		for (const step of steps) {
 			step(box.home);
-			hourly = (await collect(box)).snapshot.hourly;
+			const { snapshot } = await collect(box);
+			server = mergeSnapshots(server, snapshot).snapshot;
+			hourly = snapshot.hourly;
 		}
 		assert.deepEqual(
 			(await collect(box)).snapshot.hourly,
@@ -251,7 +258,11 @@ async function converges(
 			'an unchanged rerun adds nothing'
 		);
 		const fresh = await collect(box, ['--reset']);
-		assert.deepEqual(hourly, fresh.snapshot.hourly, 'incremental runs match a fresh scan');
+		assert.deepEqual(
+			server?.hourly,
+			fresh.snapshot.hourly,
+			'the server ends where a fresh scan ends'
+		);
 		const rows = Object.fromEntries(
 			Object.entries(byDayAndModel(fresh.snapshot, DAY0)).map(([key, { input, output }]) => [
 				key,
@@ -437,17 +448,33 @@ test('nothing but numbers and a schema-safe model name leaves the machine', { sk
 						},
 						ts: Date.now() - DAY_MS
 					})
+				],
+				[
+					2,
+					generationBlob({
+						model: join(box.home, 'projects', 'private-stem.db'),
+						use: { input: 7, totalOutput: 1, visible: 1, responseId: 'resp-private-2' },
+						ts: Date.now() - DAY_MS
+					})
 				]
 			]
 		});
 		writeFileSync(conversation(box.home, 'broken.db'), 'not sqlite');
 		const { stdout, stderr, snapshot } = await collect(box);
 
-		assert.deepEqual(
-			snapshot.hourly.map((r) => [r.model, r.inputTokens, r.outputTokens]),
-			[['Secret-Model-Internal-Build-7', 5, 3]]
-		);
-		for (const secret of [box.home, 'conv-7f3a9c', 'resp-private', 'billing', 'conversations']) {
+		assert.deepEqual(snapshot.hourly.map((r) => [r.model, r.inputTokens, r.outputTokens]).sort(), [
+			['Secret-Model-Internal-Build-7', 5, 3],
+			['gemini-internal-model', 7, 1]
+		]);
+		const secrets = [
+			box.home,
+			'conv-7f3a9c',
+			'resp-private',
+			'billing',
+			'conversations',
+			'private-stem'
+		];
+		for (const secret of secrets) {
 			assert.ok(!stdout.includes(secret), `the snapshot contains "${secret}"`);
 		}
 		assert.match(stderr, /Antigravity database broken\.db: /);
@@ -457,7 +484,7 @@ test('nothing but numbers and a schema-safe model name leaves the machine', { sk
 			readFileSync(join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'), 'utf8')
 		);
 		const kept = JSON.stringify([state.seen, state.buckets]);
-		for (const secret of [box.home, 'conv-7f3a9c', 'resp-private', 'billing', 'conversations']) {
+		for (const secret of secrets) {
 			assert.ok(!kept.includes(secret), `the state keeps "${secret}" outside its file list`);
 		}
 	});
@@ -492,6 +519,103 @@ test('ANTIGRAVITY_DATA_DIR is read after the default roots', { skip }, async () 
 		);
 	});
 });
+
+test(
+	'a root in ANTIGRAVITY_DATA_DIR that links to a default root is read once',
+	{ skip },
+	async () => {
+		await withSandbox(async (box) => {
+			await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+			createDatabase(conversation(box.home, 'a.db'), {
+				gens: [
+					[1, pro({ ...plain(100, 10), responseId: 'R' }, Date.now() - DAY_MS, [plain(50, 5)])]
+				]
+			});
+			const link = join(box.home, 'linked');
+			symlinkSync(join(box.home, '.gemini', 'antigravity'), link);
+
+			const { snapshot } = await collect(box, [], { ANTIGRAVITY_DATA_DIR: link });
+			assert.deepEqual(
+				snapshot.hourly.map((r) => [r.inputTokens, r.outputTokens]),
+				[[150, 15]]
+			);
+		});
+	}
+);
+
+test(
+	'a timestamp that cannot be a date falls back to the conversation time',
+	{ skip },
+	async () => {
+		await withSandbox(async (box) => {
+			await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+			const msAsSeconds = Date.now() * 1000;
+			createDatabase(conversation(box.home, 'a.db'), {
+				gens: [[1, pro({ ...plain(100, 10), responseId: 'R' }, msAsSeconds)]],
+				trajectories: [trajectory(at(1, 5))]
+			});
+
+			const { snapshot } = await collect(box);
+			assert.deepEqual(
+				snapshot.hourly.map((r) => [r.hour, r.inputTokens]),
+				[[new Date(at(1, 5)).toISOString(), 100]]
+			);
+		});
+	}
+);
+
+test('usage stored as TEXT instead of a BLOB is read byte for byte', { skip }, async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		const db = openDatabase(conversation(box.home, 'a.db'), {
+			gens: [[1, pro({ ...plain(500, 32), responseId: 'R' }, at(1, 5))]]
+		});
+		db.exec('UPDATE gen_metadata SET data = CAST(data AS TEXT)');
+		assert.equal(db.prepare('SELECT typeof(data) AS t FROM gen_metadata').get()?.t, 'text');
+		db.close();
+
+		const { snapshot } = await collect(box);
+		assert.deepEqual(
+			snapshot.hourly.map((r) => [r.inputTokens, r.outputTokens]),
+			[[500, 32]]
+		);
+	});
+});
+
+test(
+	'above a long-context tier, a missing cache price derives from the base input price',
+	{ skip },
+	async () => {
+		await withSandbox(async (box) => {
+			await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'), {
+				'gemini-3-pro': {
+					input_cost_per_token: 1e-6,
+					input_cost_per_token_above_200k_tokens: 2e-6,
+					output_cost_per_token: 1e-5
+				}
+			});
+			createDatabase(conversation(box.home, 'a.db'), {
+				gens: [
+					[
+						1,
+						pro(
+							{ ...plain(30_000, 600), cacheRead: 210_000, cacheWrite: 1_000, responseId: 'R' },
+							at(1, 5)
+						)
+					]
+				]
+			});
+
+			const [row] = (await collect(box)).snapshot.hourly;
+			assert.deepEqual(row.costUsd, {
+				input: 0.06,
+				cacheRead: 0.021,
+				cacheWrite: 0.00125,
+				output: 0.006
+			});
+		});
+	}
+);
 
 test(
 	'without node:sqlite the collector warns once and still sends the other sources',
