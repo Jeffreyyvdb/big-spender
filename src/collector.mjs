@@ -1395,7 +1395,8 @@ function agAppendEvent(events, idTimestamps, usage, row) {
 }
 
 /** @returns {AgEvent[]} */
-function agDatabaseEvents(db, session, fallbackTs) {
+function agDatabaseEvents(db, path, fallbackTs) {
+	const session = basename(path, extname(path));
 	db.exec('BEGIN');
 	if (db.prepare('PRAGMA page_count').get().page_count === 0) return [];
 	const hasTable = (name) =>
@@ -1435,7 +1436,9 @@ function agDatabaseEvents(db, session, fallbackTs) {
 			append(retry, {
 				...row,
 				fallbackIdentities: [],
-				retryKey: `retry:${session}:${kind}:${idx}:${n}`
+				// ccusage never merges a retry without ids, so a copy of the database elsewhere counts
+				// its own: the key is the file, not the session name two files can share.
+				retryKey: `retry:${path}:${kind}:${idx}:${n}`
 			})
 		);
 	};
@@ -1531,7 +1534,7 @@ async function readAntigravity(dirs, ctx, provider) {
 		try {
 			db = await openSqlite(path);
 			if (!db) return;
-			events.push(...agDatabaseEvents(db, basename(path, extname(path)), st.mainMtimeMs));
+			events.push(...agDatabaseEvents(db, path, st.mainMtimeMs));
 			state.files[path] = { size: st.size, mtimeMs: st.mtimeMs, offset: 0 };
 			ctx.filesRead++;
 			ctx.parsedBytes += st.size;

@@ -11,7 +11,8 @@ import {
 	createDatabase,
 	generationBlob,
 	openDatabase,
-	sqlite
+	sqlite,
+	type Usage
 } from './antigravity-fixture.ts';
 import { run, seedPricing, withSandbox, type Sandbox } from './helpers.ts';
 
@@ -194,6 +195,63 @@ test(
 			assert.deepEqual(recount.snapshot.hourly, third.snapshot.hourly);
 		});
 	}
+);
+
+const DAY0 = Math.floor(Date.now() / DAY_MS) * DAY_MS - 3 * DAY_MS;
+const at = (day: number, hour: number) => DAY0 + day * DAY_MS + hour * 3_600_000;
+const pro = (use: Usage, ts?: number, retries: Usage[] = []) =>
+	generationBlob({ model: 'gemini-3-pro', use, ts, retries });
+const plain = (input: number, output: number): Usage => ({
+	input,
+	totalOutput: output,
+	visible: output
+});
+
+/** Runs the collector after each step, then checks the last snapshot against a fresh scan. */
+async function converges(
+	steps: ((home: string) => void)[],
+	expected: Record<string, { input: number; output: number }>
+) {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		let hourly: UsageSnapshot['hourly'] = [];
+		for (const step of steps) {
+			step(box.home);
+			hourly = (await collect(box)).snapshot.hourly;
+		}
+		assert.deepEqual(
+			(await collect(box)).snapshot.hourly,
+			hourly,
+			'an unchanged rerun adds nothing'
+		);
+		const fresh = await collect(box, ['--reset']);
+		assert.deepEqual(hourly, fresh.snapshot.hourly, 'incremental runs match a fresh scan');
+		const rows = Object.fromEntries(
+			Object.entries(byDayAndModel(fresh.snapshot, DAY0)).map(([key, { input, output }]) => [
+				key,
+				{ input, output }
+			])
+		);
+		assert.deepEqual(rows, expected);
+	});
+}
+
+test(
+	'scenario 7: a retry without ids counts once per database, also for a same-named copy',
+	{ skip },
+	() =>
+		converges(
+			[
+				(home) => {
+					for (const root of ['.gemini/antigravity', '.gemini/antigravity-backup']) {
+						createDatabase(conversation(home, 'a.db', root), {
+							gens: [[1, pro({ ...plain(100, 10), responseId: 'R' }, at(1, 10), [plain(90, 4)])]]
+						});
+					}
+				}
+			],
+			{ '1 gemini-3-pro': { input: 280, output: 18 } }
+		)
 );
 
 test('a database that changed only in its WAL file is read again', { skip }, async () => {
