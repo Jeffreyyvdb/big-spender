@@ -9,6 +9,12 @@ snapshot into that device's stored history, adds the devices together, and serve
 JSON and as a plain HTML page. You can also embed the server side in your own app and draw the
 numbers however you like.
 
+![A 30-day bar chart of daily AI coding cost, each bar stacked by machine (MacBook, VPS, Home agent), with a $3,148 total](docs/usage-card.png)
+
+The card above is on [jeffreyyvdb.com](https://jeffreyyvdb.com). The site mounts
+`big-spender/server` and draws its own chart from the summary, here 30 days of daily cost stacked
+by machine.
+
 The collector has no dependencies and needs Node 20 or newer. The package depends on `zod` only.
 
 ## What leaves the machine
