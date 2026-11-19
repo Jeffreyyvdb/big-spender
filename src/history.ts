@@ -6,6 +6,11 @@ const DAY_MS = 86_400_000;
 const round = (n: number) => Math.round(n * 1e6) / 1e6;
 const dayOf = (r: UsageRow) => Math.floor(Date.parse(r.hour) / DAY_MS);
 const keyOf = (r: UsageRow) => `${dayOf(r)}|${r.provider}|${r.model}`;
+// A collector sends a zero row to take back a day and model it reported before (a response it
+// moved to another day or model). The row replaces the stored ones and is not kept itself.
+const hasTokens = (r: UsageRow) =>
+	r.inputTokens + r.cacheReadTokens + r.cacheWrite5mTokens + r.cacheWrite1hTokens + r.outputTokens >
+	0;
 
 function compareRows(a: UsageRow, b: UsageRow): number {
 	return (
@@ -70,13 +75,14 @@ export function mergeSnapshots(
 	stored: UsageSnapshot | undefined,
 	next: UsageSnapshot
 ): { snapshot: UsageSnapshot; droppedDays: number } {
-	const fresh = [...next.hourly].sort(compareRows);
+	const sorted = [...next.hourly].sort(compareRows);
+	const fresh = sorted.filter(hasTokens);
 	const limits = mergeLimits(stored?.limits, next.limits);
 	const withLimits = limits.length ? { limits } : {};
 	const { limits: _, ...rest } = next;
 	if (!stored) return { snapshot: { ...rest, hourly: fresh, ...withLimits }, droppedDays: 0 };
 
-	const reported = new Set(fresh.map(keyOf));
+	const reported = new Set(sorted.map(keyOf));
 	const kept = [...group(stored.hourly)]
 		.filter(([key]) => !reported.has(key))
 		.flatMap(([, rows]) => rollUp(rows))
