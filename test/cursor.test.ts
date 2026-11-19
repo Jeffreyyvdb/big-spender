@@ -37,8 +37,11 @@ function event(
 	};
 }
 
-/** What the fake Cursor API hands out: the access token, and how many events a page leaves out. */
-type FakeCursor = { accessToken: string; shortBy: number };
+/**
+ * How the fake Cursor API misbehaves: the key it accepts, the token it hands out, how many events
+ * each page leaves out, and how many extra events the next request counts.
+ */
+type FakeCursor = { apiKey: string; accessToken: string; shortBy: number; countBonus: number };
 
 /** Cursor's API as the collector sees it: a key exchange and one page of up to 1000 events. */
 async function withCursor(
@@ -46,7 +49,7 @@ async function withCursor(
 	fn: (url: string, requests: UsageRequest[], api: FakeCursor) => Promise<void>
 ) {
 	const requests: UsageRequest[] = [];
-	const api: FakeCursor = { accessToken: ACCESS_TOKEN, shortBy: 0 };
+	const api: FakeCursor = { apiKey: API_KEY, accessToken: ACCESS_TOKEN, shortBy: 0, countBonus: 0 };
 	const server = createServer(async (req, res) => {
 		let text = '';
 		for await (const chunk of req) text += chunk;
@@ -55,7 +58,7 @@ async function withCursor(
 			res.end(JSON.stringify(body));
 		};
 		if (req.url === '/auth/exchange_user_api_key') {
-			if (req.headers.authorization !== `Bearer ${API_KEY}`) return reply(401, { error: 'no' });
+			if (req.headers.authorization !== `Bearer ${api.apiKey}`) return reply(401, { error: 'no' });
 			return reply(200, { accessToken: api.accessToken });
 		}
 		if (req.url === '/aiserver.v1.DashboardService/GetFilteredUsageEvents') {
@@ -69,14 +72,22 @@ async function withCursor(
 			const startDate = Number(body.startDate);
 			const endDate = Number(body.endDate);
 			const inside = events
-				.filter((e) => Number(e.timestamp) >= startDate && Number(e.timestamp) <= endDate)
+				// A malformed timestamp is listed in every window, as a broken record would be.
+				.filter((e) => {
+					const ts = Number(e.timestamp);
+					return Number.isNaN(ts) || (ts >= startDate && ts <= endDate);
+				})
 				.sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
 			const page = inside.slice(0, body.pageSize).slice(api.shortBy);
+			const bonus = api.countBonus;
+			api.countBonus = 0;
 			requests.push({ startDate, endDate, returned: page.length });
 			// Connect leaves out empty fields.
 			return reply(
 				200,
-				inside.length ? { totalUsageEventsCount: inside.length, usageEventsDisplay: page } : {}
+				inside.length
+					? { totalUsageEventsCount: inside.length + bonus, usageEventsDisplay: page }
+					: {}
 			);
 		}
 		reply(404, {});
@@ -218,7 +229,7 @@ test('a window holding more than one page is split, and every event counts once'
 	await withSandbox(async (box) => {
 		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
 		await withIngest(box, async (ingestUrl, dataDir) => {
-			await withCursor(events, async (cursorUrl, requests) => {
+			await withCursor(events, async (cursorUrl, requests, api) => {
 				const res = await run(COLLECTOR, [], collectorEnv(box, ingestUrl, cursorUrl));
 				assert.equal(res.code, 0, res.stderr);
 				assert.ok(requests.length > 3);
@@ -229,6 +240,15 @@ test('a window holding more than one page is split, and every event counts once'
 					2500
 				);
 				assert.ok(Math.abs(cost(cursor.hourly) - 25) < 1e-6, `cost ${cost(cursor.hourly)}`);
+
+				api.countBonus = 1;
+				const short = await run(COLLECTOR, ['--dry-run'], collectorEnv(box, ingestUrl, cursorUrl));
+				assert.equal(short.code, 1);
+				assert.match(
+					short.stderr,
+					/Cursor counted 2501 usage events in a window but returned 2500 inside it/,
+					'halves that add up to less than the whole fail the read'
+				);
 			});
 		});
 	});
@@ -315,12 +335,19 @@ async function withFakeIngest(
 		const result = snap.deviceId === 'cursor' ? reply.result : 'stored';
 		res.writeHead(200, { 'content-type': 'application/json' });
 		res.end(
-			JSON.stringify({ ok: true, deviceId: snap.deviceId, rows: snap.hourly.length, result })
+			JSON.stringify({
+				ok: true,
+				deviceId: snap.deviceId,
+				rows: snap.hourly.length,
+				note: 'x'.repeat(400),
+				result
+			})
 		);
 	});
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 	try {
-		await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}/ingest`, received, reply);
+		const port = (server.address() as AddressInfo).port;
+		await fn(`http://127.0.0.1:${port}/ingest?key=gateway-secret`, received, reply);
 	} finally {
 		server.closeAllConnections();
 		await new Promise((resolve) => server.close(resolve));
@@ -347,6 +374,17 @@ test('a page short of its count, a stale reply or an unsafe token never complete
 				assert.match(short.stderr, /Cursor counted 2 usage events in a window but returned 1/);
 				api.shortBy = 0;
 
+				api.countBonus = 1;
+				const counted = await run(COLLECTOR, [], env);
+				assert.equal(counted.code, 1);
+				assert.match(counted.stderr, /Cursor counted 3 usage events in a window but returned 2/);
+
+				events.push(event(Number.NaN, 'composer-2', { inputTokens: 1, totalCents: 1 }));
+				const invalid = await run(COLLECTOR, [], env);
+				assert.equal(invalid.code, 1);
+				assert.match(invalid.stderr, /Cursor counted 3 usage events in a window but returned 2/);
+				events.pop();
+
 				api.accessToken = 'tok\nsecret-part';
 				const unsafe = await run(COLLECTOR, [], env);
 				assert.equal(unsafe.code, 1);
@@ -369,6 +407,21 @@ test('a page short of its count, a stale reply or an unsafe token never complete
 				assert.equal(staleRun, oldDay);
 				assert.equal(backfill, oldDay, 'a stale reply leaves the backfill to do');
 				assert.notEqual(incremental, oldDay, 'once stored, later runs send 90 days');
+				const state = await readFile(
+					join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'),
+					'utf8'
+				);
+				assert.doesNotMatch(state, /gateway-secret|key_/, 'the marker keeps no URL or key');
+
+				api.apiKey = 'key_other_account';
+				const switched = await run(
+					COLLECTOR,
+					[],
+					collectorEnv(box, ingestUrl, cursorUrl, api.apiKey)
+				);
+				assert.equal(switched.code, 0, switched.stderr);
+				assert.equal(cursorCoverage(received).at(-1), oldDay, 'another key backfills again');
+				api.apiKey = API_KEY;
 			});
 
 			await withFakeIngest(async (otherUrl, received) => {
@@ -380,7 +433,7 @@ test('a page short of its count, a stale reply or an unsafe token never complete
 	});
 });
 
-test('Cursor is refused for a machine named cursor and for an API URL off this machine', async () => {
+test('the cursor device id is reserved, the API URL stays on this machine, keys stay one line', async () => {
 	await withSandbox(async (box) => {
 		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
 		await withIngest(box, async (ingestUrl, dataDir) => {
@@ -389,7 +442,8 @@ test('Cursor is refused for a machine named cursor and for an API URL off this m
 				BIG_SPENDER_DEVICE_ID: 'cursor'
 			});
 			assert.equal(named.code, 1);
-			assert.match(named.stderr, /device id is "cursor"/);
+			assert.match(named.stderr, /"cursor" is reserved for Cursor usage/);
+			assert.ok(!existsSync(join(dataDir, 'cursor.json')), 'a machine named cursor posts nothing');
 
 			const remote = await run(
 				COLLECTOR,
@@ -400,5 +454,29 @@ test('Cursor is refused for a machine named cursor and for an API URL off this m
 			assert.match(remote.stderr, /may only point at this machine/);
 			assert.ok(existsSync(join(dataDir, 'laptop.json')), 'the device snapshot is still posted');
 		});
+	});
+});
+
+test('install and push refuse the cursor device id, and install refuses a key with a line break', async () => {
+	await withSandbox(async (box) => {
+		const url = 'https://example.com/api/usage/ingest';
+		const named = harness(box, { env: { BIG_SPENDER_INGEST_TOKEN: 'tok' } });
+		assert.equal(await main(['install', '--device', 'cursor', '--url', url], named.ctx), 2);
+		assert.match(named.err.join('\n'), /reserved for Cursor usage/);
+
+		const pushed = harness(box);
+		assert.equal(await main(['push', 'cursor', '--dry-run'], pushed.ctx), 2);
+
+		const multiline = harness(box, {
+			env: {
+				BIG_SPENDER_INGEST_TOKEN: 'tok',
+				BIG_SPENDER_CURSOR_API_KEY: 'key_a\nBIG_SPENDER_DEVICE_ID=other'
+			}
+		});
+		assert.equal(
+			await main(['install', '--device', 'desk', '--url', url, '--cursor'], multiline.ctx),
+			2
+		);
+		assert.ok(!existsSync(join(box.env.XDG_CONFIG_HOME, 'big-spender', 'env')));
 	});
 });

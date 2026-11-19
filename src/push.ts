@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { gzipSync } from 'node:zlib';
 import { UsageError, type Context } from './context.ts';
 import { parseEnv, setting } from './envfile.ts';
-import { DEVICE_ID, type UsageSnapshot } from './schema.ts';
+import { CURSOR_DEVICE_ID, DEVICE_ID, type UsageSnapshot } from './schema.ts';
 
 export const PUSH_USAGE = `Usage: big-spender push <device> [--dry-run] [--url <ingest url>]
 
@@ -84,6 +84,9 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 	const deviceId = positionals[0] ?? '';
 	if (positionals.length !== 1 || !DEVICE_ID.test(deviceId)) {
 		throw new UsageError('<device> must be a lowercase slug such as laptop or desktop');
+	}
+	if (deviceId === CURSOR_DEVICE_ID) {
+		throw new UsageError(`the device id "${CURSOR_DEVICE_ID}" is reserved for Cursor usage`);
 	}
 
 	const built = await runCollector(

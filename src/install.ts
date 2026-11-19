@@ -14,7 +14,7 @@ import { delimiter, dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { UsageError, type Context } from './context.ts';
 import { parseEnv, renameLegacyKeys, setting, upsertEnv } from './envfile.ts';
-import { DEVICE_ID } from './schema.ts';
+import { CURSOR_DEVICE_ID, DEVICE_ID } from './schema.ts';
 import { pickScheduler } from './scheduler.ts';
 
 // The collector removes its lock when it finishes, so one this young belongs to a live run.
@@ -192,6 +192,9 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	if (!DEVICE_ID.test(deviceId)) {
 		throw new UsageError('--device must be a lowercase slug such as laptop or desktop');
 	}
+	if (deviceId === CURSOR_DEVICE_ID) {
+		throw new UsageError(`the device id "${CURSOR_DEVICE_ID}" is reserved for Cursor usage`);
+	}
 
 	if (existing.deviceId && deviceId !== existing.deviceId && !values.rename) {
 		throw new UsageError(
@@ -228,6 +231,12 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 			ctx.env.BIG_SPENDER_CURSOR_API_KEY || (await ctx.prompter().askHidden('Cursor API key: '))
 		).trim();
 		if (!cursorKey) throw new UsageError('--cursor needs a Cursor API key');
+		// A newline would end the env file line and start another setting.
+		if (!/^[\x21-\x7e]+$/.test(cursorKey)) {
+			throw new UsageError(
+				'the Cursor API key contains spaces, line breaks or other characters it cannot have'
+			);
+		}
 	}
 
 	const log: string[] = [];

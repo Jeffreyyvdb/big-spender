@@ -124,8 +124,9 @@ async function acquireLock() {
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean, cursorBackfilledTo?: string[] }} State
- * cursorBackfilledTo lists the ingest URLs that stored the Cursor account's full history.
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean, cursorBackfills?: string[] }} State
+ * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
+ * account's full history. Hashed, because an ingest URL can carry a credential.
  */
 
 // One-time fixes to existing state. The state version stays the same so an older installed copy
@@ -768,22 +769,29 @@ async function cursorEvents(token, fromMs, toMs) {
 	if (!Number.isSafeInteger(total) || total < 0 || !Array.isArray(events)) {
 		throw new Error('Cursor answered with a usage page in an unexpected shape');
 	}
+	let inside;
 	if (total > CURSOR_PAGE_SIZE) {
 		if (toMs - fromMs < 2)
 			throw new Error(`Cursor listed ${total} usage events in one millisecond`);
 		const mid = fromMs + Math.floor((toMs - fromMs) / 2);
-		return [...(await cursorEvents(token, fromMs, mid)), ...(await cursorEvents(token, mid, toMs))];
+		inside = [
+			...(await cursorEvents(token, fromMs, mid)),
+			...(await cursorEvents(token, mid, toMs))
+		];
+	} else {
+		inside = events.filter((e) => {
+			const ts = Number(e?.timestamp);
+			return ts >= fromMs && ts < toMs;
+		});
 	}
-	// Posting a short window would replace complete days on the server with partial ones.
-	if (events.length !== total) {
+	// Posting a short window would replace complete days on the server with partial ones. Events
+	// that arrive while the halves are read can make a split window longer, never shorter.
+	if (inside.length < total || (total <= CURSOR_PAGE_SIZE && inside.length !== total)) {
 		throw new Error(
-			`Cursor counted ${total} usage events in a window but returned ${events.length}`
+			`Cursor counted ${total} usage events in a window but returned ${inside.length} inside it`
 		);
 	}
-	return events.filter((e) => {
-		const ts = Number(e?.timestamp);
-		return ts >= fromMs && ts < toMs;
-	});
+	return inside;
 }
 
 const cursorCount = (v) => num(typeof v === 'string' ? Number(v) : v);
@@ -914,12 +922,13 @@ async function post(snapshot) {
 				body,
 				signal: AbortSignal.timeout(30_000)
 			});
-			const text = (await res.text()).slice(0, 300);
+			const reply = await res.text();
+			const text = reply.slice(0, 300);
 			if (res.ok) {
 				log(
 					`posted ${snapshot.hourly.length} rows for "${snapshot.deviceId}" (${body.length} bytes gzipped): ${text}`
 				);
-				return parseJson(text)?.result;
+				return parseJson(reply)?.result;
 			}
 			lastErr = new Error(`HTTP ${res.status}: ${text}`);
 			// Client errors other than rate limiting won't fix themselves.
@@ -945,6 +954,11 @@ async function main() {
 		if (!(DRY_RUN || SUMMARY_ONLY)) {
 			throw new Error('BIG_SPENDER_DEVICE_ID must be a lowercase slug like "laptop" or "desktop"');
 		}
+	}
+	if (deviceId === CURSOR_DEVICE_ID) {
+		throw new Error(
+			`the device id "${CURSOR_DEVICE_ID}" is reserved for Cursor usage; rename this machine with big-spender install --device <id> --rename`
+		);
 	}
 	const release = await acquireLock();
 	if (!release) {
@@ -980,17 +994,12 @@ async function main() {
 
 		// A Cursor failure is held until this device's snapshot is posted, so it never blocks it.
 		const cursorKey = (process.env.BIG_SPENDER_CURSOR_API_KEY ?? '').trim();
-		const ingestUrl = setting('INGEST_URL');
-		const backfill = !(state.cursorBackfilledTo ?? []).includes(ingestUrl);
+		const backfillId = shortHash(`${setting('INGEST_URL')}\n${cursorKey}`);
+		const backfill = !(state.cursorBackfills ?? []).includes(backfillId);
 		let cursor = null;
 		let cursorError = null;
 		if (cursorKey) {
 			try {
-				if (setting('DEVICE_ID') === CURSOR_DEVICE_ID) {
-					throw new Error(
-						`this machine's device id is "${CURSOR_DEVICE_ID}", which the Cursor snapshot uses; rename this machine with big-spender install --device <id> --rename`
-					);
-				}
 				assertHeaderSafe(cursorKey, 'BIG_SPENDER_CURSOR_API_KEY');
 				cursor = await cursorSnapshot(cursorKey, backfill, nowMs, coverageStartMs);
 			} catch (err) {
@@ -1012,7 +1021,7 @@ async function main() {
 		if (cursor) {
 			const result = await post(cursor.snapshot);
 			if (backfill && result === 'stored') {
-				(state.cursorBackfilledTo ??= []).push(ingestUrl);
+				(state.cursorBackfills ??= []).push(backfillId);
 				await saveState(state);
 			} else if (result !== 'stored') {
 				log(
