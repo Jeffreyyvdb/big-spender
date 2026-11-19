@@ -162,14 +162,17 @@ async function existingSettings(ctx: Context): Promise<Existing> {
 	};
 }
 
-export const INSTALL_USAGE = `Usage: big-spender install --device <id> [--url <ingest url>] [--rename]
+export const INSTALL_USAGE = `Usage: big-spender install --device <id> [--url <ingest url>] [--rename] [--cursor]
 
 Copies the collector to ~/.local/share/big-spender, schedules it hourly (systemd user timer on
 Linux, launchd agent on macOS) and runs it once. The ingest token comes from the existing env
 file, BIG_SPENDER_INGEST_TOKEN, or a hidden prompt. It is never taken from a flag.
 Re-running is safe. A usage-collector install from before the rename is migrated in place.
 A machine that already has a device id keeps it: --device with a different id needs --rename,
-because the server would count the same history twice, under the old id and the new one.`;
+because the server would count the same history twice, under the old id and the new one.
+--cursor also reads your Cursor account's usage from Cursor's API and sends it as the device
+"cursor". The Cursor API key comes from BIG_SPENDER_CURSOR_API_KEY or a hidden prompt. Set it up
+on one machine only. Re-running install without --cursor keeps a key that is already set.`;
 
 export async function install(args: string[], ctx: Context): Promise<number> {
 	const { values } = parseArgs({
@@ -177,7 +180,8 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 		options: {
 			device: { type: 'string' },
 			url: { type: 'string' },
-			rename: { type: 'boolean' }
+			rename: { type: 'boolean' },
+			cursor: { type: 'boolean' }
 		},
 		strict: true
 	});
@@ -218,6 +222,13 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 	if (!url) url = await ctx.prompter().ask('Ingest URL (https://…/api/usage/ingest): ');
 	if (!token) token = await ctx.prompter().askHidden('Ingest token: ');
 	if (!url || !token) throw new UsageError('an ingest URL and token are required');
+	let cursorKey = '';
+	if (values.cursor) {
+		cursorKey = (
+			ctx.env.BIG_SPENDER_CURSOR_API_KEY || (await ctx.prompter().askHidden('Cursor API key: '))
+		).trim();
+		if (!cursorKey) throw new UsageError('--cursor needs a Cursor API key');
+	}
 
 	const log: string[] = [];
 
@@ -241,7 +252,8 @@ export async function install(args: string[], ctx: Context): Promise<number> {
 		upsertEnv(base, {
 			BIG_SPENDER_DEVICE_ID: deviceId,
 			BIG_SPENDER_INGEST_URL: url,
-			BIG_SPENDER_INGEST_TOKEN: token
+			BIG_SPENDER_INGEST_TOKEN: token,
+			...(cursorKey ? { BIG_SPENDER_CURSOR_API_KEY: cursorKey } : {})
 		})
 	);
 

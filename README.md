@@ -15,6 +15,9 @@ The card above is on [jeffreyyvdb.com](https://jeffreyyvdb.com). The site mounts
 `big-spender/server` and draws its own chart from the summary, here 30 days of daily cost stacked
 by machine.
 
+Cursor keeps usage on its servers, so one machine can also read your Cursor account's usage from
+Cursor's API and send it as its own device. See [Cursor](#cursor).
+
 The collector has no dependencies and needs Node 20 or newer. The package depends on `zod` only.
 
 ## What leaves the machine
@@ -31,6 +34,12 @@ nothing is bucketed finer than a UTC day: 7, 30 and 90 days are per day, all tim
 
 Before the first send you can see exactly what would leave the machine with
 `big-spender push <device> --dry-run`.
+
+With [Cursor](#cursor) set up, the collector also calls Cursor's API with your Cursor API key. It
+sends Cursor only the key and a date range. From the answer it keeps model names, token counts,
+cost and timestamps, the same as from local logs. Conversation ids are hashed on the device and
+only counted, like session ids. Everything else in the answer, such as your Cursor user id, is
+dropped.
 
 ## Quick start
 
@@ -89,6 +98,37 @@ you do mean to rename the device, pass `--rename` and delete the old device's fi
 Remove the schedule with `big-spender uninstall`. The env file and the state are kept.
 
 `big-spender status` prints the last 24 hours on this machine and sends nothing.
+
+### Cursor
+
+Cursor keeps usage on its servers, per account, so the collector reads it from Cursor's API
+instead of local files. Set it up on one machine only:
+
+```sh
+npx big-spender install --device laptop --cursor
+```
+
+It asks for a Cursor user API key with a hidden prompt (or reads `BIG_SPENDER_CURSOR_API_KEY`) and
+adds it to the env file. Create the key in your Cursor dashboard. Running `install` again without
+`--cursor` keeps the key; with `--cursor` it asks for a new one.
+
+Cursor usage is sent as its own device, `cursor`, not as the machine that reads it, because one
+account covers every machine you use Cursor on. If you move the key to another machine, remove it
+from the first one, or both would send the same usage. Add `cursor` to your
+[devices file](#device-names-and-colours) to give it a name and colour.
+
+The first run sends all of the account's history that has token counts. Cursor billed per request
+until about June 2025 and reported no tokens for those events, so they are skipped. Later runs
+send the last 90 days, and the server keeps the older days. If the first run fails, the next run
+tries the full history again.
+
+Cost is Cursor's own price for each event (`totalCents`), not LiteLLM's. Cursor's model names
+mostly don't match LiteLLM's, and models such as Composer have no API price at all. Cursor reports
+one price per event, so the split over input, cache read, cache write and output uses fixed ratios
+of 1, 0.1, 1.25 and 5. The total is always Cursor's.
+
+A Cursor failure, such as a revoked key, does not stop the machine's own snapshot. The run still
+posts it, then exits with an error that names Cursor. `big-spender push` never reads Cursor.
 
 ## The server
 
@@ -213,6 +253,9 @@ big-spender status                          # last 24 hours on this machine, not
 node ~/.local/share/big-spender/collector.mjs --dry-run   # the full snapshot JSON, nothing sent
 ```
 
+With [Cursor](#cursor) set up, `--dry-run` reads Cursor too and prints the `cursor` snapshot after
+this machine's.
+
 Compare with [ccusage](https://github.com/ryoppippi/ccusage) on the same machine. Use the `claude`
 subcommand: plain `npx ccusage` also adds other CLIs that the collector does not read. Claude Code
 tokens and cost should match per model:
@@ -231,8 +274,9 @@ about 15 to 20 percent less.
 | ----------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Claude Code | `~/.claude/projects/**/*.jsonl`, `~/.config/claude/projects`, `$CLAUDE_CONFIG_DIR/projects` | `assistant` lines; de-duplicated by `message.id` + `requestId` (one API response is logged once per content block, and resumed sessions copy history). `<synthetic>` skipped; subagent logs included. Some Claude Code versions (2.1.293 to 2.1.310) log a partial output count on a message's first line and the final count on a later line; a later line that reports more output adds the difference. |
 | Codex       | `~/.codex/sessions/**/rollout-*.jsonl`, `$CODEX_HOME/sessions`                              | `event_msg` / `token_count` with `info.last_token_usage`; skipped when `total_token_usage` did not change. Model from the latest `turn_context`. `cached_input_tokens` is part of `input_tokens`; reasoning is part of `output_tokens`.                                                                                                                                                                   |
+| Cursor      | Cursor's API, `DashboardService/GetFilteredUsageEvents`, with `BIG_SPENDER_CURSOR_API_KEY`  | Events with token counts only. Cost is Cursor's `totalCents`. Events have no unique id and pages can overlap, so a time window with more than 1,000 events is split in half instead of paged. `cacheWriteTokens` count as 5-minute cache writes. Sessions are hashed `conversationId`s. Model names are lowercased, and anything outside `a-z 0-9 . _ : @ -` becomes `-`.                                 |
 
-**Pricing.** LiteLLM `model_prices_and_context_window.json`, cached for 24 hours in
+**Pricing.** Claude Code and Codex use LiteLLM `model_prices_and_context_window.json`, cached for 24 hours in
 `~/.cache/big-spender/`. Lookup tries the exact model, then `anthropic/` or `openai/` prefixes, then
 without a date suffix. Unknown models count with cost 0 and log a warning. Long-context tiers
 (`*_above_<N>k_tokens`) are applied per request; 1-hour cache writes use

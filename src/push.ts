@@ -17,7 +17,8 @@ prompt, so neither is written to this machine. Nothing is scheduled.
 
 --dry-run prints the overview, writes the exact JSON that would be sent to
 $TMPDIR/big-spender-snapshot-<device>.json and never asks for the token. Both modes update the
-collector's local state in ~/.cache/big-spender (which logs were read), never anything remote.`;
+collector's local state in ~/.cache/big-spender (which logs were read), never anything remote.
+Cursor usage is not part of a push: only the scheduled collector sends it.`;
 
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
 const POST_ATTEMPTS = 4;
@@ -85,7 +86,11 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		throw new UsageError('<device> must be a lowercase slug such as laptop or desktop');
 	}
 
-	const built = await runCollector(ctx, { BIG_SPENDER_DEVICE_ID: deviceId }, ['--dry-run']);
+	const built = await runCollector(
+		ctx,
+		{ BIG_SPENDER_DEVICE_ID: deviceId, BIG_SPENDER_CURSOR_API_KEY: '' },
+		['--dry-run']
+	);
 	if (built.code !== 0) {
 		ctx.err(built.stderr.trimEnd());
 		return 1;

@@ -5,6 +5,8 @@
 // token and cost aggregates (LiteLLM API prices), and POSTs one full snapshot
 // to your big-spender server's ingest endpoint. Only numbers, model names, timestamps and the
 // device id leave the machine: no paths, prompts, session ids or branches.
+// With BIG_SPENDER_CURSOR_API_KEY set it also reads the Cursor account's usage from Cursor's API
+// and POSTs it as a second snapshot under the device id "cursor".
 //
 // Zero dependencies, Node >= 20 (or Bun). `big-spender install` copies this single file to
 // ~/.local/share/big-spender/collector.mjs and schedules it. See the package README.
@@ -15,7 +17,8 @@
 //   node collector.mjs --summary    # print only the 24h summary
 //   node collector.mjs --reset      # forget local state and rescan everything
 //
-// Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN (see templates/env.example).
+// Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
+// BIG_SPENDER_CURSOR_API_KEY (see templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
@@ -36,6 +39,11 @@ const PRICING_URL =
 	'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 const PRICING_TTL_MS = DAY_MS;
 const POST_ATTEMPTS = 4;
+const CURSOR_API_URL = process.env.BIG_SPENDER_CURSOR_API_URL || 'https://api2.cursor.sh';
+const CURSOR_DEVICE_ID = 'cursor';
+const CURSOR_PAGE_SIZE = 1000;
+// The server's date floor (EARLIEST_DATE in schema.ts); the backfill reads from here.
+const CURSOR_EARLIEST_MS = Date.parse('2020-01-01T00:00:00Z');
 
 const args = new Set(process.argv.slice(2));
 const DRY_RUN = args.has('--dry-run');
@@ -100,12 +108,13 @@ async function acquireLock() {
 // State
 
 /**
- * @typedef {{ input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number, sessions: string[] }} Bucket
+ * @typedef {{ input: number, cacheRead: number, cacheWrite: number, output: number, savings: number }} Cost
+ * @typedef {{ input: number, cacheRead: number, cacheWrite5m: number, cacheWrite1h: number, output: number, sessions: string[], cost?: Cost }} Bucket
  * @typedef {{ size: number, mtimeMs: number, offset: number, model?: string, sessionId?: string, lastTotal?: number }} FileState
  * A seen entry is the first timestamp, or for Claude [first timestamp, output tokens counted].
  * A bare number on a Claude key means the counted output is unknown (state from an older version).
  * @typedef {number | [number, number]} Seen
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean }} State
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, fixes?: string[], rescanClaude?: boolean, cursorBackfilled?: boolean }} State
  */
 
 // One-time fixes to existing state. The state version stays the same so an older installed copy
@@ -267,7 +276,7 @@ function price(entry, base, tier) {
 	return typeof v === 'number' ? v : undefined;
 }
 
-/** Cost breakdown in USD for a bucket's tokens. */
+/** Cost breakdown in USD for a bucket's tokens. @returns {Cost} */
 function costOf(entry, tier, t) {
 	if (!entry) return { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, savings: 0 };
 	const inP = price(entry, 'input_cost_per_token', tier) ?? 0;
@@ -532,18 +541,28 @@ async function scan(state, resolvePrice, cutoffMs) {
 
 const round = (n, d = 6) => Math.round(n * 10 ** d) / 10 ** d;
 
-function buildSnapshot(state, resolvePrice, pricing, nowMs, coverageStartMs) {
+/**
+ * @param {Record<string, Bucket>} buckets
+ * @param {(b: Bucket, provider: string, model: string, tier: number) => Cost} costFor
+ * @param {{ deviceId: string, pricingSource: string, providers: string[], nowMs: number, coverageStartMs: number }} meta
+ *   `providers` names the session counts the snapshot carries.
+ */
+function buildSnapshot(
+	buckets,
+	costFor,
+	{ deviceId, pricingSource, providers, nowMs, coverageStartMs }
+) {
 	const hourlyCutoff = Math.floor((nowMs - HOURLY_DAYS * DAY_MS) / DAY_MS) * DAY_MS;
 	/** @type {Map<string, any>} */
 	const rows = new Map();
-	for (const [key, b] of Object.entries(state.buckets)) {
+	for (const [key, b] of Object.entries(buckets)) {
 		const [hourStr, provider, model, tierStr] = key.split('|');
 		const hourMs = Number(hourStr);
 		if (hourMs < coverageStartMs) continue;
 		const daily = hourMs < hourlyCutoff;
 		const start = daily ? Math.floor(hourMs / DAY_MS) * DAY_MS : hourMs;
 		const rowKey = `${start}|${daily ? 'd' : 'h'}|${provider}|${model}`;
-		const c = costOf(resolvePrice(provider, model), Number(tierStr), b);
+		const c = costFor(b, provider, model, Number(tierStr));
 		let row = rows.get(rowKey);
 		if (!row) {
 			row = {
@@ -604,20 +623,17 @@ function buildSnapshot(state, resolvePrice, pricing, nowMs, coverageStartMs) {
 	const all = new Set();
 	for (const [name, span] of Object.entries(ranges)) {
 		const from = currentHour + HOUR_MS - span;
-		const sets = { claude: new Set(), codex: new Set() };
-		for (const [key, b] of Object.entries(state.buckets)) {
+		const sets = Object.fromEntries(providers.map((p) => [p, new Set()]));
+		for (const [key, b] of Object.entries(buckets)) {
 			const [hourStr, provider] = key.split('|');
 			const h = Number(hourStr);
 			if (h < from || h < coverageStartMs) continue;
 			for (const s of b.sessions) sets[provider]?.add(s);
 		}
-		sessionCounts[name] = {
-			claude: sets.claude.size,
-			codex: sets.codex.size,
-			all: sets.claude.size + sets.codex.size
-		};
+		const counts = Object.fromEntries(providers.map((p) => [p, sets[p].size]));
+		sessionCounts[name] = { ...counts, all: Object.values(counts).reduce((a, n) => a + n, 0) };
 	}
-	for (const [key, b] of Object.entries(state.buckets)) {
+	for (const [key, b] of Object.entries(buckets)) {
 		if (Number(key.split('|')[0]) >= coverageStartMs) for (const s of b.sessions) all.add(s);
 	}
 
@@ -625,10 +641,10 @@ function buildSnapshot(state, resolvePrice, pricing, nowMs, coverageStartMs) {
 	const { '24h': sessions24h, ...publicCounts } = sessionCounts;
 	const snapshot = {
 		schemaVersion: SCHEMA_VERSION,
-		deviceId: setting('DEVICE_ID'),
+		deviceId,
 		generatedAt: new Date(nowMs).toISOString(),
 		coverageStart: new Date(coverageStartMs).toISOString(),
-		pricingSource: `litellm@${new Date(pricing.fetchedAt).toISOString().slice(0, 10)}`,
+		pricingSource,
 		hourly,
 		sessionsTotal: all.size,
 		sessionCounts: publicCounts
@@ -675,13 +691,192 @@ function printSummary(snapshot, sessions24h, nowMs) {
 				([m, v]) =>
 					`  ${m.padEnd(28)} ${usd(v.cost).padStart(10)}  ${(v.tokens / 1e6).toFixed(1)}M tok`
 			),
-		`Compare with \`bunx ccusage claude daily\` (Claude Code only) for this device.`
+		...(snapshot.pricingSource === 'cursor'
+			? []
+			: [`Compare with \`bunx ccusage claude daily\` (Claude Code only) for this device.`])
 	];
 	console.error(lines.join('\n'));
 }
 
 // ---------------------------------------------------------------------------
+// Cursor
+//
+// Cursor keeps usage on its servers, per account, so it is read from Cursor's API instead of
+// local logs and sent under its own device id: the same account on two machines is one history.
+
+async function cursorRequest(path, bearer, body, headers = {}) {
+	const res = await fetch(`${CURSOR_API_URL}${path}`, {
+		method: 'POST',
+		headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json', ...headers },
+		body: JSON.stringify(body),
+		// Never forward the key or token to another host.
+		redirect: 'error',
+		signal: AbortSignal.timeout(30_000)
+	});
+	if (!res.ok) {
+		const hint =
+			res.status === 401 || res.status === 403 ? '; check BIG_SPENDER_CURSOR_API_KEY' : '';
+		throw new Error(`Cursor ${path} answered HTTP ${res.status}${hint}`);
+	}
+	const json = await res.json().catch(() => null);
+	if (!json || typeof json !== 'object' || Array.isArray(json)) {
+		throw new Error(`Cursor ${path} answered with something other than a JSON object`);
+	}
+	return json;
+}
+
+/** Trades a Cursor user API key for the short-lived access token its dashboard RPCs accept. */
+async function cursorAccessToken(apiKey) {
+	const { accessToken } = await cursorRequest('/auth/exchange_user_api_key', apiKey, {});
+	if (typeof accessToken !== 'string' || !accessToken) {
+		throw new Error('Cursor did not return an access token for BIG_SPENDER_CURSOR_API_KEY');
+	}
+	return accessToken;
+}
+
+/**
+ * Raw usage events with fromMs <= timestamp < toMs. Cursor gives events no unique id and its pages
+ * can overlap, so instead of paging, a window holding more than one page is split in two.
+ */
+async function cursorEvents(token, fromMs, toMs) {
+	const body = await cursorRequest(
+		'/aiserver.v1.DashboardService/GetFilteredUsageEvents',
+		token,
+		{
+			page: 1,
+			pageSize: CURSOR_PAGE_SIZE,
+			startDate: String(fromMs),
+			endDate: String(toMs - 1)
+		},
+		{ 'connect-protocol-version': '1' }
+	);
+	// Connect leaves out empty fields, so a window without events answers {}.
+	const total = Number(body.totalUsageEventsCount ?? 0);
+	const events = body.usageEventsDisplay ?? [];
+	if (!Number.isSafeInteger(total) || total < 0 || !Array.isArray(events)) {
+		throw new Error('Cursor answered with a usage page in an unexpected shape');
+	}
+	if (total > CURSOR_PAGE_SIZE) {
+		if (toMs - fromMs < 2)
+			throw new Error(`Cursor listed ${total} usage events in one millisecond`);
+		const mid = fromMs + Math.floor((toMs - fromMs) / 2);
+		return [...(await cursorEvents(token, fromMs, mid)), ...(await cursorEvents(token, mid, toMs))];
+	}
+	if (events.length !== total) {
+		log(`warning: Cursor counted ${total} usage events in a window but returned ${events.length}`);
+	}
+	return events.filter((e) => {
+		const ts = Number(e?.timestamp);
+		return ts >= fromMs && ts < toMs;
+	});
+}
+
+const cursorCount = (v) => num(typeof v === 'string' ? Number(v) : v);
+
+/** Cursor model names are free text ("Premium (Codex 5.3)"); the server accepts only slugs. */
+const cursorModel = (name) =>
+	String(name ?? '')
+		.toLowerCase()
+		.replace(/[^a-z0-9._:@-]+/g, '-')
+		.replace(/^-+|-+$/g, '')
+		.slice(0, 100) || 'unknown';
+
+/**
+ * One usage event as tokens and Cursor's own price, or null for events without token counts:
+ * Cursor billed per request before mid-2025, and some free-credit events report no tokens.
+ */
+function parseCursorEvent(raw) {
+	const u = raw?.tokenUsage;
+	if (!u || typeof u !== 'object') return null;
+	const ts = Number(raw.timestamp);
+	const t = {
+		input: cursorCount(u.inputTokens),
+		cacheRead: cursorCount(u.cacheReadTokens),
+		cacheWrite: cursorCount(u.cacheWriteTokens),
+		output: cursorCount(u.outputTokens)
+	};
+	if (!Number.isFinite(ts) || t.input + t.cacheRead + t.cacheWrite + t.output === 0) return null;
+	const conversation = typeof raw.conversationId === 'string' ? raw.conversationId : '';
+	return {
+		ts,
+		model: cursorModel(raw.model),
+		session: conversation && conversation !== 'null' ? shortHash(`cursor:${conversation}`) : null,
+		...t,
+		usd: cursorCount(u.totalCents) / 100
+	};
+}
+
+// Cursor reports one price per event. It is split over the token types in these proportions
+// (typical API price ratios) so the cost-by-type breakdown has something to show; the total is
+// always Cursor's.
+const CURSOR_PRICE_RATIO = { input: 1, cacheRead: 0.1, cacheWrite: 1.25, output: 5 };
+
+/** @returns {Record<string, Bucket>} */
+function cursorBuckets(events) {
+	/** @type {Record<string, Bucket>} */
+	const buckets = {};
+	const w = CURSOR_PRICE_RATIO;
+	for (const e of events) {
+		const key = bucketKey(Math.floor(e.ts / HOUR_MS) * HOUR_MS, 'cursor', e.model, 0);
+		const b = (buckets[key] ??= {
+			input: 0,
+			cacheRead: 0,
+			cacheWrite5m: 0,
+			cacheWrite1h: 0,
+			output: 0,
+			sessions: [],
+			cost: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, savings: 0 }
+		});
+		b.input += e.input;
+		b.cacheRead += e.cacheRead;
+		b.cacheWrite5m += e.cacheWrite;
+		b.output += e.output;
+		if (e.session && !b.sessions.includes(e.session)) b.sessions.push(e.session);
+		const unit =
+			e.usd /
+			(e.input * w.input +
+				e.cacheRead * w.cacheRead +
+				e.cacheWrite * w.cacheWrite +
+				e.output * w.output);
+		b.cost.input += e.input * w.input * unit;
+		b.cost.cacheRead += e.cacheRead * w.cacheRead * unit;
+		b.cost.cacheWrite += e.cacheWrite * w.cacheWrite * unit;
+		b.cost.output += e.output * w.output * unit;
+		b.cost.savings += e.cacheRead * (w.input - w.cacheRead) * unit;
+	}
+	return buckets;
+}
+
+/**
+ * The Cursor account's snapshot. Until a backfill has been posted it covers all history;
+ * after that the same 90 days as the device snapshot, since the server keeps older days.
+ */
+async function cursorSnapshot(apiKey, backfill, nowMs, coverageStartMs) {
+	const token = await cursorAccessToken(apiKey);
+	const raw = await cursorEvents(token, backfill ? CURSOR_EARLIEST_MS : coverageStartMs, nowMs + 1);
+	const events = raw.map(parseCursorEvent).filter((e) => e !== null);
+	let firstMs = coverageStartMs;
+	for (const e of events) firstMs = Math.min(firstMs, Math.floor(e.ts / DAY_MS) * DAY_MS);
+	return buildSnapshot(cursorBuckets(events), (b) => b.cost, {
+		deviceId: CURSOR_DEVICE_ID,
+		pricingSource: 'cursor',
+		providers: ['claude', 'codex', 'cursor'],
+		nowMs,
+		coverageStartMs: firstMs
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Upload
+
+// fetch quotes the whole header in its error for some of these, which would print the secret.
+function assertHeaderSafe(secret, name) {
+	if (!/^[\x21-\x7e]+$/.test(secret)) {
+		throw new Error(
+			`${name} contains characters that are not allowed in an HTTP header; check it for spaces or a stray newline`
+		);
+	}
+}
 
 async function post(snapshot) {
 	const url = setting('INGEST_URL');
@@ -689,12 +884,7 @@ async function post(snapshot) {
 	if (!url || !token) {
 		throw new Error('BIG_SPENDER_INGEST_URL and BIG_SPENDER_INGEST_TOKEN must be set');
 	}
-	// fetch quotes the whole header in its error for some of these, which would print the token.
-	if (!/^[\x21-\x7e]+$/.test(token)) {
-		throw new Error(
-			'the ingest token contains characters that are not allowed in an HTTP header; check it for spaces or a stray newline'
-		);
-	}
+	assertHeaderSafe(token, 'the ingest token');
 	const body = gzipSync(JSON.stringify(snapshot));
 	let lastErr;
 	for (let attempt = 1; attempt <= POST_ATTEMPTS; attempt++) {
@@ -711,7 +901,9 @@ async function post(snapshot) {
 			});
 			const text = (await res.text()).slice(0, 300);
 			if (res.ok) {
-				log(`posted ${snapshot.hourly.length} rows (${body.length} bytes gzipped): ${text}`);
+				log(
+					`posted ${snapshot.hourly.length} rows for "${snapshot.deviceId}" (${body.length} bytes gzipped): ${text}`
+				);
 				return;
 			}
 			lastErr = new Error(`HTTP ${res.status}: ${text}`);
@@ -755,19 +947,54 @@ async function main() {
 		await scan(state, resolvePrice, coverageStartMs);
 		await saveState(state);
 
-		const { snapshot, sessions24h } = buildSnapshot(
-			state,
-			resolvePrice,
-			pricing,
-			nowMs,
-			coverageStartMs
+		const device = buildSnapshot(
+			state.buckets,
+			(b, provider, model, tier) => costOf(resolvePrice(provider, model), tier, b),
+			{
+				deviceId: setting('DEVICE_ID'),
+				pricingSource: `litellm@${new Date(pricing.fetchedAt).toISOString().slice(0, 10)}`,
+				providers: ['claude', 'codex'],
+				nowMs,
+				coverageStartMs
+			}
 		);
-		if (DRY_RUN) console.log(JSON.stringify(snapshot, null, 2));
-		if (DRY_RUN || SUMMARY_ONLY) {
-			printSummary(snapshot, sessions24h, nowMs);
+		if (SUMMARY_ONLY) {
+			printSummary(device.snapshot, device.sessions24h, nowMs);
 			return;
 		}
-		await post(snapshot);
+
+		// A Cursor failure is held until this device's snapshot is posted, so it never blocks it.
+		const cursorKey = (process.env.BIG_SPENDER_CURSOR_API_KEY ?? '').trim();
+		const backfill = !state.cursorBackfilled;
+		let cursor = null;
+		let cursorError = null;
+		if (cursorKey) {
+			try {
+				assertHeaderSafe(cursorKey, 'BIG_SPENDER_CURSOR_API_KEY');
+				cursor = await cursorSnapshot(cursorKey, backfill, nowMs, coverageStartMs);
+			} catch (err) {
+				cursorError = new Error(`Cursor: ${err?.message ?? err}`);
+			}
+		}
+
+		if (DRY_RUN) {
+			for (const built of [device, cursor]) {
+				if (!built) continue;
+				console.log(JSON.stringify(built.snapshot, null, 2));
+				printSummary(built.snapshot, built.sessions24h, nowMs);
+			}
+			if (cursorError) throw cursorError;
+			return;
+		}
+		await post(device.snapshot);
+		if (cursorError) throw cursorError;
+		if (cursor) {
+			await post(cursor.snapshot);
+			if (backfill) {
+				state.cursorBackfilled = true;
+				await saveState(state);
+			}
+		}
 	} finally {
 		await release();
 	}
