@@ -109,6 +109,8 @@ An older one answers the `cursor` snapshot with `422`. Set it up on one machine 
 npx big-spender install --device laptop --cursor
 ```
 
+Only the account's personal usage is read. Usage billed to a Cursor team is not read yet.
+
 It asks for a Cursor user API key with a hidden prompt (or reads `BIG_SPENDER_CURSOR_API_KEY`) and
 adds it to the env file. Create the key in your Cursor dashboard. Running `install` again without
 `--cursor` keeps the key; with `--cursor` it asks for a new one.

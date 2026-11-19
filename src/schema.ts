@@ -49,28 +49,39 @@ const sessionCount = z.strictObject({
 	all: z.number().int().nonnegative()
 });
 
-export const usageSnapshotSchema = z.strictObject({
-	schemaVersion: z.literal(1),
-	deviceId: z.string().regex(DEVICE_ID),
-	generatedAt: isoDate,
-	coverageStart: isoDate,
-	pricingSource: z
-		.string()
-		.max(80)
-		.regex(/^[A-Za-z0-9@._:/-]+$/),
-	hourly: z.array(usageRowSchema).max(MAX_ROWS),
-	sessionsTotal: z.number().int().nonnegative(),
-	// Distinct sessions per range, counted on the device (session ids are never sent).
-	sessionCounts: z
-		.strictObject({
-			// Sent by older collectors only; accepted and ignored.
-			'24h': sessionCount.optional(),
-			'7d': sessionCount,
-			'30d': sessionCount,
-			'90d': sessionCount
-		})
-		.optional()
-});
+export const usageSnapshotSchema = z
+	.strictObject({
+		schemaVersion: z.literal(1),
+		deviceId: z.string().regex(DEVICE_ID),
+		generatedAt: isoDate,
+		coverageStart: isoDate,
+		pricingSource: z
+			.string()
+			.max(80)
+			.regex(/^[A-Za-z0-9@._:/-]+$/),
+		hourly: z.array(usageRowSchema).max(MAX_ROWS),
+		sessionsTotal: z.number().int().nonnegative(),
+		// Distinct sessions per range, counted on the device (session ids are never sent).
+		sessionCounts: z
+			.strictObject({
+				// Sent by older collectors only; accepted and ignored.
+				'24h': sessionCount.optional(),
+				'7d': sessionCount,
+				'30d': sessionCount,
+				'90d': sessionCount
+			})
+			.optional()
+	})
+	.refine(
+		// Collectors from before the reservation could still report a machine named "cursor".
+		(s) =>
+			s.deviceId !== CURSOR_DEVICE_ID ||
+			(s.pricingSource === 'cursor' && s.hourly.every((r) => r.provider === 'cursor')),
+		{
+			message: `the device id "${CURSOR_DEVICE_ID}" is reserved for Cursor usage`,
+			path: ['deviceId']
+		}
+	);
 
 export type UsageRow = z.infer<typeof usageRowSchema>;
 export type UsageSnapshot = z.infer<typeof usageSnapshotSchema>;

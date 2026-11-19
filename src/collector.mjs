@@ -763,6 +763,10 @@ async function cursorEvents(token, fromMs, toMs) {
 		},
 		{ 'connect-protocol-version': '1' }
 	);
+	// A failed call can still answer 200, with an error body that would read as an empty window.
+	if ('error' in body || 'code' in body || 'message' in body) {
+		throw new Error('Cursor answered with an error instead of usage events');
+	}
 	// Connect leaves out empty fields, so a window without events answers {}.
 	const total = Number(body.totalUsageEventsCount ?? 0);
 	const events = body.usageEventsDisplay ?? [];

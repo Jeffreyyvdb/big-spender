@@ -11,7 +11,7 @@ import { main } from '../src/cli.ts';
 import type { UsageRow, UsageSnapshot } from '../src/schema.ts';
 import { createBigSpender } from '../src/server/index.ts';
 import { createHttpServer } from '../src/serve.ts';
-import { harness, run, seedPricing, withSandbox, type Sandbox } from './helpers.ts';
+import { harness, run, seedPricing, snapshot, withSandbox, type Sandbox } from './helpers.ts';
 
 const COLLECTOR = fileURLToPath(new URL('../src/collector.mjs', import.meta.url));
 const API_KEY = 'key_live_abc';
@@ -41,7 +41,13 @@ function event(
  * How the fake Cursor API misbehaves: the key it accepts, the token it hands out, how many events
  * each page leaves out, and how many extra events the next request counts.
  */
-type FakeCursor = { apiKey: string; accessToken: string; shortBy: number; countBonus: number };
+type FakeCursor = {
+	apiKey: string;
+	accessToken: string;
+	shortBy: number;
+	countBonus: number;
+	errorOnce: boolean;
+};
 
 /** Cursor's API as the collector sees it: a key exchange and one page of up to 1000 events. */
 async function withCursor(
@@ -49,7 +55,13 @@ async function withCursor(
 	fn: (url: string, requests: UsageRequest[], api: FakeCursor) => Promise<void>
 ) {
 	const requests: UsageRequest[] = [];
-	const api: FakeCursor = { apiKey: API_KEY, accessToken: ACCESS_TOKEN, shortBy: 0, countBonus: 0 };
+	const api: FakeCursor = {
+		errorOnce: false,
+		apiKey: API_KEY,
+		accessToken: ACCESS_TOKEN,
+		shortBy: 0,
+		countBonus: 0
+	};
 	const server = createServer(async (req, res) => {
 		let text = '';
 		for await (const chunk of req) text += chunk;
@@ -67,6 +79,10 @@ async function withCursor(
 				req.headers['connect-protocol-version'] !== '1'
 			) {
 				return reply(401, { error: 'no' });
+			}
+			if (api.errorOnce) {
+				api.errorOnce = false;
+				return reply(200, { code: 'unavailable', message: 'upstream error' });
 			}
 			const body = JSON.parse(text);
 			const startDate = Number(body.startDate);
@@ -249,6 +265,18 @@ test('a window holding more than one page is split, and every event counts once'
 					/Cursor counted 2501 usage events in a window but returned 2500 inside it/,
 					'halves that add up to less than the whole fail the read'
 				);
+
+				api.countBonus = -1;
+				const grew = await run(COLLECTOR, ['--dry-run'], collectorEnv(box, ingestUrl, cursorUrl));
+				assert.equal(grew.code, 0, 'events that arrive between the reads are kept');
+				const grown: UsageSnapshot = JSON.parse(
+					grew.stdout.slice(grew.stdout.lastIndexOf('{\n  "schemaVersion"'))
+				);
+				assert.equal(grown.deviceId, 'cursor');
+				assert.equal(
+					grown.hourly.reduce((n, r) => n + r.inputTokens, 0),
+					2500
+				);
 			});
 		});
 	});
@@ -385,6 +413,11 @@ test('a page short of its count, a stale reply or an unsafe token never complete
 				assert.match(invalid.stderr, /Cursor counted 3 usage events in a window but returned 2/);
 				events.pop();
 
+				api.errorOnce = true;
+				const errored = await run(COLLECTOR, [], env);
+				assert.equal(errored.code, 1);
+				assert.match(errored.stderr, /Cursor answered with an error instead of usage events/);
+
 				api.accessToken = 'tok\nsecret-part';
 				const unsafe = await run(COLLECTOR, [], env);
 				assert.equal(unsafe.code, 1);
@@ -478,5 +511,30 @@ test('install and push refuse the cursor device id, and install refuses a key wi
 			2
 		);
 		assert.ok(!existsSync(join(box.env.XDG_CONFIG_HOME, 'big-spender', 'env')));
+	});
+});
+
+test('the server takes only Cursor usage under the cursor device id', async () => {
+	await withSandbox(async (box) => {
+		const bs = createBigSpender({
+			dataDir: join(box.home, 'data'),
+			ingestToken: 'tok',
+			devices: { devices: {} }
+		});
+		const ingest = (snap: UsageSnapshot) =>
+			bs.ingest(
+				new Request('http://localhost/api/usage/ingest', {
+					method: 'POST',
+					headers: { authorization: 'Bearer tok', 'content-type': 'application/json' },
+					body: JSON.stringify(snap)
+				})
+			);
+		assert.equal((await ingest(snapshot('cursor'))).status, 422, 'an older collector named cursor');
+		const cursorOnly = {
+			...snapshot('cursor'),
+			pricingSource: 'cursor',
+			hourly: snapshot('cursor').hourly.map((r) => ({ ...r, provider: 'cursor' as const }))
+		};
+		assert.equal((await ingest(cursorOnly)).status, 200);
 	});
 });
