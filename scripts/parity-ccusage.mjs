@@ -31,10 +31,12 @@ const AGENTS = {
 		outputExcludesReasoning: true,
 		// ccusage keeps an unknown display name as written; the collector fits it to the schema.
 		renameModel: (m) =>
-			m
-				.replace(/[^A-Za-z0-9._:/@-]+/g, '-')
-				.replace(/^-+|-+$/g, '')
-				.slice(0, 100) || 'gemini-internal-model'
+			(!/[\\/]/.test(m) &&
+				m
+					.replace(/[^A-Za-z0-9._:@-]+/g, '-')
+					.replace(/^-+|-+$/g, '')
+					.slice(0, 100)) ||
+			'gemini-internal-model'
 	}
 };
 

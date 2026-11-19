@@ -237,6 +237,23 @@ test('a day whose output with reasoning differs is reported', () => {
 	);
 });
 
+test('a day that only ccusage has, with nothing but reasoning, is reported', () => {
+	const report = withoutReasoning();
+	report.daily!.unshift({
+		date: '2026-11-12',
+		inputTokens: 0,
+		cacheReadTokens: 0,
+		cacheCreationTokens: 0,
+		totalTokens: 7,
+		modelBreakdowns: [{ ...breakdown('opus', 0, 0), outputTokens: 0 }]
+	});
+	const { dayOutputs } = runWithoutReasoning(report);
+	assert.deepEqual(
+		dayOutputs.filter((d) => !d.ok),
+		[{ day: '2026-11-12', ours: 0, theirs: 7, ok: false }]
+	);
+});
+
 test('the other token counts stay exact per row when output is compared per day', () => {
 	const report = withoutReasoning();
 	report.daily![1].modelBreakdowns![0].inputTokens! += 1;

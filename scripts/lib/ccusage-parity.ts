@@ -193,10 +193,16 @@ export function compare(
 		const costDiff = costGap(a.cost, b, a.rows);
 		return { day, ours: a.cost, theirs: b, costDiff, ok: costDiff <= tolerance };
 	});
+	// A day can hold only reasoning, which no ccusage row shows, so days come from both sides.
+	const outputDays = new Set([
+		...ourDay.keys(),
+		...[...(theirs.dayOutput?.keys() ?? [])].filter((day) => day >= fromDay)
+	]);
 	const dayOutputs = theirs.dayOutput
-		? [...ourDay].map(([day, a]) => {
+		? [...outputDays].sort().map((day) => {
+				const ours = ourDay.get(day)?.output ?? 0;
 				const b = theirs.dayOutput!.get(day) ?? null;
-				return { day, ours: a.output, theirs: b, ok: a.output === b };
+				return { day, ours, theirs: b, ok: ours === b };
 			})
 		: [];
 	return { rows, days, dayOutputs };
