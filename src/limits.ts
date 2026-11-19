@@ -17,51 +17,68 @@ const minuteOf = (iso: string) => Math.floor(Date.parse(iso) / MINUTE_MS) * MINU
 // Reports of one window can put its reset seconds apart, across a minute boundary.
 const RESET_SLACK_MS = 2 * MINUTE_MS;
 
+type Tagged = { window: LimitWindow; deviceId?: string };
+
 /**
- * Merges window lists into one record per window instance: same provider and window, with resets
- * at most RESET_SLACK_MS after the earliest reset of the group (rounded down to the minute), which
- * the record keeps. A group keeps the highest peak and the earliest hit, so merging is idempotent
+ * Groups reports into window instances: same provider and window, with resets at most
+ * RESET_SLACK_MS after the earliest reset of the group (rounded down to the minute). Each member's
+ * `resetsAt` is rounded; the first member of a group carries the earliest.
+ */
+function groupWindows(items: Tagged[]): Tagged[][] {
+	const sorted = items
+		.map(({ window: w, deviceId }): Tagged => ({
+			window: { ...w, resetsAt: new Date(minuteOf(w.resetsAt)).toISOString() },
+			deviceId
+		}))
+		.sort(
+			(a, b) =>
+				a.window.provider.localeCompare(b.window.provider) ||
+				a.window.window.localeCompare(b.window.window) ||
+				Date.parse(a.window.resetsAt) - Date.parse(b.window.resetsAt)
+		);
+	const groups: Tagged[][] = [];
+	for (const item of sorted) {
+		const group = groups.at(-1);
+		const first = group?.[0].window;
+		if (
+			group &&
+			first &&
+			first.provider === item.window.provider &&
+			first.window === item.window.window &&
+			Date.parse(item.window.resetsAt) - Date.parse(first.resetsAt) <= RESET_SLACK_MS
+		) {
+			group.push(item);
+		} else {
+			groups.push([item]);
+		}
+	}
+	return groups;
+}
+
+const byTime = (a: string, b: string) => Date.parse(a) - Date.parse(b);
+
+/**
+ * Merges window lists into one record per window instance (see groupWindows), which keeps the
+ * earliest reset. A group keeps the highest peak and the earliest hit, so merging is idempotent
  * and one account's window reported by two devices counts once. Sorted by reset time; past the
  * cap the oldest are dropped.
  */
 export function mergeLimits(...lists: (LimitWindow[] | undefined)[]): LimitWindow[] {
-	const all = lists
-		.flatMap((list) => list ?? [])
-		.map((w): LimitWindow => ({
-			provider: w.provider,
-			window: w.window,
-			resetsAt: new Date(minuteOf(w.resetsAt)).toISOString(),
-			peakPercent: w.peakPercent,
-			...(w.hitAt ? { hitAt: w.hitAt } : {})
-		}))
-		.sort(
-			(a, b) =>
-				a.provider.localeCompare(b.provider) ||
-				a.window.localeCompare(b.window) ||
-				Date.parse(a.resetsAt) - Date.parse(b.resetsAt)
-		);
-	const merged: LimitWindow[] = [];
-	for (const w of all) {
-		const group = merged.at(-1);
-		if (
-			!group ||
-			group.provider !== w.provider ||
-			group.window !== w.window ||
-			Date.parse(w.resetsAt) - Date.parse(group.resetsAt) > RESET_SLACK_MS
-		) {
-			merged.push(w);
-			continue;
-		}
-		const hits = [group.hitAt, w.hitAt].filter((t): t is string => t !== undefined);
-		const hitAt = hits.sort((a, b) => Date.parse(a) - Date.parse(b))[0];
-		merged[merged.length - 1] = {
-			provider: group.provider,
-			window: group.window,
-			resetsAt: group.resetsAt,
-			peakPercent: Math.max(group.peakPercent, w.peakPercent),
+	const groups = groupWindows(lists.flatMap((list) => list ?? []).map((window) => ({ window })));
+	const merged = groups.map((group): LimitWindow => {
+		const { provider, window, resetsAt } = group[0].window;
+		const hitAt = group
+			.map((m) => m.window.hitAt)
+			.filter((t): t is string => t !== undefined)
+			.sort(byTime)[0];
+		return {
+			provider,
+			window,
+			resetsAt,
+			peakPercent: Math.max(...group.map((m) => m.window.peakPercent)),
 			...(hitAt ? { hitAt } : {})
 		};
-	}
+	});
 	const sorted = merged.sort(
 		(a, b) =>
 			Date.parse(a.resetsAt) - Date.parse(b.resetsAt) ||
@@ -69,6 +86,57 @@ export function mergeLimits(...lists: (LimitWindow[] | undefined)[]): LimitWindo
 			a.window.localeCompare(b.window)
 	);
 	return sorted.slice(Math.max(0, sorted.length - MAX_LIMIT_WINDOWS));
+}
+
+export type LimitHitDevice = { deviceId: string; hitAt: string; peakPercent: number };
+
+export type LimitHit = {
+	provider: UsageProvider;
+	window: string;
+	/** Earliest reset of the window instance, as mergeLimits keeps it. */
+	resetsAt: string;
+	/** Earliest hitAt across devices. */
+	hitAt: string;
+	/** Devices that recorded a hit for this instance, earliest first (ties by deviceId). */
+	devices: LimitHitDevice[];
+};
+
+export type LimitHitsReport = { generatedAt: string; hits: LimitHit[] };
+
+/**
+ * Every recorded limit hit with its exact time and the devices that saw it, earliest device
+ * first. Not public: it names devices.
+ */
+export function limitHits(snapshots: UsageSnapshot[], now: number): LimitHitsReport {
+	const groups = groupWindows(
+		snapshots.flatMap((s) => (s.limits ?? []).map((window) => ({ window, deviceId: s.deviceId })))
+	);
+	const hits = groups.flatMap((group): LimitHit[] => {
+		const byDevice = new Map<string, LimitHitDevice>();
+		for (const { window: w, deviceId } of group) {
+			if (!w.hitAt || deviceId === undefined) continue;
+			const seen = byDevice.get(deviceId);
+			byDevice.set(deviceId, {
+				deviceId,
+				hitAt: seen && byTime(seen.hitAt, w.hitAt) <= 0 ? seen.hitAt : w.hitAt,
+				peakPercent: Math.max(seen?.peakPercent ?? 0, w.peakPercent)
+			});
+		}
+		const devices = [...byDevice.values()].sort(
+			(a, b) => byTime(a.hitAt, b.hitAt) || a.deviceId.localeCompare(b.deviceId)
+		);
+		if (!devices.length) return [];
+		const { provider, window, resetsAt } = group[0].window;
+		return [{ provider, window, resetsAt, hitAt: devices[0].hitAt, devices }];
+	});
+	hits.sort(
+		(a, b) =>
+			byTime(a.hitAt, b.hitAt) ||
+			a.provider.localeCompare(b.provider) ||
+			a.window.localeCompare(b.window) ||
+			byTime(a.resetsAt, b.resetsAt)
+	);
+	return { generatedAt: new Date(now).toISOString(), hits };
 }
 
 export type LimitsSeries = {

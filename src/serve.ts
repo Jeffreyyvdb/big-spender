@@ -12,6 +12,7 @@ export type ServeConfig = {
 	host: string;
 	dataDir: string;
 	ingestToken: string | undefined;
+	adminToken: string | undefined;
 	devices: DeviceConfig;
 };
 
@@ -31,6 +32,7 @@ Environment:
   PORT, HOST                     listen address (flags win)
   BIG_SPENDER_DATA_DIR           where per-device snapshots are stored (default ./data)
   BIG_SPENDER_INGEST_TOKEN       bearer token collectors must send; ingest is off without it
+  BIG_SPENDER_ADMIN_TOKEN        bearer token for GET /api/usage/limits/hits; must differ from the ingest token; off without it
   BIG_SPENDER_DEVICES_FILE       JSON device names and colours (see the README)`;
 
 export async function loadServeConfig(
@@ -72,6 +74,7 @@ export async function loadServeConfig(
 		host: values.host ?? env.HOST ?? '0.0.0.0',
 		dataDir: values.data ?? env.BIG_SPENDER_DATA_DIR ?? './data',
 		ingestToken: env.BIG_SPENDER_INGEST_TOKEN?.trim() || undefined,
+		adminToken: env.BIG_SPENDER_ADMIN_TOKEN?.trim() || undefined,
 		devices
 	};
 }
@@ -98,6 +101,10 @@ const routes: Record<string, Route> = {
 			Response.json(await bs.limits(), {
 				headers: { 'cache-control': 'public, max-age=300, stale-while-revalidate=900' }
 			})
+	},
+	'/api/usage/limits/hits': {
+		methods: ['GET', 'HEAD'],
+		handle: (bs, request) => bs.limitHits(request)
 	},
 	'/': {
 		methods: ['GET', 'HEAD'],

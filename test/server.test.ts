@@ -393,3 +393,71 @@ test('saves that overlap still merge one after another', async () => {
 		);
 	});
 });
+
+test('limitHits is off without a distinct admin token and needs the bearer token', async () => {
+	await withTempDir(async (dir) => {
+		const hits = (bs: ReturnType<typeof createBigSpender>, token?: string) =>
+			bs.limitHits(
+				new Request('http://localhost/api/usage/limits/hits', {
+					headers: token ? { authorization: `Bearer ${token}` } : {}
+				})
+			);
+		const limit = (hitAt: string) => ({
+			provider: 'claude' as const,
+			window: 'five_hour',
+			resetsAt: '2026-11-14T20:00:00.000Z',
+			peakPercent: 100,
+			hitAt
+		});
+		const ingestSnapshot = (bs: ReturnType<typeof createBigSpender>, id: string, hitAt: string) =>
+			bs.ingest(postJson({ ...snapshot(id), limits: [limit(hitAt)] }));
+
+		const off = setup(dir);
+		assert.equal((await hits(off, TOKEN)).status, 503);
+		assert.deepEqual(await (await hits(off, TOKEN)).json(), { error: 'admin is not configured' });
+		const blank = createBigSpender({
+			dataDir: dir,
+			ingestToken: TOKEN,
+			adminToken: '  ',
+			devices: DEVICES
+		});
+		assert.equal((await hits(blank, '')).status, 503);
+
+		const same = createBigSpender({
+			dataDir: dir,
+			ingestToken: TOKEN,
+			adminToken: TOKEN,
+			devices: DEVICES
+		});
+		const refused = await hits(same, TOKEN);
+		assert.equal(refused.status, 503);
+		assert.deepEqual(await refused.json(), {
+			error: 'admin token must differ from the ingest token'
+		});
+
+		const bs = createBigSpender({
+			dataDir: dir,
+			ingestToken: TOKEN,
+			adminToken: 'admin-secret',
+			devices: DEVICES
+		});
+		await ingestSnapshot(bs, 'mac', '2026-11-14T17:30:00.000Z');
+		await ingestSnapshot(bs, 'pi', '2026-11-14T17:20:00.000Z');
+		assert.equal((await hits(bs)).status, 401);
+		assert.equal((await hits(bs, 'wrong')).status, 401);
+		assert.equal((await hits(bs, TOKEN)).status, 401);
+
+		const ok = await hits(bs, 'admin-secret');
+		assert.equal(ok.status, 200);
+		assert.equal(ok.headers.get('cache-control'), 'no-store');
+		const body = (await ok.json()) as {
+			hits: { hitAt: string; devices: { deviceId: string }[] }[];
+		};
+		assert.equal(body.hits.length, 1);
+		assert.equal(body.hits[0].hitAt, '2026-11-14T17:20:00.000Z');
+		assert.deepEqual(
+			body.hits[0].devices.map((d) => d.deviceId),
+			['pi', 'mac']
+		);
+	});
+});

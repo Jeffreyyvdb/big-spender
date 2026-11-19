@@ -111,6 +111,7 @@ test('serve config comes from flags, then env, then defaults', async () => {
 			host: '0.0.0.0',
 			dataDir: './data',
 			ingestToken: undefined,
+			adminToken: undefined,
 			devices: { devices: {}, unknownDevices: 'by-id' }
 		});
 
@@ -124,11 +125,13 @@ test('serve config comes from flags, then env, then defaults', async () => {
 			HOST: '127.0.0.1',
 			BIG_SPENDER_DATA_DIR: '/data',
 			BIG_SPENDER_INGEST_TOKEN: ' tok \n',
+			BIG_SPENDER_ADMIN_TOKEN: ' adm \n',
 			BIG_SPENDER_DEVICES_FILE: file
 		};
 		const fromEnv = await loadServeConfig([], env);
 		assert.equal(fromEnv.port, 9000);
 		assert.equal(fromEnv.ingestToken, 'tok');
+		assert.equal(fromEnv.adminToken, 'adm');
 		assert.equal(fromEnv.devices.unknownDevices, 'other');
 
 		const flagged = await loadServeConfig(['--port', '1234', '--host', '::1', '--data', 'x'], env);
@@ -143,5 +146,47 @@ test('bad serve config is rejected', async () => {
 		const file = join(dir, 'devices.json');
 		await writeFile(file, JSON.stringify({ devices: { a: { name: 'A' } } }));
 		await assert.rejects(loadServeConfig(['--devices', file], {}), /invalid devices file/);
+	});
+});
+
+test('GET /api/usage/limits/hits answers admin requests with device-level hits', async () => {
+	await withTempDir(async (dir) => {
+		const bs = createBigSpender({
+			dataDir: dir,
+			ingestToken: TOKEN,
+			adminToken: 'admin-secret',
+			devices: { devices: {}, unknownDevices: 'by-id' }
+		});
+		const server = createHttpServer(bs);
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		try {
+			const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+			await ingest(base, {
+				...snapshot('mac'),
+				limits: [
+					{
+						provider: 'claude',
+						window: 'five_hour',
+						resetsAt: '2026-11-14T20:00:00.000Z',
+						peakPercent: 100,
+						hitAt: '2026-11-14T17:30:00.000Z'
+					}
+				]
+			});
+			assert.equal((await fetch(`${base}/api/usage/limits/hits`)).status, 401);
+			const res = await fetch(`${base}/api/usage/limits/hits`, {
+				headers: { authorization: 'Bearer admin-secret' }
+			});
+			assert.equal(res.status, 200);
+			assert.equal(res.headers.get('cache-control'), 'no-store');
+			const body = (await res.json()) as { hits: { devices: { deviceId: string }[] }[] };
+			assert.equal(body.hits[0].devices[0].deviceId, 'mac');
+			const publicBody = await (await fetch(`${base}/api/usage/limits`)).text();
+			assert.equal(publicBody.includes('"mac"'), false);
+			assert.equal((await fetch(`${base}/api/usage/limits/hits`, { method: 'POST' })).status, 405);
+		} finally {
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
 	});
 });
