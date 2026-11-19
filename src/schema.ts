@@ -15,7 +15,9 @@ const isoDate = z.iso
 
 export const MAX_ROWS = 50_000;
 export const DEVICE_ID = /^[a-z0-9][a-z0-9-]{0,31}$/;
-export const PROVIDERS = ['claude', 'codex'] as const;
+// Collectors send the Cursor account's usage under this id, so no machine may use it.
+export const CURSOR_DEVICE_ID = 'cursor';
+export const PROVIDERS = ['claude', 'codex', 'cursor'] as const;
 // Public ranges. 7d, 30d and 90d are bucketed by UTC day, `all` by ISO week. Nothing is finer
 // than a day: an hourly view would show when each machine is in use.
 export const RANGES = ['7d', '30d', '90d', 'all'] as const;
@@ -42,6 +44,8 @@ export const usageRowSchema = z.strictObject({
 const sessionCount = z.strictObject({
 	claude: z.number().int().nonnegative(),
 	codex: z.number().int().nonnegative(),
+	// Sent by collectors that read Cursor; older ones only know claude and codex.
+	cursor: z.number().int().nonnegative().optional(),
 	all: z.number().int().nonnegative()
 });
 

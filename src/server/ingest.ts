@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { usageSnapshotSchema } from '../schema.ts';
+import { CURSOR_DEVICE_ID, usageSnapshotSchema } from '../schema.ts';
 import type { SnapshotStore } from '../store.ts';
 
 // Collectors POST one device's full snapshot here (optionally gzip-encoded).
@@ -98,7 +98,17 @@ export function createIngest({ store, token, onStored }: IngestOptions) {
 			return Response.json({ error: 'invalid snapshot', issues }, { status: 422 });
 		}
 
-		const result = await store.save(parsed.data);
+		// Checked here, not in the schema: a stored file from before the reservation must still load.
+		const snap = parsed.data;
+		if (
+			snap.deviceId === CURSOR_DEVICE_ID &&
+			(snap.pricingSource !== 'cursor' || snap.hourly.some((r) => r.provider !== 'cursor'))
+		) {
+			const issues = [`deviceId: "${CURSOR_DEVICE_ID}" is reserved for Cursor usage`];
+			return Response.json({ error: 'invalid snapshot', issues }, { status: 422 });
+		}
+
+		const result = await store.save(snap);
 		if (result === 'stored') onStored();
 		return Response.json({
 			ok: true,
