@@ -115,7 +115,6 @@ async function geminiSandbox(fn: (box: Box) => Promise<void>) {
 			const res = await run(COLLECTOR, ['--dry-run'], {
 				...env,
 				BIG_SPENDER_DEVICE_ID: 'laptop',
-				BIG_SPENDER_EXPERIMENTAL: 'gemini',
 				...extraEnv
 			});
 			assert.equal(res.code, 0, res.stderr);
@@ -132,22 +131,6 @@ test('Gemini chats, JSONL sessions and headless stats count as ccusage counts th
 		assertUsage(byDayAndModel(snapshot), EXPECTED);
 		// sess-json-a, sess-jsonl-b, sess-stream-d and the four files without a session id.
 		assert.equal(snapshot.sessionCounts?.['7d']?.gemini, 7);
-	});
-});
-
-test('Gemini is experimental: read only when BIG_SPENDER_EXPERIMENTAL names it', async () => {
-	await geminiSandbox(async ({ collect }) => {
-		const off = await collect({ BIG_SPENDER_EXPERIMENTAL: '' });
-		assert.equal(off.snapshot.hourly.length, 0);
-		assert.equal(off.snapshot.sessionCounts?.['7d']?.gemini, undefined);
-
-		const on = await collect({ BIG_SPENDER_EXPERIMENTAL: 'pi, gemini' });
-		assertUsage(byDayAndModel(on.snapshot), EXPECTED);
-
-		const offAgain = await collect({ BIG_SPENDER_EXPERIMENTAL: '' });
-		assert.equal(offAgain.snapshot.hourly.length, 0);
-		const onAgain = await collect();
-		assertUsage(byDayAndModel(onAgain.snapshot), EXPECTED);
 	});
 });
 
@@ -268,16 +251,6 @@ test('a JSONL correction dated before the window takes the message back', async 
 		);
 		const after = await collect();
 		assert.equal(tokens(first.snapshot) - tokens(after.snapshot), 3040);
-	});
-});
-
-test('turning the source off and on again does not count anything twice', async () => {
-	await geminiSandbox(async ({ tmp, collect }) => {
-		const on = await collect();
-		await collect({ BIG_SPENDER_EXPERIMENTAL: '' });
-		await appendFile(join(tmp, 'project-hash-b/chats/session-b.jsonl'), '\n');
-		const again = await collect();
-		assert.deepEqual(again.snapshot.hourly, on.snapshot.hourly);
 	});
 });
 

@@ -41,7 +41,6 @@ async function collect({ env }: Sandbox, args: string[] = [], extra: Record<stri
 	const res = await run(COLLECTOR, ['--dry-run', ...args], {
 		...env,
 		BIG_SPENDER_DEVICE_ID: 'laptop',
-		BIG_SPENDER_EXPERIMENTAL: 'antigravity',
 		...extra
 	});
 	assert.equal(res.code, 0, res.stderr);
@@ -125,30 +124,6 @@ test('Antigravity usage is counted once per response, per day and model', { skip
 		assert.doesNotMatch(stderr, /empty\.db|conversation_summaries/);
 	});
 });
-
-test(
-	'Antigravity is read and sent only while BIG_SPENDER_EXPERIMENTAL names it',
-	{ skip },
-	async () => {
-		await withSandbox(async (box) => {
-			await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'), PRICES);
-			const { day0 } = buildAntigravityHome(box.home);
-			const off = { BIG_SPENDER_EXPERIMENTAL: 'cursor, pi' };
-
-			const never = await collect(box, [], off);
-			assert.deepEqual(never.snapshot.hourly, []);
-			assert.equal(never.snapshot.sessionCounts?.['7d'].antigravity, undefined);
-			assert.doesNotMatch(never.stderr, /Antigravity/);
-
-			const on = await collect(box, [], { BIG_SPENDER_EXPERIMENTAL: 'pi, antigravity' });
-			assert.deepEqual(tokens(byDayAndModel(on.snapshot, day0)), FIXTURE_TOKENS);
-
-			assert.deepEqual((await collect(box, [], off)).snapshot.hourly, []);
-			const again = await collect(box);
-			assert.deepEqual(again.snapshot.hourly, on.snapshot.hourly);
-		});
-	}
-);
 
 test(
 	'Antigravity cost uses the seeded prices, with reasoning billed as output',
@@ -516,6 +491,45 @@ test('ANTIGRAVITY_DATA_DIR is read after the default roots', { skip }, async () 
 		assert.deepEqual(
 			snapshot.hourly.map((r) => r.inputTokens),
 			[111]
+		);
+	});
+});
+
+test('every T3 Code Antigravity profile is read, also under T3CODE_HOME', { skip }, async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		const ts = Date.now() - DAY_MS;
+		const profile = (t3Home: string, stateDir: string, instance: string) =>
+			join(t3Home, stateDir, 'providers', 'antigravity', instance, 'antigravity-acp');
+		const one = (dir: string, input: number) => {
+			createDatabase(join(dir, 'conversations', `c-${input}.db`), {
+				gens: [
+					[
+						1,
+						generationBlob({ model: 'gemini-3-pro', use: { input, responseId: `r-${input}` }, ts })
+					]
+				]
+			});
+			writeFileSync(join(dir, 'conversation_summaries.db'), 'not sqlite');
+		};
+		const t3 = join(box.home, '.t3');
+		one(profile(t3, 'userdata', 'a'.repeat(64)), 1);
+		one(profile(t3, 'userdata', 'b'.repeat(64)), 10);
+		one(profile(t3, 'dev', 'a'.repeat(64)), 100);
+		const custom = join(box.home, 'custom-t3');
+		one(profile(custom, 'userdata', 'c'.repeat(64)), 1000);
+
+		const defaults = await collect(box);
+		assert.deepEqual(
+			defaults.snapshot.hourly.map((r) => r.inputTokens),
+			[111]
+		);
+		assert.doesNotMatch(defaults.stderr, /skipping unreadable/);
+
+		const withHome = await collect(box, [], { T3CODE_HOME: custom });
+		assert.deepEqual(
+			withHome.snapshot.hourly.map((r) => r.inputTokens),
+			[1111]
 		);
 	});
 });
