@@ -88,6 +88,45 @@ test('a real device id is required to post', async () => {
 	});
 });
 
+test('help and unknown arguments stop before any state is written or anything is posted', async () => {
+	await withSandbox(async ({ env }) => {
+		const cacheDir = join(env.XDG_CACHE_HOME, 'big-spender');
+		await seedPricing(cacheDir);
+		let posts = 0;
+		const server = createServer((req, res) => {
+			posts++;
+			req.resume();
+			req.on('end', () => res.end('{"result":"stored"}'));
+		});
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		try {
+			const ready = {
+				...env,
+				BIG_SPENDER_DEVICE_ID: 'laptop',
+				BIG_SPENDER_INGEST_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}/`,
+				BIG_SPENDER_INGEST_TOKEN: 'tok',
+				BIG_SPENDER_POLL_LIMITS: 'off'
+			};
+			for (const flag of ['--help', '-h']) {
+				const res = await run(COLLECTOR, [flag], ready);
+				assert.equal(res.code, 0, `${flag}: ${res.stderr}`);
+				assert.match(res.stdout, /Usage:.*--dry-run/s, flag);
+			}
+			for (const args of [['--dryrun'], ['--dry-run', '--bogus'], ['laptop']]) {
+				const res = await run(COLLECTOR, args, ready);
+				assert.equal(res.code, 2, `${args.join(' ')} exits 2`);
+				assert.match(res.stderr, new RegExp(`unknown argument: ${args.at(-1)}`));
+				assert.match(res.stderr, /Usage:/);
+			}
+			assert.equal(posts, 0, 'nothing was posted');
+			assert.ok(!existsSync(join(cacheDir, 'state.json')), 'no state was written');
+		} finally {
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
+	});
+});
+
 test('a token that cannot go in an HTTP header fails at once and is never printed', async () => {
 	await withSandbox(async ({ env }) => {
 		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
