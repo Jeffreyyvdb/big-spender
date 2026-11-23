@@ -18,12 +18,11 @@
 //   node collector.mjs --reset      # forget local state and rescan everything
 //
 // Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
-// BIG_SPENDER_CURSOR_API_KEY, BIG_SPENDER_EXPERIMENTAL and BIG_SPENDER_POLL_LIMITS=off (see
-// templates/env.example).
+// BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_POLL_LIMITS=off (see templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, readFileSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import {
 	mkdir,
 	open,
@@ -1360,10 +1359,9 @@ function geminiEvents(path, text, mtimeMs) {
 /**
  * Gemini rewrites its files, so a changed file is read whole and what it counts now replaces
  * what it counted before, as ccusage counts each file as it is. `state.seen` keeps each file's
- * counts per hour, model, tier and session so they can be taken back, also after the file was
- * skipped for a while (an experimental source turned off). A message updated, corrected or
- * removed in the file changes the count with it, and an hour or model it leaves is sent as a
- * zero row.
+ * counts per hour, model, tier and session so they can be taken back. A message updated,
+ * corrected or removed in the file changes the count with it, and an hour or model it leaves is
+ * sent as a zero row.
  * @type {Source['read']}
  */
 async function readGemini(paths, ctx, provider) {
@@ -1530,6 +1528,23 @@ const ANTIGRAVITY_ROOTS = [
 ];
 const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-internal-model';
 
+/**
+ * T3 Code runs Antigravity with a profile per provider instance, named by the instance id's
+ * SHA-256, under the state dir of its home: `userdata`, or `dev` for a development build.
+ */
+function t3AntigravityDirs(t3Home) {
+	return ['userdata', 'dev'].flatMap((stateDir) => {
+		const profiles = join(t3Home, stateDir, 'providers', 'antigravity');
+		let names;
+		try {
+			names = readdirSync(profiles);
+		} catch {
+			return [];
+		}
+		return names.map((name) => join(profiles, name, 'antigravity-acp', 'conversations'));
+	});
+}
+
 const isDir = (path) => {
 	try {
 		return statSync(path).isDirectory();
@@ -1538,12 +1553,14 @@ const isDir = (path) => {
 	}
 };
 
-const antigravityEnvDirs = () =>
-	(process.env.ANTIGRAVITY_DATA_DIR ?? '')
+const antigravityEnvDirs = () => [
+	...(process.env.ANTIGRAVITY_DATA_DIR ?? '')
 		.split(',')
 		.map((root) => root.trim())
 		.filter(Boolean)
-		.map((root) => (isDir(join(root, 'conversations')) ? join(root, 'conversations') : root));
+		.map((root) => (isDir(join(root, 'conversations')) ? join(root, 'conversations') : root)),
+	...(process.env.T3CODE_HOME?.trim() ? t3AntigravityDirs(process.env.T3CODE_HOME.trim()) : [])
+];
 
 function byPathComponents(a, b) {
 	const x = a.split(sep);
@@ -2433,8 +2450,7 @@ async function readOpenCode(paths, ctx, provider) {
  *   paths: string[],
  *   envPaths: () => string[],
  *   read: (paths: string[], ctx: ReadContext, provider: string) => Promise<void>,
- *   priceKeys: (model: string) => string[],
- *   experimental?: boolean
+ *   priceKeys: (model: string) => string[]
  * }} Source
  */
 
@@ -2451,7 +2467,6 @@ async function readOpenCode(paths, ctx, provider) {
  *   data whole on every run and skips what it counted before through `state.seen`, keyed with a
  *   provider prefix and valued with the record's timestamp so pruneState can drop it.
  * - `priceKeys`: the LiteLLM keys to try for a model, in order.
- * - `experimental`: read only when BIG_SPENDER_EXPERIMENTAL names it; see enabledSources.
  *
  * @type {Record<string, Source>}
  */
@@ -2529,14 +2544,15 @@ const SOURCES = {
 		}
 	},
 	antigravity: {
-		experimental: true,
-		paths: ANTIGRAVITY_ROOTS.map((root) => join(HOME, root, 'conversations')),
+		paths: [
+			...ANTIGRAVITY_ROOTS.map((root) => join(HOME, root, 'conversations')),
+			...t3AntigravityDirs(join(HOME, '.t3'))
+		],
 		envPaths: antigravityEnvDirs,
 		read: readAntigravity,
 		priceKeys: antigravityPriceKeys
 	},
 	gemini: {
-		experimental: true,
 		paths: [join(HOME, '.gemini', 'tmp')],
 		envPaths: () =>
 			(process.env.GEMINI_DATA_DIR ?? '')
@@ -2563,16 +2579,6 @@ const SOURCES = {
 		priceKeys: opencodePriceKeys
 	}
 };
-
-// An experimental source has not been checked against real usage yet, so it is read and sent only
-// when BIG_SPENDER_EXPERIMENTAL (comma-separated provider ids) names it. Turned off, its counted rows
-// stay in the state, so turning it on again replaces them instead of counting them twice.
-function enabledSources() {
-	const optIn = new Set(
-		(process.env.BIG_SPENDER_EXPERIMENTAL ?? '').split(',').map((id) => id.trim())
-	);
-	return Object.entries(SOURCES).filter(([id, source]) => !source.experimental || optIn.has(id));
-}
 
 /** @param {[string, Source][]} sources */
 async function scan(state, resolvePrice, cutoffMs, sources, polled) {
@@ -3077,14 +3083,14 @@ async function main() {
 		const resolvePrice = makePriceResolver(pricing.models);
 		const state = await loadState();
 		pruneState(state, coverageStartMs);
-		const sources = enabledSources();
-		const enabled = new Set(sources.map(([id]) => id));
+		const sources = Object.entries(SOURCES);
+		const known = new Set(Object.keys(SOURCES));
 		const polled = await pollLimits(state, nowMs);
 		await scan(state, resolvePrice, coverageStartMs, sources, polled);
 		await saveState(state);
 
 		const buckets = Object.fromEntries(
-			Object.entries(state.buckets).filter(([key]) => enabled.has(key.split('|')[1]))
+			Object.entries(state.buckets).filter(([key]) => known.has(key.split('|')[1]))
 		);
 		const used = new Set(Object.keys(buckets).map((k) => k.split('|')[1]));
 		const device = buildSnapshot(
@@ -3095,7 +3101,7 @@ async function main() {
 				pricingSource: `litellm@${new Date(pricing.fetchedAt).toISOString().slice(0, 10)}`,
 				// Older servers require the claude and codex counts and reject any other key, so another
 				// provider's count is sent only once this device has used it.
-				providers: [...enabled].filter((p) => p === 'claude' || p === 'codex' || used.has(p)),
+				providers: [...known].filter((p) => p === 'claude' || p === 'codex' || used.has(p)),
 				nowMs,
 				coverageStartMs,
 				limits: state.limits

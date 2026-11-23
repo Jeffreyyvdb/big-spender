@@ -10,7 +10,7 @@
 // prices. Token counts must match exactly; cost may differ by --tolerance (default 0.001).
 // Exit code 0 is a match, 1 a mismatch, 2 nothing to compare or a usage error.
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs, promisify } from 'node:util';
@@ -19,7 +19,36 @@ import { ccusageRows, collectorRows, compare } from './lib/ccusage-parity.ts';
 
 const execFileAsync = promisify(execFile);
 
-/** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string, outputExcludesReasoning?: boolean }>} */
+// ccusage knows no T3 Code profile, and its ANTIGRAVITY_DATA_DIR replaces its default roots, so it
+// is given every root the collector reads (ANTIGRAVITY_ROOTS and t3AntigravityDirs in the collector).
+async function antigravityDataDirs(env) {
+	const t3Profiles = async (t3Home) =>
+		(
+			await Promise.all(
+				['userdata', 'dev'].map(async (stateDir) => {
+					const profiles = join(t3Home, stateDir, 'providers', 'antigravity');
+					const names = await readdir(profiles).catch(() => []);
+					return names.map((name) => join(profiles, name, 'antigravity-acp'));
+				})
+			)
+		).flat();
+	const home = env.HOME ?? homedir();
+	return [
+		...[
+			'antigravity',
+			'antigravity-cli',
+			'antigravity-ide',
+			'antigravity-backup',
+			'antigravity-acp'
+		].map((root) => join(home, '.gemini', root)),
+		join(home, '.config', 'antigravity'),
+		...(await t3Profiles(join(home, '.t3'))),
+		...(env.T3CODE_HOME ? await t3Profiles(env.T3CODE_HOME) : []),
+		...(env.ANTIGRAVITY_DATA_DIR ?? '').split(',').filter((dir) => dir.trim())
+	].join(',');
+}
+
+/** @type {Record<string, { agent: string, args?: string[], renameModel?: (ccusageModel: string) => string, outputExcludesReasoning?: boolean, ccusageEnv?: (env: NodeJS.ProcessEnv) => Promise<NodeJS.ProcessEnv> }>} */
 const AGENTS = {
 	claude: { agent: 'claude', args: ['--mode', 'calculate'] },
 	codex: { agent: 'codex' },
@@ -30,6 +59,7 @@ const AGENTS = {
 	antigravity: {
 		agent: 'antigravity',
 		outputExcludesReasoning: true,
+		ccusageEnv: async (env) => ({ ANTIGRAVITY_DATA_DIR: await antigravityDataDirs(env) }),
 		// ccusage keeps an unknown display name as written; the collector fits it to the schema.
 		renameModel: (m) =>
 			(!/[\\/]/.test(m) &&
@@ -98,9 +128,9 @@ try {
 		XDG_CACHE_HOME: cache,
 		BIG_SPENDER_ENV_FILE: join(tmp, 'no-env-file'),
 		BIG_SPENDER_DEVICE_ID: 'parity',
-		BIG_SPENDER_CURSOR_API_KEY: '',
-		BIG_SPENDER_EXPERIMENTAL: provider
+		BIG_SPENDER_CURSOR_API_KEY: ''
 	};
+	const ccusageEnv = { ...base, ...(await mapping.ccusageEnv?.(base)) };
 	const run = async (file, args, env) =>
 		(await execFileAsync(file, args, { env, maxBuffer: 1024 * 1024 * 1024 })).stdout;
 
@@ -121,7 +151,7 @@ try {
 					'--offline',
 					...(mapping.args ?? [])
 				],
-				base
+				ccusageEnv
 			)
 		]);
 		snapshot = JSON.parse(ours);
