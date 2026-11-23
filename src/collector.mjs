@@ -2478,8 +2478,11 @@ const SOURCES = {
 		priceKeys: litellmKeys('anthropic')
 	},
 	codex: {
-		paths: [join(HOME, '.codex', 'sessions')],
-		envPaths: () => fromEnv('CODEX_HOME', 'sessions'),
+		paths: [join(HOME, '.codex', 'sessions'), join(HOME, '.codex', 'archived_sessions')],
+		envPaths: () => [
+			...fromEnv('CODEX_HOME', 'sessions'),
+			...fromEnv('CODEX_HOME', 'archived_sessions')
+		],
 		read: jsonlReader((ctx, file, path) =>
 			codexLineHandler(
 				ctx.state,

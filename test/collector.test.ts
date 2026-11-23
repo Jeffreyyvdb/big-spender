@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -235,6 +235,58 @@ test('a file that a default path and an override both reach goes to the provider
 			r.model
 		]);
 		assert.deepEqual(rows, [['codex', 'gpt-test']]);
+	});
+});
+
+async function writeCodexRollout(dir: string, inputTokens: number) {
+	await mkdir(dir, { recursive: true });
+	const ts = new Date(Date.now() - HOUR_MS).toISOString();
+	const lines = [
+		{ timestamp: ts, type: 'session_meta', payload: { id: 'archived-session' } },
+		{ timestamp: ts, type: 'turn_context', payload: { model: 'gpt-test' } },
+		{
+			timestamp: ts,
+			type: 'event_msg',
+			payload: {
+				type: 'token_count',
+				info: {
+					total_token_usage: { total_tokens: inputTokens + 50 },
+					last_token_usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 50 }
+				}
+			}
+		}
+	];
+	const path = join(dir, 'rollout-2026-11-19T00-00-00-00000000-0000-0000-0000-000000000002.jsonl');
+	await writeFile(path, lines.map((l) => `${JSON.stringify(l)}\n`).join(''));
+	return path;
+}
+
+const codexInput = (snap: { hourly: Array<{ provider: string; inputTokens: number }> }) =>
+	snap.hourly.filter((r) => r.provider === 'codex').reduce((sum, r) => sum + r.inputTokens, 0);
+
+test('archived Codex sessions are counted, under HOME and under CODEX_HOME', async () => {
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		await writeCodexRollout(join(home, '.codex', 'archived_sessions'), 200);
+		assert.equal(codexInput(await dryRun(env)), 200);
+	});
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		const codexHome = join(home, 'codex-home');
+		await writeCodexRollout(join(codexHome, 'archived_sessions'), 300);
+		assert.equal(codexInput(await dryRun({ ...env, CODEX_HOME: codexHome })), 300);
+	});
+});
+
+test('a Codex session archived after it was counted is not counted again', async () => {
+	await withSandbox(async ({ env, home }) => {
+		await seedPricing(join(env.XDG_CACHE_HOME, 'big-spender'));
+		const live = await writeCodexRollout(join(home, '.codex', 'sessions', '2026', '11', '19'), 200);
+		assert.equal(codexInput(await dryRun(env)), 200);
+		const archived = join(home, '.codex', 'archived_sessions');
+		await mkdir(archived, { recursive: true });
+		await rename(live, join(archived, basename(live)));
+		assert.equal(codexInput(await dryRun(env)), 200);
 	});
 });
 
