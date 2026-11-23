@@ -9,13 +9,7 @@
 // and POSTs it as a second snapshot under the device id "cursor".
 //
 // Zero dependencies, Node >= 20 (or Bun). `big-spender install` copies this single file to
-// ~/.local/share/big-spender/collector.mjs and schedules it. See the package README.
-//
-// Usage:
-//   node collector.mjs              # parse new log bytes, POST the snapshot
-//   node collector.mjs --dry-run    # print the snapshot + a 24h summary, no POST
-//   node collector.mjs --summary    # print only the 24h summary
-//   node collector.mjs --reset      # forget local state and rescan everything
+// ~/.local/share/big-spender/collector.mjs and schedules it. See the package README and USAGE below.
 //
 // Env: BIG_SPENDER_DEVICE_ID, BIG_SPENDER_INGEST_URL, BIG_SPENDER_INGEST_TOKEN and optionally
 // BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_POLL_LIMITS=off (see templates/env.example).
@@ -54,10 +48,28 @@ const CURSOR_PAGE_SIZE = 1000;
 // The server's date floor (EARLIEST_DATE in schema.ts); the backfill reads from here.
 const CURSOR_EARLIEST_MS = Date.parse('2020-01-01T00:00:00Z');
 
-const args = new Set(process.argv.slice(2));
-const DRY_RUN = args.has('--dry-run');
-const SUMMARY_ONLY = args.has('--summary');
-const RESET = args.has('--reset');
+const USAGE = `Usage: node collector.mjs [--dry-run | --summary] [--reset]
+
+  (no flag)    read new log data and POST the snapshot
+  --dry-run    print the snapshot and a 24h summary; sends nothing
+  --summary    print only the 24h summary; sends nothing
+  --reset      forget local state and rescan everything
+  -h, --help   print this help`;
+
+// Checked before anything else runs: an ignored typo such as --dryrun would post a real snapshot.
+const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) {
+	console.log(USAGE);
+	process.exit(0);
+}
+const unknown = args.find((a) => !['--dry-run', '--summary', '--reset'].includes(a));
+if (unknown !== undefined) {
+	console.error(`[big-spender] unknown argument: ${unknown}\n\n${USAGE}`);
+	process.exit(2);
+}
+const DRY_RUN = args.includes('--dry-run');
+const SUMMARY_ONLY = args.includes('--summary');
+const RESET = args.includes('--reset');
 
 const HOME = homedir();
 const CACHE_DIR = join(process.env.XDG_CACHE_HOME || join(HOME, '.cache'), 'big-spender');
