@@ -33,8 +33,10 @@ nothing is bucketed finer than a UTC day: 7, 30 and 90 days are per day, all tim
 `unknownDevices` at its default, see [Device names and colours](#device-names-and-colours).
 
 Usage limit windows (see [Usage limits](#usage-limits)) are sent as a window name, its reset time,
-a peak percentage and, when a request was refused, the time of the first refusal. They never name a
-device, and `/api/usage/limits` publishes them per UTC day only.
+a peak percentage, a hashed account id and, when a request was refused, the time of the first
+refusal. The account id is a hash made on the device, so the server can tell two accounts apart
+without learning either. It is stored, never published. `/api/usage/limits` names no device and no
+account, and publishes per UTC day only.
 
 Before the first send you can see exactly what would leave the machine with
 `big-spender push <device> --dry-run`.
@@ -250,8 +252,8 @@ own storage or charts.
 
 ## Usage limits
 
-Besides cost, the collector records when you run out of your Claude and Codex subscription
-allowance, so you can judge whether a plan fits how you work. It reads what the agents write to
+Besides cost, the collector records when you run out of your Claude, Codex and Antigravity
+subscription allowance, so you can judge whether a plan fits how you work. It reads what the agents write to
 their local logs, and it polls their usage endpoints (see [Polling](#polling-usage-endpoints)).
 
 - **Claude Code.** A refused request is logged as an `assistant` line with `error: "rate_limit"`
@@ -273,12 +275,16 @@ their local logs, and it polls their usage endpoints (see [Polling](#polling-usa
   saw, one where several windows stay possible, and any refusal read while polling is off or
   failing. These change nothing.
 
-A record is one window instance, identified by provider, window name and reset time rounded down
-to the minute. Reports whose resets are at most two minutes apart are the same window, because one
+A record is one window instance, identified by provider, account, window name and reset time
+rounded down to the minute. Polls know the account; log lines don't name one, so a logged window
+joins the account whose instance it falls in (the nearest reset within two minutes), and on its own
+it stays a record without an account. Reports whose resets are at most two minutes apart are the same window, because one
 window's reported reset can drift by a few seconds. A push sends at most the 5,000 newest records,
 the most the server accepts. It holds the peak percentage seen and the time of the first refusal. Limits belong
-to the account, not the machine, so merging keeps the highest peak and the earliest refusal, and
-two machines that report the same window count once. Records are kept for 90 days on the collector and up to 5,000 windows on the
+to the account, not the machine, so merging keeps the highest peak and the earliest refusal, two
+machines that report the same window count once, and two accounts whose windows reset at the same
+time count twice. A refused Codex turn names no account, so it changes nothing when windows of two
+Codex accounts were open at the time. Records are kept for 90 days on the collector and up to 5,000 windows on the
 server, like day rows.
 
 `GET /api/usage/limits` returns, for each provider and window over the last 90 UTC days, how many
@@ -292,8 +298,8 @@ shape did not change. `big-spender status` also lists the limits hit in the last
 minute, because that output never leaves the machine.
 
 `GET /api/usage/limits/hits` is the admin view. It needs `Authorization: Bearer <BIG_SPENDER_ADMIN_TOKEN>`
-and returns every recorded hit with its exact `hitAt`, the window's reset and the devices that saw it,
-earliest first. The public endpoint stays day-level with no devices. The admin token must differ from
+and returns every recorded hit with its exact `hitAt`, the window's reset, its hashed `account` when
+one is known, and the devices that saw it, earliest first. The public endpoint stays day-level with no devices. The admin token must differ from
 the ingest token, because every collector machine holds that one. A hit found by polling carries the
 poll time, not the exact refusal time. Two devices that show the same `hitAt` to the millisecond read
 the same log line.
@@ -301,18 +307,29 @@ the same log line.
 ### Polling usage endpoints
 
 Logs only show a limit when a request is refused, which hides how much of a window you leave
-unused. So each run also asks Anthropic and OpenAI how full your windows are right now, the same
-numbers `/usage` in Claude Code and Codex show. Claude is polled at `api.anthropic.com` and Codex at
-`chatgpt.com`, with the login the agent already keeps: `~/.claude/.credentials.json`
-(`$CLAUDE_CONFIG_DIR` if set) and `~/.codex/auth.json` (`$CODEX_HOME` if set). The collector opens
-those files read-only, never refreshes them and sends the token only to that provider. If a token
-has expired, that provider is skipped with one warning until you run the agent again. A missing
-file means that provider is not polled, without a warning. A failed poll never fails the run.
+unused. So each run also asks Anthropic, OpenAI and Google how full your windows are right now, the
+same numbers `/usage` in Claude Code and Codex shows. A failed poll never fails the run.
+
+| Agent       | Endpoint                                                              | Logins read                                                                                                                                                                       |
+| ----------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | `api.anthropic.com`                                                   | `.credentials.json` in `~/.claude`, `$CLAUDE_CONFIG_DIR` and every T3 Code Claude instance's home; the account comes from `.claude.json` beside it                                |
+| Codex       | `chatgpt.com`                                                         | `auth.json` in `~/.codex`, `$CODEX_HOME` and every T3 Code Codex instance's home and shadow home                                                                                  |
+| Antigravity | `cloudcode-pa.googleapis.com` and `daily-cloudcode-pa.googleapis.com` | `antigravity-oauth-token` in the Antigravity data dirs and every T3 Code Antigravity profile, and on Linux the system keyring (`secret-tool`), where the Antigravity CLI keeps it |
+
+T3 Code's homes are read from its `settings.json` (`~/.t3/userdata`, or `$T3CODE_HOME`): an
+instance's home settings and any `CLAUDE_CONFIG_DIR` or `CODEX_HOME` variable it sets. Each
+account is polled once, through the first of its logins with a live token, so the same account in
+two places is not asked twice and a second account is not missed. The collector opens the login
+files read-only, never refreshes them and sends each token only to its provider. An expired token
+is skipped with one warning until the agent runs again; Antigravity's lasts an hour, so it is polled
+only in hours you use Antigravity. A missing file means no poll, without a warning.
 
 Each reading is a peak for the same window record the logs feed. Windows are named `five_hour` and
 `seven_day`, plus one `seven_day_<model>` per model-specific weekly (`seven_day_fable`,
-`seven_day_opus`). Codex's extra limits become `<window>_<limit name>`. Only the window name, reset
-time and percentage are stored or sent.
+`seven_day_opus`). Codex's extra limits become `<window>_<limit name>`. Antigravity's are per model
+group: `five_hour_gemini`, `seven_day_gemini`, and `five_hour_3p` and `seven_day_3p` for the
+Claude and GPT models it serves. An Antigravity window that is not in use yet has no record. Only the
+window name, reset time, percentage and hashed account are stored or sent.
 
 Claude Code logs a refusal of Fable's weekly as `seven_day_overage_included` and labels it "Fable
 limit". The endpoint reports the same limit as `seven_day_fable`, so the collector records those
@@ -320,9 +337,9 @@ refusals as `seven_day_fable`, and they join the polled readings in one record.
 
 To turn polling off, set `BIG_SPENDER_POLL_LIMITS=off` in the env file.
 
-An older server rejects the unknown `limits` field with a 422. The collector and `push` then send
-the snapshot again without it and print a warning on each run, so usage keeps arriving. Upgrade the server to store
-limits.
+An older server rejects an unknown field with a 422: the `account` of a limit window, or the
+`limits` field itself. The collector and `push` then send the snapshot again without it and print
+a warning on each run, so usage keeps arriving. Upgrade the server to store limits per account.
 
 ## Push by hand
 

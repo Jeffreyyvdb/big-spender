@@ -18,7 +18,7 @@ prompt, so neither is written to this machine. Nothing is scheduled.
 --dry-run prints the overview, writes the exact JSON that would be sent to
 $TMPDIR/big-spender-snapshot-<device>.json and never asks for the token. Both modes update the
 collector's local state in ~/.cache/big-spender (which logs were read), never anything remote.
-A server too old to store usage-limit windows gets the snapshot again without them.
+A server too old to store usage-limit windows, or their accounts, gets the snapshot again without them.
 Cursor usage is not part of a push: only the scheduled collector sends it.`;
 
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
@@ -75,7 +75,7 @@ function overview(snapshot: UsageSnapshot, gzipped: number): string[] {
 		...(snapshot.limits
 			? [
 					'',
-					`${snapshot.limits.length} usage-limit windows (name, reset time, peak percent, first block time) are published too.`
+					`${snapshot.limits.length} usage-limit windows (name, reset time, peak percent, first block time) are published too. Their hashed account ids are stored, not published.`
 				]
 			: [])
 	];
@@ -150,19 +150,33 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		);
 	}
 
+	// An older server rejects a key it doesn't know with a 422 naming it: the account of a limit
+	// window, or the limits themselves. Each is dropped in turn. Any other limits error is a real
+	// bug and must not silently drop the windows.
+	let sending = snapshot;
 	let sent = body;
 	let result: string;
-	try {
-		result = await send(ctx, url, token, body);
-	} catch (err) {
-		// A server from before limits existed rejects the unknown key with a 422 naming it. Any
-		// other limits error is a real bug and must not silently drop the windows.
-		const message = err instanceof Error ? err.message : '';
-		if (!snapshot.limits || !/^HTTP 422\b.*Unrecognized key.{0,20}limits/.test(message)) throw err;
-		ctx.err('warning: the server is too old to store limit data; sending usage without it');
-		const { limits: _, ...usageOnly } = snapshot;
-		sent = gzipSync(JSON.stringify(usageOnly));
-		result = await send(ctx, url, token, sent);
+	for (;;) {
+		try {
+			result = await send(ctx, url, token, sent);
+			break;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : '';
+			if (!sending.limits || !/^HTTP 422\b/.test(message)) throw err;
+			if (/limits\.\d+: Unrecognized key.{0,5}account/.test(message)) {
+				ctx.err(
+					'warning: the server is too old to tell accounts apart; sending limits without them'
+				);
+				sending = { ...sending, limits: sending.limits.map(({ account: _, ...w }) => w) };
+			} else if (/Unrecognized key.{0,20}limits/.test(message)) {
+				ctx.err('warning: the server is too old to store limit data; sending usage without it');
+				const { limits: _, ...usageOnly } = sending;
+				sending = usageOnly;
+			} else {
+				throw err;
+			}
+			sent = gzipSync(JSON.stringify(sending));
+		}
 	}
 	ctx.out(`posted ${snapshot.hourly.length} rows (${sent.length} bytes gzipped): ${result}`);
 	return 0;

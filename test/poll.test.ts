@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { run, seedPricing, withSandbox, type Sandbox } from './helpers.ts';
 
@@ -14,15 +15,17 @@ const iso = (ms: number) => new Date(ms).toISOString();
 
 type Seen = { path: string; headers: IncomingHttpHeaders };
 type Reply = { status: number; body: unknown };
-type Stub = { claude: Reply; codex: Reply };
+type Stub = { claude: Reply; codex: Reply; agDaily: Reply; agProd: Reply };
 
 /** Both usage endpoints on one loopback server; each test sets what they answer. */
 async function withUsageApi(fn: (api: Stub, seen: Seen[], url: string) => Promise<void>) {
-	const api: Stub = { claude: { status: 200, body: {} }, codex: { status: 200, body: {} } };
+	const ok = () => ({ status: 200, body: {} });
+	const api: Stub = { claude: ok(), codex: ok(), agDaily: ok(), agProd: ok() };
 	const seen: Seen[] = [];
 	const server = createServer((req, res) => {
 		seen.push({ path: String(req.url), headers: req.headers });
-		const reply = req.url?.startsWith('/claude') ? api.claude : api.codex;
+		const route = /^\/(claude|codex|agDaily|agProd)/.exec(String(req.url))?.[1] as keyof Stub;
+		const reply = api[route] ?? api.codex;
 		res.writeHead(reply.status, { 'content-type': 'application/json' });
 		res.end(JSON.stringify(reply.body));
 	});
@@ -57,6 +60,8 @@ async function collect(box: Sandbox, url: string, extra: Record<string, string> 
 		BIG_SPENDER_DEVICE_ID: 'laptop',
 		BIG_SPENDER_CLAUDE_USAGE_URL: `${url}/claude`,
 		BIG_SPENDER_CODEX_USAGE_URL: `${url}/codex`,
+		BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
+		BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${url}/agProd`,
 		...extra
 	});
 	return { ...res, snap: res.code === 0 ? JSON.parse(res.stdout) : null };
@@ -64,6 +69,7 @@ async function collect(box: Sandbox, url: string, extra: Record<string, string> 
 
 type Win = {
 	provider: string;
+	account?: string;
 	window: string;
 	resetsAt: string;
 	peakPercent: number;
@@ -866,5 +872,377 @@ test('a weekly the poll reports as null is not ruled out', async () => {
 			assert.equal(res.code, 0, res.stderr);
 			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
 		});
+	});
+});
+
+// Accounts: each login is polled once per account, wherever it is kept.
+
+async function writeClaudeAccount(dir: string, file: string, accountUuid: string) {
+	await mkdir(dir, { recursive: true });
+	await writeFile(
+		join(dir, file),
+		JSON.stringify({ oauthAccount: { accountUuid, organizationUuid: 'org-1', emailAddress: 'x' } })
+	);
+}
+
+async function writeT3Settings(box: Sandbox, instances: Record<string, unknown>) {
+	await mkdir(join(box.home, '.t3', 'userdata'), { recursive: true });
+	await writeFile(
+		join(box.home, '.t3', 'userdata', 'settings.json'),
+		JSON.stringify({ providerInstances: instances })
+	);
+}
+
+async function writeClaudeHome(dir: string, token: string, expiresAt = Date.now() + HOUR) {
+	await mkdir(dir, { recursive: true });
+	await writeFile(
+		join(dir, '.credentials.json'),
+		JSON.stringify({ claudeAiOauth: validClaude({ accessToken: token, expiresAt }) })
+	);
+}
+
+const accountsOf = (snap: { limits?: Win[] }, provider: string) =>
+	new Set((snap.limits ?? []).filter((w) => w.provider === provider).map((w) => w.account));
+
+test('a T3 Code Claude home signed in to another account is polled too, and its windows stay apart', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeHome(join(box.home, '.claude'), 'token-a');
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const work = join(box.home, 'claude-work');
+		await writeClaudeHome(work, 'token-b');
+		await writeClaudeAccount(work, '.claude.json', 'account-b');
+		await writeT3Settings(box, {
+			claudeWork: { driver: 'claudeAgent', config: { homePath: '~/claude-work' } }
+		});
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = { five_hour: { utilization: 40, resets_at: iso(NEXT_HOUR) } };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(seen.map((s) => s.headers.authorization).sort(), [
+				'Bearer token-a',
+				'Bearer token-b'
+			]);
+			const fiveHours = res.snap.limits.filter((w: Win) => w.window === 'five_hour');
+			assert.equal(fiveHours.length, 2);
+			assert.equal(accountsOf(res.snap, 'claude').size, 2);
+			for (const w of fiveHours) assert.match(w.account, /^[A-Za-z0-9_-]{16}$/);
+			assert.ok(!JSON.stringify(res.snap).includes('account-a'));
+		});
+	});
+});
+
+test('one account in two homes is polled once, through the login that has a live token', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeHome(join(box.home, '.claude'), 'stale', Date.now() - 1000);
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const other = join(box.home, 'claude-other');
+		await writeClaudeHome(other, 'live');
+		await writeClaudeAccount(other, '.claude.json', 'account-a');
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = { five_hour: { utilization: 40, resets_at: iso(NEXT_HOUR) } };
+			const res = await collect(box, url, { CLAUDE_CONFIG_DIR: other });
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(
+				seen.map((s) => s.headers.authorization),
+				['Bearer live']
+			);
+			assert.equal(warnings(res.stderr), 0, res.stderr);
+			assert.equal(res.snap.limits.length, 1);
+		});
+	});
+});
+
+test('CLAUDE_CONFIG_DIR naming the default home reads its login once', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = claudeBody();
+			const res = await collect(box, url, { CLAUDE_CONFIG_DIR: join(box.home, '.claude') });
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 1);
+		});
+	});
+});
+
+test('a T3 Code Codex shadow home with another ChatGPT seat is polled as its own account', async () => {
+	await withSandbox(async (box) => {
+		const seat = (user: string) =>
+			jwt({
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				'https://api.openai.com/auth': { chatgpt_account_user_id: `${user}__acct-123` }
+			});
+		const tokenA = seat('user-a');
+		const tokenB = seat('user-b');
+		await writeCodexLogin(box, tokenA);
+		const shadow = join(box.home, '.codex-t3', 'work');
+		await mkdir(shadow, { recursive: true });
+		await writeFile(
+			join(shadow, 'auth.json'),
+			JSON.stringify({ tokens: { access_token: tokenB, account_id: CODEX_ACCOUNT } })
+		);
+		await writeT3Settings(box, {
+			codexWork: { driver: 'codex', config: { shadowHomePath: '~/.codex-t3/work' } }
+		});
+		await withUsageApi(async (api, seen, url) => {
+			api.codex.body = codexFiveHour(30, NEXT_HOUR + 2 * HOUR);
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 2);
+			assert.equal(res.snap.limits.length, 2);
+			assert.equal(accountsOf(res.snap, 'codex').size, 2);
+			assert.match(res.stderr, /polled codex usage \(account [A-Za-z0-9_-]{6}\): five_hour 30%/);
+		});
+	});
+});
+
+test('a Claude refusal in the logs joins the polled window of its account', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const hitMs = NEXT_HOUR - 3 * HOUR;
+		await writeClaudeLog(box, [refusedClaudeWeekly(hitMs, weeklyResetsAt)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = { limits: [fableWeekly(100)] };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(res.snap.limits.length, 1);
+			assert.equal(res.snap.limits[0].hitAt, iso(hitMs));
+			assert.match(res.snap.limits[0].account, /^[A-Za-z0-9_-]{16}$/);
+		});
+	});
+});
+
+test('a Codex refusal with two accounts open is not blamed on either', async () => {
+	await withSandbox(async (box) => {
+		const seat = (user: string) =>
+			jwt({
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				'https://api.openai.com/auth': { chatgpt_account_user_id: user }
+			});
+		await writeCodexLogin(box, seat('user-a'));
+		const other = join(box.home, 'codex-b');
+		await mkdir(other, { recursive: true });
+		await writeFile(
+			join(other, 'auth.json'),
+			JSON.stringify({ tokens: { access_token: seat('user-b'), account_id: CODEX_ACCOUNT } })
+		);
+		await writeT3Settings(box, {
+			b: { driver: 'codex', environment: [{ name: 'CODEX_HOME', value: other, sensitive: false }] }
+		});
+		await writeCodexLog(box, [sharingRefusal(fiveHourResetsAt - 4 * HOUR)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(100, fiveHourResetsAt);
+			const before = Date.now();
+			const res = await collect(box, url);
+			assert.equal(res.snap.limits.length, 2);
+			for (const w of res.snap.limits) assert.ok(Date.parse(w.hitAt) >= before, w.hitAt);
+		});
+	});
+});
+
+// Antigravity
+
+const AG_TOKEN = 'ya29.antigravity-secret';
+
+const agLogin = (extra: Record<string, unknown> = {}) =>
+	JSON.stringify({
+		token: {
+			access_token: AG_TOKEN,
+			token_type: 'Bearer',
+			refresh_token: 'ag-refresh-secret',
+			expiry: iso(Date.now() + HOUR),
+			...extra
+		},
+		auth_method: 'consumer',
+		id_token_email: 'Someone@Example.com'
+	});
+
+async function writeT3AntigravityLogin(box: Sandbox, text: string, profile = 'p1') {
+	const dir = join(
+		box.home,
+		'.t3',
+		'userdata',
+		'providers',
+		'antigravity',
+		profile,
+		'antigravity-acp'
+	);
+	await mkdir(dir, { recursive: true });
+	await writeFile(join(dir, 'antigravity-oauth-token'), text);
+}
+
+const agBucket = (id: string, window: string, remaining: number | undefined, resetMs: number) => ({
+	bucketId: id,
+	window,
+	resetTime: iso(resetMs),
+	...(remaining === undefined ? {} : { remainingFraction: remaining })
+});
+
+const nowWindow = (minutes: number) => Date.now() + minutes * 60_000;
+
+test('Antigravity quota buckets are polled from both endpoints, the live reading winning', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		await withUsageApi(async (api, seen, url) => {
+			api.agDaily.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-weekly', 'weekly', 0.75, NEXT_HOUR + 48 * HOUR),
+							agBucket('gemini-5h', '5h', undefined, NEXT_HOUR + 2 * HOUR)
+						]
+					}
+				]
+			};
+			api.agProd.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-5h', '5h', 1, nowWindow(300)),
+							agBucket('3p-weekly', 'weekly', 1, nowWindow(10080)),
+							agBucket('3p-5h', '5h', 0.9, NEXT_HOUR + 3 * HOUR)
+						]
+					}
+				]
+			};
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'antigravity'), [
+				['five_hour_3p', iso(NEXT_HOUR + 3 * HOUR), 10, false],
+				['five_hour_gemini', iso(NEXT_HOUR + 2 * HOUR), 100, true],
+				['seven_day_gemini', iso(NEXT_HOUR + 48 * HOUR), 25, false]
+			]);
+			assert.equal(accountsOf(res.snap, 'antigravity').size, 1);
+			assert.deepEqual(seen.map((s) => s.path).sort(), ['/agDaily', '/agProd']);
+			for (const s of seen) {
+				assert.equal(s.headers.authorization, `Bearer ${AG_TOKEN}`);
+				assert.match(String(s.headers['user-agent']), /^antigravity\/hub\/[\d.]+ \(aidev_client;/);
+			}
+			const state = await readFile(
+				join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'),
+				'utf8'
+			);
+			for (const secret of [AG_TOKEN, 'ag-refresh-secret', 'someone@example.com']) {
+				assert.ok(
+					!res.stdout.includes(secret) && !res.stderr.includes(secret) && !state.includes(secret)
+				);
+			}
+		});
+	});
+});
+
+test('two T3 profiles signed in to one Google account are polled once', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin(), 'p1');
+		await writeT3AntigravityLogin(box, agLogin(), 'p2');
+		await withUsageApi(async (api, seen, url) => {
+			api.agDaily.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.5, NEXT_HOUR)] }] };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 2, 'one request per endpoint');
+			assert.equal(res.snap.limits.length, 1);
+		});
+	});
+});
+
+test('an expired Antigravity login sends nothing and warns once', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin({ expiry: iso(Date.now() - 1000) }));
+		await withUsageApi(async (_api, seen, url) => {
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(seen, []);
+			assert.match(res.stderr, /antigravity usage not polled: the login token expired/);
+		});
+	});
+});
+
+test('one Antigravity endpoint failing still records the other', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily = { status: 503, body: {} };
+			api.agProd.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.5, NEXT_HOUR)] }] };
+			const res = await collect(box, url);
+			assert.equal(warnings(res.stderr), 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'antigravity'), [
+				['five_hour_gemini', iso(NEXT_HOUR), 50, false]
+			]);
+		});
+	});
+});
+
+test(
+	'on Linux the Antigravity CLI login is read from the keyring',
+	{ skip: process.platform !== 'linux' },
+	async () => {
+		await withSandbox(async (box) => {
+			const bin = join(box.home, 'bin');
+			await mkdir(bin, { recursive: true });
+			const login = join(box.home, 'keyring-login.json');
+			await writeFile(login, agLogin());
+			await writeFile(
+				join(bin, 'secret-tool'),
+				`#!/bin/sh\n[ "$*" = "lookup service gemini username antigravity" ] && exec cat '${login}'\nexit 1\n`,
+				{ mode: 0o755 }
+			);
+			await withUsageApi(async (api, seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.8, NEXT_HOUR)] }] };
+				const res = await collect(box, url, { PATH: `${bin}:/usr/bin:/bin` });
+				assert.equal(res.code, 0, res.stderr);
+				assert.equal(seen.length, 2);
+				assert.deepEqual(windows(res.snap, 'antigravity'), [
+					['five_hour_3p', iso(NEXT_HOUR), 20, false]
+				]);
+			});
+		});
+	}
+);
+
+test('a server too old for accounts gets the limits again without them', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeT3AntigravityLogin(box, agLogin());
+		const bodies: { limits?: Win[] }[] = [];
+		const ingest = createServer(async (req, res) => {
+			const chunks: Buffer[] = [];
+			for await (const c of req) chunks.push(c as Buffer);
+			const body = JSON.parse(gunzipSync(Buffer.concat(chunks)).toString());
+			bodies.push(body);
+			res.setHeader('content-type', 'application/json');
+			if (body.limits?.some((w: Win) => 'account' in w)) {
+				res.statusCode = 422;
+				res.end(
+					JSON.stringify({
+						error: 'invalid snapshot',
+						issues: ['limits.0: Unrecognized key: "account"']
+					})
+				);
+			} else res.end('{"ok":true}');
+		});
+		await new Promise<void>((resolve) => ingest.listen(0, '127.0.0.1', resolve));
+		try {
+			await withUsageApi(async (api, _seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.5, NEXT_HOUR)] }] };
+				const res = await run(COLLECTOR, [], {
+					...box.env,
+					BIG_SPENDER_DEVICE_ID: 'laptop',
+					BIG_SPENDER_INGEST_URL: `http://127.0.0.1:${(ingest.address() as AddressInfo).port}/`,
+					BIG_SPENDER_INGEST_TOKEN: 'tok',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${url}/agProd`
+				});
+				assert.equal(res.code, 0, res.stderr);
+				assert.match(res.stderr, /too old to tell accounts apart/);
+				assert.equal(bodies.length, 2);
+				assert.deepEqual(
+					bodies[1].limits?.map((w) => [w.provider, w.window, 'account' in w]),
+					[['antigravity', 'five_hour_3p', false]]
+				);
+			});
+		} finally {
+			ingest.closeAllConnections();
+			await new Promise((resolve) => ingest.close(resolve));
+		}
 	});
 });

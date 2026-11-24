@@ -16,7 +16,15 @@
 // The older USAGE_* names are still read when the new one is unset.
 
 import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+	createReadStream,
+	existsSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	statSync
+} from 'node:fs';
 import {
 	mkdir,
 	open,
@@ -153,7 +161,7 @@ async function acquireLock() {
  * session].
  * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]] | [number, Record<string, any>] | (number | string)[]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
- * @typedef {{ provider: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
+ * @typedef {{ provider: string, account?: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
  * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
  * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
  * account's full history. Hashed, because an ingest URL can carry a credential.
@@ -265,9 +273,11 @@ function pruneState(state, cutoffMs) {
 }
 
 // Same rule as mergeLimits in src/limits.ts (this file ships alone, so it cannot import it): one
-// record per window instance, highest peak, earliest hit. Reports of one window can put its reset
-// seconds apart, across a minute boundary, so a reset within RESET_SLACK_MS of a known one of the
-// same window is that one, and the record keeps the earlier reset.
+// record per window instance and account, highest peak, earliest hit. Reports of one window can
+// put its reset seconds apart, across a minute boundary, so a reset within RESET_SLACK_MS of a
+// known one of the same window is that one, and the record keeps the earlier reset. Log lines name
+// no account: a record without one joins the nearest record of any account, and a record with an
+// account takes in the records without one.
 const MINUTE_MS = 60_000;
 const RESET_SLACK_MS = 2 * MINUTE_MS;
 // Times outside this range are malformed (milliseconds read as seconds, say) and are skipped,
@@ -280,9 +290,10 @@ const LIMIT_TIMES_TO = Date.parse('2100-01-01T00:00:00Z');
 const plausibleTime = (ms) => ms >= LIMIT_TIMES_FROM && ms < LIMIT_TIMES_TO;
 
 /**
- * Returns the window name and reset time the record ended up with, or nothing when it was rejected.
+ * Returns the window name, reset time and account the record ended up with, or nothing when it
+ * was rejected.
  * @param {State} state
- * @param {{ provider: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
+ * @param {{ provider: string, account?: string, window: string, resetsAtMs: number, percent: number, hitMs?: number }} w
  */
 function addLimit(state, w) {
 	const { window } = w;
@@ -290,27 +301,31 @@ function addLimit(state, w) {
 	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(window)) return;
 	if (w.hitMs !== undefined && !plausibleTime(w.hitMs)) return;
 	state.limits ??= {};
-	let prev;
-	for (const [key, l] of Object.entries(state.limits)) {
-		const gap = Math.abs(Date.parse(l.resetsAt) - resetsAtMs);
-		if (l.provider !== w.provider || l.window !== window || gap > RESET_SLACK_MS) continue;
-		if (prev && gap >= Math.abs(Date.parse(prev[1].resetsAt) - resetsAtMs)) continue;
-		prev = [key, l];
-	}
-	if (prev) {
-		delete state.limits[prev[0]];
-		resetsAtMs = Math.min(resetsAtMs, Date.parse(prev[1].resetsAt));
-	}
-	const hits = [prev?.[1].hitAt && Date.parse(prev[1].hitAt), w.hitMs].filter(Number.isFinite);
+	const near = Object.entries(state.limits)
+		.map(([key, l]) => ({ key, l, gap: Math.abs(Date.parse(l.resetsAt) - resetsAtMs) }))
+		.filter(
+			({ l, gap }) => l.provider === w.provider && l.window === window && gap <= RESET_SLACK_MS
+		)
+		.sort((a, b) => a.gap - b.gap);
+	let account = w.account;
+	if (!account) account = near.find(({ l }) => l.account)?.l.account;
+	const same = near.filter(({ l }) => !l.account || l.account === account);
+	for (const { key } of same) delete state.limits[key];
+	resetsAtMs = Math.min(resetsAtMs, ...same.map(({ l }) => Date.parse(l.resetsAt)));
+	const hits = [...same.map(({ l }) => l.hitAt && Date.parse(l.hitAt)), w.hitMs].filter(
+		Number.isFinite
+	);
 	const percent = Math.min(100, Math.max(0, w.percent));
-	state.limits[`${w.provider}|${window}|${resetsAtMs}`] = {
+	const key = `${w.provider}|${window}|${resetsAtMs}${account ? `|${account}` : ''}`;
+	state.limits[key] = {
 		provider: w.provider,
+		...(account ? { account } : {}),
 		window,
 		resetsAt: new Date(resetsAtMs).toISOString(),
-		peakPercent: Math.max(prev?.[1].peakPercent ?? 0, percent),
+		peakPercent: Math.max(percent, ...same.map(({ l }) => l.peakPercent)),
 		...(hits.length ? { hitAt: new Date(Math.min(...hits)).toISOString() } : {})
 	};
-	return { window, resetsAtMs };
+	return { window, resetsAtMs, account };
 }
 
 // Claude Code logs Fable's weekly as seven_day_overage_included and labels it "Fable limit". The
@@ -383,11 +398,14 @@ function codexWindowMs(window) {
 // the poll read both Codex windows, every limit it reports had an instance on file at ts, and
 // exactly one is not ruled out. polled holds this run's Codex poll readings; it is empty when
 // the poll was off or failed. Runs after the whole scan, once every log reading is on file.
+// A refusal names no account either, so with two Codex accounts open or polled it changes nothing.
 function codexRefusal(state, ts, polled) {
 	const open = Object.values(state.limits ?? {}).filter((l) => {
 		const resetsAtMs = Date.parse(l.resetsAt);
 		return l.provider === 'codex' && ts > resetsAtMs - codexWindowMs(l.window) && ts <= resetsAtMs;
 	});
+	const accounts = new Set([...open, ...polled].map((l) => l.account).filter(Boolean));
+	if (accounts.size > 1) return;
 	const full = open.filter((l) => l.peakPercent >= 100);
 	const readBelowFull = (l) =>
 		polled.some(
@@ -407,6 +425,7 @@ function codexRefusal(state, ts, polled) {
 	for (const l of blockers) {
 		addLimit(state, {
 			provider: 'codex',
+			account: l.account,
 			window: l.window,
 			resetsAtMs: Date.parse(l.resetsAt),
 			percent: 100,
@@ -491,24 +510,220 @@ function codexWindows(body, nowMs) {
 	return out;
 }
 
-// The access token is a JWT; its payload says when it expires. One that can't be decoded is sent
-// anyway and the endpoint decides.
-function jwtExpiresMs(token) {
+function jwtClaims(token) {
 	try {
-		const exp = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).exp;
-		return typeof exp === 'number' ? exp * 1000 : NaN;
+		return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
 	} catch {
-		return NaN;
+		return undefined;
 	}
 }
 
-// headers() returns the request headers, or a string saying why this provider is skipped.
+// The access token is a JWT; its payload says when it expires. One that can't be decoded is sent
+// anyway and the endpoint decides.
+function jwtExpiresMs(token) {
+	const exp = jwtClaims(token)?.exp;
+	return typeof exp === 'number' ? exp * 1000 : NaN;
+}
+
+// A login file that is missing is no login; one that can't be parsed is an error. JSON.parse quotes
+// part of the text in its error, which here would be a token, so its message is dropped.
+function readLogin(path) {
+	let text;
+	try {
+		text = readFileSync(path, 'utf8');
+	} catch {
+		return undefined;
+	}
+	try {
+		return JSON.parse(text);
+	} catch {
+		throw new Error('could not read the login file');
+	}
+}
+
+function readJsonQuiet(path) {
+	try {
+		return JSON.parse(readFileSync(path, 'utf8'));
+	} catch {
+		return undefined;
+	}
+}
+
+// T3 Code can give a Claude or Codex provider instance its own home (CLAUDE_CONFIG_DIR or
+// CODEX_HOME), set as a setting or as an environment variable of the instance, and a Codex
+// instance a shadow home that holds only its login. Each may be signed in to another account.
+// They are in its settings, under the state dir of its home.
+const T3_HOME_VARIABLES = { claudeAgent: 'CLAUDE_CONFIG_DIR', codex: 'CODEX_HOME' };
+
+function t3InstanceHomes(driver) {
+	const t3Homes = [join(HOME, '.t3'), process.env.T3CODE_HOME?.trim()].filter(Boolean);
+	return t3Homes.flatMap((t3Home) =>
+		['userdata', 'dev'].flatMap((stateDir) => {
+			const settings = readJsonQuiet(join(t3Home, stateDir, 'settings.json'));
+			const instances = Object.values(settings?.providerInstances ?? {});
+			return instances
+				.filter((i) => i?.driver === driver)
+				.flatMap((i) => [
+					i.config?.homePath,
+					i.config?.shadowHomePath,
+					...(Array.isArray(i.environment) ? i.environment : [])
+						.filter((v) => v?.name === T3_HOME_VARIABLES[driver])
+						.map((v) => v.value)
+				])
+				.filter((p) => typeof p === 'string' && p.trim())
+				.map((p) => resolve(HOME, expandHome(p.trim())));
+		})
+	);
+}
+
+const DEFAULT_CLAUDE_HOME = join(HOME, '.claude');
+
+// Claude Code keeps the signed-in account in .claude.json: inside CLAUDE_CONFIG_DIR, or next to
+// ~/.claude for the default home. Limits belong to the organization's plan, so both ids count.
+function claudeAccount(home) {
+	const files = [join(home, '.claude.json')];
+	if (home === DEFAULT_CLAUDE_HOME) files.push(join(HOME, '.claude.json'));
+	for (const file of files) {
+		const a = readJsonQuiet(file)?.oauthAccount;
+		if (typeof a?.accountUuid === 'string' && a.accountUuid) {
+			return `${a.accountUuid}/${a.organizationUuid ?? ''}`;
+		}
+	}
+	return undefined;
+}
+
+// The ChatGPT access token names the user within the workspace; limits are per seat.
+function codexAccount(tokens) {
+	const auth =
+		typeof tokens?.access_token === 'string'
+			? jwtClaims(tokens.access_token)?.['https://api.openai.com/auth']
+			: undefined;
+	if (typeof auth?.chatgpt_account_user_id === 'string') return auth.chatgpt_account_user_id;
+	if (typeof auth?.chatgpt_account_id === 'string' && typeof auth.chatgpt_user_id === 'string') {
+		return `${auth.chatgpt_account_id}/${auth.chatgpt_user_id}`;
+	}
+	return typeof tokens?.account_id === 'string' && tokens.account_id
+		? tokens.account_id
+		: undefined;
+}
+
+// The Antigravity CLI keeps its Google login as JSON in antigravity-oauth-token in its data dir,
+// or, when that file is absent, in the system keyring (go-keyring: service "gemini", user
+// "antigravity"). T3 Code keeps one per profile.
+const ANTIGRAVITY_TOKEN_FILE = 'antigravity-oauth-token';
+
+function antigravityLogin(text) {
+	let login;
+	try {
+		login = JSON.parse(decodeGoKeyring(text));
+	} catch {
+		throw new Error('could not read the login');
+	}
+	const email = login?.id_token_email;
+	return {
+		creds: login,
+		account: typeof email === 'string' && email ? email.trim().toLowerCase() : undefined
+	};
+}
+
+// go-keyring stores UTF-8 as is on Linux, and prefixed and encoded on macOS.
+function decodeGoKeyring(text) {
+	if (text.startsWith('go-keyring-base64:'))
+		return Buffer.from(text.slice(18), 'base64').toString();
+	if (text.startsWith('go-keyring-encoded:')) return Buffer.from(text.slice(19), 'hex').toString();
+	return text;
+}
+
+// Only on Linux: macOS would show a keychain prompt on every hourly run.
+function antigravityKeyring() {
+	if (process.platform !== 'linux') return undefined;
+	const res = spawnSync('secret-tool', ['lookup', 'service', 'gemini', 'username', 'antigravity'], {
+		encoding: 'utf8',
+		timeout: 5_000,
+		stdio: ['ignore', 'pipe', 'ignore']
+	});
+	return res.status === 0 && res.stdout.trim() ? res.stdout.trim() : undefined;
+}
+
+const antigravityTokenFiles = () =>
+	[
+		...ANTIGRAVITY_ROOTS.map((root) => join(HOME, root)),
+		...(process.env.ANTIGRAVITY_DATA_DIR ?? '')
+			.split(',')
+			.map((root) => root.trim())
+			.filter(Boolean),
+		...t3AntigravityProfiles(join(HOME, '.t3')),
+		...(process.env.T3CODE_HOME?.trim()
+			? t3AntigravityProfiles(process.env.T3CODE_HOME.trim())
+			: [])
+	].map((dir) => join(dir, ANTIGRAVITY_TOKEN_FILE));
+
+const ANTIGRAVITY_WINDOWS = { '5h': ['five_hour', 300], weekly: ['seven_day', 10080] };
+
+// Buckets are grouped by model family (gemini, 3p for Claude and GPT), each with a 5-hour and a
+// weekly window. The first endpoint that reports a bucket in use wins.
+function antigravityWindows(bodies, nowMs) {
+	const out = new Map();
+	for (const body of bodies) {
+		const groups = Array.isArray(body.groups) ? body.groups : [];
+		const buckets = [
+			...groups.flatMap((g) => (Array.isArray(g?.buckets) ? g.buckets : [])),
+			...(Array.isArray(body.buckets) ? body.buckets : [])
+		];
+		for (const b of buckets) {
+			const known = ANTIGRAVITY_WINDOWS[b?.window];
+			if (!known || b.disabled || typeof b.bucketId !== 'string') continue;
+			const [base, minutes] = known;
+			const family = slug(b.bucketId.replace(/[-_](5h|weekly)$/, ''));
+			const window = `${base}_${family}`.slice(0, 40);
+			const resetsAtMs = Date.parse(b.resetTime);
+			if (!family || out.has(window) || !Number.isFinite(resetsAtMs)) continue;
+			// Protobuf's JSON leaves out a zero, so a bucket without remainingFraction is used up.
+			const remaining = typeof b.remainingFraction === 'number' ? b.remainingFraction : 0;
+			// A window not in use reports its reset one window length from now; it has no instance.
+			const idle =
+				remaining >= 1 && Math.abs(resetsAtMs - nowMs - minutes * MINUTE_MS) <= RESET_SLACK_MS;
+			if (idle) continue;
+			out.set(window, {
+				window,
+				percent: Math.round((1 - Math.min(1, Math.max(0, remaining))) * 1e6) / 1e4,
+				resetsAtMs
+			});
+		}
+	}
+	return [...out.values()];
+}
+
+// Without this agent string the endpoint answers 403, and without its version and aidev_client
+// part it leaves out the Gemini buckets.
+const ANTIGRAVITY_USER_AGENT = `antigravity/hub/2.24.0 (aidev_client; os_type=${process.platform}; arch=${process.arch})`;
+const ANTIGRAVITY_QUOTA = 'v1internal:retrieveUserQuotaSummary';
+
+/**
+ * One entry per provider. logins() lists every login on this machine as { source, load }, where
+ * load() returns { creds, account? } or nothing when there is no login there. The same account
+ * is polled once, through the first of its logins that works. headers() returns the request
+ * headers, or a string saying why the login is skipped. windows() reads the answers of the
+ * endpoints that replied, in endpoint order.
+ */
 const LIMIT_POLLERS = {
 	claude: {
-		credentialsPath: () =>
-			join(process.env.CLAUDE_CONFIG_DIR || join(HOME, '.claude'), '.credentials.json'),
-		url: 'https://api.anthropic.com/api/oauth/usage?skip_spend=1',
-		urlEnv: 'BIG_SPENDER_CLAUDE_USAGE_URL',
+		logins: () =>
+			[process.env.CLAUDE_CONFIG_DIR, DEFAULT_CLAUDE_HOME, ...t3InstanceHomes('claudeAgent')]
+				.filter(Boolean)
+				.map((home) => ({
+					source: join(home, '.credentials.json'),
+					load: () => {
+						const creds = readLogin(join(home, '.credentials.json'));
+						return creds && { creds, account: claudeAccount(home) };
+					}
+				})),
+		endpoints: [
+			{
+				url: 'https://api.anthropic.com/api/oauth/usage?skip_spend=1',
+				urlEnv: 'BIG_SPENDER_CLAUDE_USAGE_URL'
+			}
+		],
 		headers: (creds, nowMs) => {
 			const oauth = creds?.claudeAiOauth;
 			if (typeof oauth?.accessToken !== 'string' || !oauth.accessToken) {
@@ -523,12 +738,22 @@ const LIMIT_POLLERS = {
 				'user-agent': 'big-spender'
 			};
 		},
-		windows: claudeWindows
+		windows: ([body]) => claudeWindows(body)
 	},
 	codex: {
-		credentialsPath: () => join(process.env.CODEX_HOME || join(HOME, '.codex'), 'auth.json'),
-		url: 'https://chatgpt.com/backend-api/wham/usage',
-		urlEnv: 'BIG_SPENDER_CODEX_USAGE_URL',
+		logins: () =>
+			[process.env.CODEX_HOME, join(HOME, '.codex'), ...t3InstanceHomes('codex')]
+				.filter(Boolean)
+				.map((home) => ({
+					source: join(home, 'auth.json'),
+					load: () => {
+						const creds = readLogin(join(home, 'auth.json'));
+						return creds && { creds, account: codexAccount(creds.tokens) };
+					}
+				})),
+		endpoints: [
+			{ url: 'https://chatgpt.com/backend-api/wham/usage', urlEnv: 'BIG_SPENDER_CODEX_USAGE_URL' }
+		],
 		headers: (creds, nowMs) => {
 			const { access_token: token, account_id: accountId } = creds?.tokens ?? {};
 			if (typeof token !== 'string' || !token) return 'not signed in with ChatGPT';
@@ -542,29 +767,69 @@ const LIMIT_POLLERS = {
 				'user-agent': 'big-spender'
 			};
 		},
-		windows: codexWindows
+		windows: ([body], nowMs) => codexWindows(body, nowMs)
+	},
+	antigravity: {
+		logins: () => [
+			...antigravityTokenFiles().map((path) => ({
+				source: path,
+				load: () => {
+					let text;
+					try {
+						text = readFileSync(path, 'utf8');
+					} catch {
+						return undefined;
+					}
+					return antigravityLogin(text);
+				}
+			})),
+			{
+				source: 'keyring',
+				load: () => {
+					const text = antigravityKeyring();
+					return text && antigravityLogin(text);
+				}
+			}
+		],
+		// The daily endpoint has the live numbers for personal accounts; prod for business ones.
+		endpoints: [
+			{
+				url: `https://daily-cloudcode-pa.googleapis.com/${ANTIGRAVITY_QUOTA}`,
+				urlEnv: 'BIG_SPENDER_ANTIGRAVITY_DAILY_URL',
+				method: 'POST'
+			},
+			{
+				url: `https://cloudcode-pa.googleapis.com/${ANTIGRAVITY_QUOTA}`,
+				urlEnv: 'BIG_SPENDER_ANTIGRAVITY_USAGE_URL',
+				method: 'POST'
+			}
+		],
+		headers: (creds, nowMs) => {
+			const token = creds?.token?.access_token;
+			if (typeof token !== 'string' || !token) return 'not signed in with Google';
+			// The agent refreshes this token while it runs; it lasts an hour.
+			if (!(Date.parse(creds.token.expiry ?? '') > nowMs)) {
+				return 'the login token expired; it is renewed when Antigravity next runs';
+			}
+			return {
+				authorization: `Bearer ${token}`,
+				'content-type': 'application/json',
+				'user-agent': ANTIGRAVITY_USER_AGENT
+			};
+		},
+		windows: antigravityWindows
 	}
 };
 
-async function pollLimit(state, provider, poller, nowMs, polled) {
-	const path = poller.credentialsPath();
-	if (!existsSync(path)) return;
-	let creds;
-	try {
-		creds = JSON.parse(readFileSync(path, 'utf8'));
-	} catch {
-		// JSON.parse quotes part of the text in its error, which here would be a token.
-		throw new Error('could not read the login file');
-	}
-	const headers = poller.headers(creds, nowMs);
-	if (typeof headers === 'string') throw new Error(headers);
-	for (const value of Object.values(headers))
-		assertHeaderSafe(value.replace(/^Bearer /, ''), `the ${provider} login token`);
+const SECRET_HEADERS = ['authorization', 'chatgpt-account-id'];
 
+async function fetchUsage(endpoint, headers) {
 	let res;
 	try {
-		res = await fetch(localOverride(poller.urlEnv, poller.url), {
+		res = await fetch(localOverride(endpoint.urlEnv, endpoint.url), {
+			method: endpoint.method ?? 'GET',
 			headers,
+			...(endpoint.method === 'POST' ? { body: '{}' } : {}),
 			redirect: 'error',
 			signal: AbortSignal.timeout(10_000)
 		});
@@ -587,22 +852,62 @@ async function pollLimit(state, provider, poller, nowMs, polled) {
 	if (!body || typeof body !== 'object' || Array.isArray(body)) {
 		throw new Error('the answer was not a JSON object');
 	}
+	return body;
+}
 
-	const seen = [];
-	for (const w of poller.windows(body, nowMs)) {
-		const stored = addLimit(state, {
-			provider,
-			window: w.window,
-			// The Claude endpoint's reset time jitters by a fraction of a second (14:59:59.7 for a
-			// 15:00 reset), and addLimit floors and keeps the earliest, so round to the real minute.
-			resetsAtMs: Math.round(w.resetsAtMs / MINUTE_MS) * MINUTE_MS,
-			percent: w.percent,
-			...(w.percent >= 100 ? { hitMs: nowMs } : {})
-		});
-		if (stored) polled.push({ ...stored, percent: w.percent });
-		seen.push(`${w.window} ${Math.round(w.percent)}%`);
+/** Polls one login and returns what it read; throws when it read nothing. */
+async function pollLogin(poller, creds, nowMs) {
+	const headers = poller.headers(creds, nowMs);
+	if (typeof headers === 'string') throw new Error(headers);
+	for (const name of SECRET_HEADERS) {
+		if (headers[name] !== undefined) {
+			assertHeaderSafe(headers[name].replace(/^Bearer /, ''), 'the login token');
+		}
 	}
-	log(`polled ${provider} usage: ${seen.join(', ') || 'no windows in use'}`);
+	const bodies = [];
+	let firstError;
+	for (const endpoint of poller.endpoints) {
+		try {
+			bodies.push(await fetchUsage(endpoint, headers));
+		} catch (err) {
+			firstError ??= err;
+		}
+	}
+	if (!bodies.length) throw firstError;
+	return poller.windows(bodies, nowMs);
+}
+
+const realPath = (path) => {
+	try {
+		return realpathSync(path);
+	} catch {
+		return path;
+	}
+};
+
+/**
+ * Every login of one provider, grouped by account: a login whose account is unknown is a group
+ * of its own. A login listed twice (CLAUDE_CONFIG_DIR set to ~/.claude, say) is read once.
+ */
+function loginsByAccount(provider, poller) {
+	const groups = new Map();
+	const sources = new Set();
+	for (const { source, load } of poller.logins()) {
+		const path = realPath(source);
+		if (sources.has(path)) continue;
+		sources.add(path);
+		let login;
+		try {
+			login = load();
+		} catch (err) {
+			login = { error: err };
+		}
+		if (!login) continue;
+		const account = login.account ? shortHash(`${provider}-account\0${login.account}`) : undefined;
+		const key = account ?? `login:${path}`;
+		groups.set(key, [...(groups.get(key) ?? []), { ...login, account }]);
+	}
+	return [...groups.values()];
 }
 
 /**
@@ -610,16 +915,44 @@ async function pollLimit(state, provider, poller, nowMs, polled) {
  * Codex readings.
  */
 async function pollLimits(state, nowMs) {
-	/** @type {{ window: string, resetsAtMs: number, percent: number }[]} */
+	/** @type {{ window: string, resetsAtMs: number, account?: string, percent: number }[]} */
 	const polled = [];
 	if (['off', '0', 'false', 'no'].includes(setting('POLL_LIMITS').toLowerCase())) return polled;
 	for (const [provider, poller] of Object.entries(LIMIT_POLLERS)) {
-		const readings = [];
-		try {
-			await pollLimit(state, provider, poller, nowMs, readings);
-			if (provider === 'codex') polled.push(...readings);
-		} catch (err) {
-			log(`warning: ${provider} usage not polled: ${err?.message ?? 'failed'}`);
+		const groups = loginsByAccount(provider, poller);
+		for (const logins of groups) {
+			const { account } = logins[0];
+			const label = groups.length > 1 && account ? ` (account ${account.slice(0, 6)})` : '';
+			let error;
+			for (const login of logins) {
+				try {
+					if (login.error) throw login.error;
+					const windows = await pollLogin(poller, login.creds, nowMs);
+					const seen = [];
+					for (const w of windows) {
+						const stored = addLimit(state, {
+							provider,
+							account,
+							window: w.window,
+							// The Claude endpoint's reset time jitters by a fraction of a second
+							// (14:59:59.7 for a 15:00 reset), and addLimit floors and keeps the earliest,
+							// so round to the real minute.
+							resetsAtMs: Math.round(w.resetsAtMs / MINUTE_MS) * MINUTE_MS,
+							percent: w.percent,
+							...(w.percent >= 100 ? { hitMs: nowMs } : {})
+						});
+						if (stored && provider === 'codex') polled.push({ ...stored, percent: w.percent });
+						seen.push(`${w.window} ${Math.round(w.percent)}%`);
+					}
+					log(`polled ${provider} usage${label}: ${seen.join(', ') || 'no windows in use'}`);
+					error = undefined;
+					break;
+				} catch (err) {
+					error ??= err;
+				}
+			}
+			if (error)
+				log(`warning: ${provider} usage${label} not polled: ${error?.message ?? 'failed'}`);
 		}
 	}
 	return polled;
@@ -1544,7 +1877,7 @@ const ANTIGRAVITY_DEFAULT_MODEL = 'gemini-internal-model';
  * T3 Code runs Antigravity with a profile per provider instance, named by the instance id's
  * SHA-256, under the state dir of its home: `userdata`, or `dev` for a development build.
  */
-function t3AntigravityDirs(t3Home) {
+function t3AntigravityProfiles(t3Home) {
 	return ['userdata', 'dev'].flatMap((stateDir) => {
 		const profiles = join(t3Home, stateDir, 'providers', 'antigravity');
 		let names;
@@ -1553,9 +1886,12 @@ function t3AntigravityDirs(t3Home) {
 		} catch {
 			return [];
 		}
-		return names.map((name) => join(profiles, name, 'antigravity-acp', 'conversations'));
+		return names.map((name) => join(profiles, name, 'antigravity-acp'));
 	});
 }
+
+const t3AntigravityDirs = (t3Home) =>
+	t3AntigravityProfiles(t3Home).map((profile) => join(profile, 'conversations'));
 
 const isDir = (path) => {
 	try {
@@ -3011,15 +3347,21 @@ function assertHeaderSafe(secret, name) {
 	}
 }
 
-// The 422 a server without limit support sends: its strict schema names the key it doesn't know.
-// Any other limits error is a real bug and must not silently drop the windows.
+// The 422s an older server sends: its strict schema names the key it doesn't know. Any other
+// limits error is a real bug and must not silently drop the windows.
 const OLD_SERVER_422 = /Unrecognized key.{0,20}limits/;
+const NO_ACCOUNTS_422 = /limits\.\d+: Unrecognized key.{0,5}account/;
 
 async function post(snapshot) {
 	try {
 		return await postOnce(snapshot);
 	} catch (err) {
-		if (err.status !== 422 || !snapshot.limits || !OLD_SERVER_422.test(err.message)) throw err;
+		if (err.status !== 422 || !snapshot.limits) throw err;
+		if (NO_ACCOUNTS_422.test(err.message)) {
+			log('warning: the server is too old to tell accounts apart; sending limits without them');
+			return await post({ ...snapshot, limits: snapshot.limits.map(({ account, ...w }) => w) });
+		}
+		if (!OLD_SERVER_422.test(err.message)) throw err;
 		log('warning: the server is too old to store limit data; sending usage without it');
 		const { limits, ...usageOnly } = snapshot;
 		return await postOnce(usageOnly);

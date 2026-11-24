@@ -245,3 +245,76 @@ test('a token that cannot go in an HTTP header fails at once and is never printe
 		});
 	});
 });
+
+test('an older server gets the limits without accounts, and one older still gets none', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeLog(box, 'claude-test-model');
+		const profile = join(
+			box.home,
+			'.t3',
+			'userdata',
+			'providers',
+			'antigravity',
+			'p1',
+			'antigravity-acp'
+		);
+		await mkdir(profile, { recursive: true });
+		const expiry = new Date(Date.now() + 3_600_000).toISOString();
+		await writeFile(
+			join(profile, 'antigravity-oauth-token'),
+			JSON.stringify({ token: { access_token: 'ag', expiry }, id_token_email: 'a@example.com' })
+		);
+		const resetTime = new Date(Date.now() + 3_600_000).toISOString();
+		const bodies: Record<string, unknown>[] = [];
+		const server = createServer(async (req, res) => {
+			res.setHeader('content-type', 'application/json');
+			if (req.url?.startsWith('/quota')) {
+				res.end(
+					JSON.stringify({
+						buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.5, resetTime }]
+					})
+				);
+				return;
+			}
+			const chunks: Buffer[] = [];
+			for await (const c of req) chunks.push(c as Buffer);
+			const body = JSON.parse(gunzipSync(Buffer.concat(chunks)).toString());
+			bodies.push(body);
+			const issue = !('limits' in body)
+				? null
+				: body.limits.some((w: object) => 'account' in w)
+					? 'limits.0: Unrecognized key: "account"'
+					: '(root): Unrecognized key: "limits"';
+			res.statusCode = issue ? 422 : 200;
+			res.end(
+				JSON.stringify(issue ? { error: 'invalid snapshot', issues: [issue] } : { ok: true })
+			);
+		});
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+		try {
+			const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+			const { ctx, err } = harness(box, {
+				answers: ['y'],
+				env: {
+					BIG_SPENDER_INGEST_URL: `${base}/ingest`,
+					BIG_SPENDER_INGEST_TOKEN: 'tok',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${base}/quota`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${base}/quota`
+				}
+			});
+			assert.equal(await main(['push', 'laptop'], ctx), 0, err.join('\n'));
+			assert.equal(bodies.length, 3);
+			assert.equal((bodies[0].limits as object[]).length, 1);
+			assert.deepEqual(Object.keys((bodies[1].limits as object[])[0]).includes('account'), false);
+			assert.equal('limits' in bodies[2], false);
+			assert.match(
+				err.join('\n'),
+				/too old to tell accounts apart[\s\S]*too old to store limit data/
+			);
+		} finally {
+			server.closeAllConnections();
+			await new Promise((resolve) => server.close(resolve));
+		}
+	});
+});
