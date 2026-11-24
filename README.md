@@ -34,9 +34,31 @@ nothing is bucketed finer than a UTC day: 7, 30 and 90 days are per day, all tim
 
 Usage limit windows (see [Usage limits](#usage-limits)) are sent as a window name, its reset time,
 a peak percentage, a hashed account id and, when a request was refused, the time of the first
-refusal. The account id is a hash made on the device, so the server can tell two accounts apart
-without learning either. It is stored, never published. `/api/usage/limits` names no device and no
-account, and publishes per UTC day only.
+refusal. The account id is an HMAC-SHA-256 made on the device and keyed with your ingest token, cut
+to 16 characters, so the server can tell two accounts apart without learning either. Without the
+token, a leaked copy of the server's data can't be matched against known emails or account ids, and
+the hash never equals another tool's plain hash of the same id. It is stored, never published.
+`/api/usage/limits` names no device and no account, and publishes per UTC day only.
+
+To poll those windows, the collector reads other tools' login files. It opens them read-only and
+never writes or refreshes them:
+
+| Read from                                                                                                        | What it uses                                                                                                                          |
+| ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `~/.claude/.credentials.json`, and the same file in `$CLAUDE_CONFIG_DIR` and each T3 Code Claude instance's home | the Claude Code OAuth access token and its expiry                                                                                     |
+| `~/.claude.json`, or `.claude.json` inside `$CLAUDE_CONFIG_DIR` or an instance's home                            | `oauthAccount.accountUuid` and `organizationUuid`, for the account hash only                                                          |
+| `~/.codex/auth.json`, and the same file in `$CODEX_HOME` and each T3 Code Codex instance's home and shadow home  | the ChatGPT access token, its `account_id`, and from the token's claims the expiry and `chatgpt_account_user_id` for the account hash |
+| T3 Code's `settings.json` in `userdata` and `dev` under `~/.t3` and `$T3CODE_HOME`                               | the home or shadow home of each Claude and Codex provider instance                                                                    |
+| `antigravity-oauth-token` in the Antigravity data dirs and in each T3 Code profile under `providers/antigravity` | the Google access token, its expiry, and the login's email (`id_token_email`) for the account hash                                    |
+| On Linux, also the keyring entry with service `gemini` and user `antigravity`, through `secret-tool`             | the same Antigravity login                                                                                                            |
+
+Each token goes only to its own provider (Anthropic, OpenAI or Google), never to your server or
+anywhere else. Of the account ids, only the keyed hash leaves the machine. `BIG_SPENDER_POLL_LIMITS=off`
+turns all of this off: no file above and no keyring entry is read. With no ingest token in the
+environment or the env file (a `--dry-run`, `--summary`, `big-spender status` or `push` on a
+machine not set up yet) there is no key for the hash, so the collector does not poll at all and
+warns; limits from the logs still come through. A `push` given a different token at its prompt
+sends the limits without accounts, since the hashes were keyed with the other one.
 
 Before the first send you can see exactly what would leave the machine with
 `big-spender push <device> --dry-run`.
@@ -336,6 +358,11 @@ limit". The endpoint reports the same limit as `seven_day_fable`, so the collect
 refusals as `seven_day_fable`, and they join the polled readings in one record.
 
 To turn polling off, set `BIG_SPENDER_POLL_LIMITS=off` in the env file.
+
+The account hash is keyed with `BIG_SPENDER_INGEST_TOKEN`, so every collector of one server must
+use the same token for one account's windows to match across machines. Rotating the token changes
+every account's hash: windows recorded before and after look like two accounts, and a window open
+during the change can count twice. History is not rewritten.
 
 An older server rejects an unknown field with a 422: the `account` of a limit window, or the
 `limits` field itself. The collector and `push` then send the snapshot again without it and print
