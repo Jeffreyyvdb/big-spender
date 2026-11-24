@@ -1246,3 +1246,74 @@ test('a server too old for accounts gets the limits again without them', async (
 		}
 	});
 });
+
+// An idle window: the endpoint reports 0% and a reset one window length from now, on every poll.
+const idleCodexBody = (nowMs: number) => ({
+	rate_limit: {
+		primary_window: {
+			used_percent: 0,
+			limit_window_seconds: 18000,
+			reset_after_seconds: 18000,
+			reset_at: Math.floor(nowMs / 1000) + 18000
+		},
+		secondary_window: {
+			used_percent: 100,
+			limit_window_seconds: 604800,
+			reset_after_seconds: 51976,
+			reset_at: (NEXT_HOUR + 14 * HOUR) / 1000
+		}
+	}
+});
+
+test('an idle Codex window polled every hour records no window instances', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			for (let run = 0; run < 3; run++) {
+				api.codex.body = idleCodexBody(Date.now());
+				const res = await collect(box, url);
+				assert.equal(res.code, 0, res.stderr);
+				assert.deepEqual(windows(res.snap, 'codex'), [
+					['seven_day', iso(NEXT_HOUR + 14 * HOUR), 100, true]
+				]);
+			}
+		});
+	});
+});
+
+test('a Codex window opened ten minutes ago at 0% is read as in use, not idle', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(0, Date.now() + 5 * HOUR - 10 * 60_000);
+			const res = await collect(box, url);
+			assert.match(res.stderr, /polled codex usage: five_hour 0%/);
+		});
+	});
+});
+
+test('idle placeholders an older version stored are not sent', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(40, NEXT_HOUR + 2 * HOUR);
+			assert.equal((await collect(box, url)).code, 0);
+			const statePath = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
+			const state = JSON.parse(await readFile(statePath, 'utf8'));
+			for (const hours of [1, 2, 3]) {
+				const resetsAt = iso(NEXT_HOUR - hours * HOUR + 60_000);
+				state.limits[`codex|five_hour|${Date.parse(resetsAt)}`] = {
+					provider: 'codex',
+					window: 'five_hour',
+					resetsAt,
+					peakPercent: 0
+				};
+			}
+			await writeFile(statePath, JSON.stringify(state));
+			const res = await collect(box, url);
+			assert.deepEqual(windows(res.snap, 'codex'), [
+				['five_hour', iso(NEXT_HOUR + 2 * HOUR), 40, false]
+			]);
+		});
+	});
+});

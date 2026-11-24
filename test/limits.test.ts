@@ -407,3 +407,18 @@ test('the public limits summary names no account', async () => {
 	const { limits } = await limitsOf({ mac: [win({ account: A })] });
 	assert.ok(!JSON.stringify(limits).includes(A));
 });
+
+test('limits() does not count windows that were never used, as older collectors stored them', async () => {
+	const idle = (resetsAt: string) =>
+		win({ window: 'five_hour', resetsAt, peakPercent: 0, hitAt: undefined });
+	const { limits } = await limitsOf({
+		mac: [
+			idle('2026-11-14T10:01:00.000Z'),
+			idle('2026-11-14T11:02:00.000Z'),
+			win({ resetsAt: '2026-11-14T20:00:00.000Z' })
+		]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 1);
+	assert.equal(w.hit, 1);
+});

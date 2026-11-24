@@ -264,6 +264,8 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 		const byWindow = new Map<string, LimitWindow[]>();
 		for (const w of windows) {
 			if (w.provider !== provider) continue;
+			// Never used: older collectors stored an idle window's placeholder from every poll.
+			if (w.peakPercent === 0 && !w.hitAt) continue;
 			if (anchor(w) < from || anchor(w) >= to) continue;
 			byWindow.set(w.window, [...(byWindow.get(w.window) ?? []), w]);
 		}

@@ -458,12 +458,23 @@ const slug = (s) =>
 		.replace(/^_+|_+$/g, '');
 
 const claudeResetMs = (resetsAt) => (typeof resetsAt === 'string' ? Date.parse(resetsAt) : NaN);
+const claudeWindowMs = (window) => (window.startsWith('five_hour') ? 300 : 10080) * MINUTE_MS;
+
+// A window nobody has used yet is reported at 0% with its reset one window length from now, on
+// every poll, so each hourly run would record a new instance. It has no instance until it is used.
+const isIdle = (w, nowMs) =>
+	w.percent <= 0 && Math.abs(w.resetsAtMs - nowMs - w.windowMs) <= RESET_SLACK_MS;
 
 function claudeWindows(body) {
 	const out = [];
 	const add = (window, percent, resetsAtMs) => {
 		if (Number.isFinite(percent) && Number.isFinite(resetsAtMs)) {
-			out.push({ window: window.slice(0, 40), percent, resetsAtMs });
+			out.push({
+				window: window.slice(0, 40),
+				percent,
+				resetsAtMs,
+				windowMs: claudeWindowMs(window)
+			});
 		}
 	};
 	for (const [key, w] of Object.entries(body)) {
@@ -496,7 +507,8 @@ function codexWindows(body, nowMs) {
 			out.push({
 				window: (suffix ? `${base}_${suffix}` : base).slice(0, 40),
 				percent: w.used_percent,
-				resetsAtMs
+				resetsAtMs,
+				windowMs: minutes * MINUTE_MS
 			});
 		}
 	};
@@ -680,15 +692,14 @@ function antigravityWindows(bodies, nowMs) {
 			if (!family || out.has(window) || !Number.isFinite(resetsAtMs)) continue;
 			// Protobuf's JSON leaves out a zero, so a bucket without remainingFraction is used up.
 			const remaining = typeof b.remainingFraction === 'number' ? b.remainingFraction : 0;
-			// A window not in use reports its reset one window length from now; it has no instance.
-			const idle =
-				remaining >= 1 && Math.abs(resetsAtMs - nowMs - minutes * MINUTE_MS) <= RESET_SLACK_MS;
-			if (idle) continue;
-			out.set(window, {
+			const reading = {
 				window,
 				percent: Math.round((1 - Math.min(1, Math.max(0, remaining))) * 1e6) / 1e4,
-				resetsAtMs
-			});
+				resetsAtMs,
+				windowMs: minutes * MINUTE_MS
+			};
+			// Skipped here, not only in pollLimits, so the other endpoint's live reading can win.
+			if (!isIdle(reading, nowMs)) out.set(window, reading);
 		}
 	}
 	return [...out.values()];
@@ -930,6 +941,10 @@ async function pollLimits(state, nowMs) {
 					const windows = await pollLogin(poller, login.creds, nowMs);
 					const seen = [];
 					for (const w of windows) {
+						if (isIdle(w, nowMs)) {
+							seen.push(`${w.window} idle`);
+							continue;
+						}
 						const stored = addLimit(state, {
 							provider,
 							account,
@@ -3069,8 +3084,10 @@ function buildSnapshot(
 		sessionsTotal: all.size,
 		sessionCounts: publicCounts
 	};
+	// A window never used carries nothing; older versions stored an idle window's placeholder
+	// from every poll.
 	const limits = Object.values(windows)
-		.filter((w) => Date.parse(w.resetsAt) >= coverageStartMs)
+		.filter((w) => Date.parse(w.resetsAt) >= coverageStartMs && (w.peakPercent > 0 || w.hitAt))
 		.sort(
 			(a, b) =>
 				a.resetsAt.localeCompare(b.resetsAt) ||
