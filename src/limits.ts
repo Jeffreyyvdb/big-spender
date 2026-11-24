@@ -23,8 +23,8 @@ type Tagged = { window: LimitWindow; deviceId?: string };
  * Groups reports into window instances. Each account's reports of one provider and window whose
  * resets are at most RESET_SLACK_MS after the earliest of the group (rounded down to the minute)
  * are one instance, so another account's window can never split or join it. A report without an
- * account (a log line names none, and older collectors sent none) joins the account whose reset
- * is nearest within RESET_SLACK_MS, so it is never counted as a second instance; the rest group
+ * account (a log line names none, and older collectors sent none) joins the account whose kept
+ * reset is nearest within RESET_SLACK_MS (ties go to the first account in sort order), so it is never counted as a second instance; the rest group
  * among themselves.
  */
 function groupWindows(items: Tagged[]): Tagged[][] {
@@ -48,7 +48,8 @@ function groupWindows(items: Tagged[]): Tagged[][] {
 			let best = -1;
 			let bestGap = Infinity;
 			for (const [i, group] of accounted.entries()) {
-				const gap = Math.min(...group.map((m) => Math.abs(resetMs(m) - ms)));
+				// To the reset the group keeps, so merging the result again attaches it the same way.
+				const gap = Math.abs(resetMs(group[0]) - ms);
 				if (gap < bestGap) [best, bestGap] = [i, gap];
 			}
 			if (best !== -1 && bestGap <= RESET_SLACK_MS) attached[best].push(item);

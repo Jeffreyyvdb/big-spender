@@ -477,3 +477,26 @@ test('windows without an account attach by distance to accounted reports only, i
 	assert.deepEqual(shape(mergeLimits([...chain].reverse())), expected);
 	assert.deepEqual(shape(mergeLimits(mergeLimits(chain), [chain[3]])), expected);
 });
+
+test('merging again with reports already merged changes nothing, and one refusal hits one account', () => {
+	const at = (t: string, extra: Partial<LimitWindow> = {}) =>
+		win({ hitAt: undefined, peakPercent: 10, resetsAt: `2026-11-14T${t}:00.000Z`, ...extra });
+	const shape = (list: LimitWindow[]) =>
+		list.map((w) => [w.account ?? null, w.resetsAt, w.peakPercent, w.hitAt ?? null]);
+	const a1 = at('20:00', { account: A, peakPercent: 40 });
+	const a2 = at('20:02', { account: A, peakPercent: 50 });
+	const b = at('20:05', { account: B, peakPercent: 30 });
+	const u = at('20:03', { peakPercent: 100, hitAt: '2026-11-14T17:00:00.000Z' });
+	for (const reports of [
+		[a1, a2, u],
+		[a1, a2, b, u]
+	]) {
+		const once = mergeLimits(reports);
+		assert.deepEqual(shape(mergeLimits(once, [u])), shape(once));
+		assert.deepEqual(
+			shape(mergeLimits(mergeLimits(reports.filter((r) => r !== u)), [u])),
+			shape(once)
+		);
+		assert.equal(once.filter((w) => w.hitAt).length, 1);
+	}
+});
