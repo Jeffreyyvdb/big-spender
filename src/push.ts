@@ -155,6 +155,16 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 	// bug and must not silently drop the windows.
 	let sending = snapshot;
 	let sent = body;
+	// The collector keyed each account hash with the token it found, the environment's and then the
+	// env file's. Another token here means another server, which could not match those hashes.
+	const keyedWith = (setting(ctx.env, 'INGEST_TOKEN') || setting(saved, 'INGEST_TOKEN')).trim();
+	if (token !== keyedWith && sending.limits?.some((w) => 'account' in w)) {
+		ctx.err(
+			'warning: this token differs from the one that keyed the account hashes; sending limits without accounts'
+		);
+		sending = { ...sending, limits: sending.limits.map(({ account: _, ...w }) => w) };
+		sent = gzipSync(JSON.stringify(sending));
+	}
 	let result: string;
 	for (;;) {
 		try {
