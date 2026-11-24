@@ -275,7 +275,8 @@ function pruneState(state, cutoffMs) {
 // Same rule as mergeLimits in src/limits.ts (this file ships alone, so it cannot import it): one
 // record per window instance and account, highest peak, earliest hit. Reports of one window can
 // put its reset seconds apart, across a minute boundary, so a reset within RESET_SLACK_MS of a
-// known one of the same window is that one, and the record keeps the earlier reset. Log lines name
+// known one of the same window is that one, and the record keeps the earlier reset (of the
+// account's own reports, when it has an account). Log lines name
 // no account: a record without one joins the nearest record of any account, and a record with an
 // account takes in the records without one.
 const MINUTE_MS = 60_000;
@@ -311,7 +312,13 @@ function addLimit(state, w) {
 	if (!account) account = near.find(({ l }) => l.account)?.l.account;
 	const same = near.filter(({ l }) => !l.account || l.account === account);
 	for (const { key } of same) delete state.limits[key];
-	resetsAtMs = Math.min(resetsAtMs, ...same.map(({ l }) => Date.parse(l.resetsAt)));
+	// A record without an account never moves the reset of the account it joins.
+	const resets = [
+		{ account: w.account, ms: resetsAtMs },
+		...same.map(({ l }) => ({ account: l.account, ms: Date.parse(l.resetsAt) }))
+	];
+	const accounted = resets.filter((r) => r.account);
+	resetsAtMs = Math.min(...(accounted.length ? accounted : resets).map((r) => r.ms));
 	const hits = [...same.map(({ l }) => l.hitAt && Date.parse(l.hitAt)), w.hitMs].filter(
 		Number.isFinite
 	);

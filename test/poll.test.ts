@@ -1435,3 +1435,19 @@ test('a server that keeps refusing accounts is asked once more, then the push fa
 		}
 	});
 });
+
+test("a refusal in the logs joins its account's polled window without moving its reset", async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const hitMs = NEXT_HOUR - 3 * HOUR;
+		await writeClaudeLog(box, [refusedClaudeWeekly(hitMs, weeklyResetsAt - 60_000)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = { limits: [fableWeekly(100)] };
+			const res = await collect(box, url);
+			assert.deepEqual(hitsOf(res.snap), [
+				['seven_day_fable', iso(weeklyResetsAt), 100, iso(hitMs)]
+			]);
+		});
+	});
+});

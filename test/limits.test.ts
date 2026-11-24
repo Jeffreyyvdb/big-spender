@@ -447,3 +447,33 @@ test("one account's drifting reports are never split by another account's nearby
 	const log = win({ resetsAt: '2026-11-14T20:03:00.000Z' });
 	assert.deepEqual(shape(mergeLimits([a, b1], [log])), expected);
 });
+
+test('windows without an account attach by distance to accounted reports only, in any order', () => {
+	const at = (t: string, extra: Partial<LimitWindow> = {}) =>
+		win({ hitAt: undefined, peakPercent: 10, resetsAt: `2026-11-14T${t}:00.000Z`, ...extra });
+	const shape = (list: LimitWindow[]) =>
+		list.map((w) => [w.account ?? null, w.resetsAt, w.peakPercent]);
+	const a = at('20:00', { account: A, peakPercent: 40 });
+	const b = at('20:04', { account: B, peakPercent: 50 });
+	const u1 = at('20:02', { peakPercent: 60 });
+	const u2 = at('20:03', { peakPercent: 70 });
+	assert.deepEqual(shape(mergeLimits([a, b, u1, u2])), shape(mergeLimits([a, b, u2, u1])));
+	assert.deepEqual(shape(mergeLimits([a, b, u1, u2])), [
+		[A, '2026-11-14T20:00:00.000Z', 60],
+		[B, '2026-11-14T20:04:00.000Z', 70]
+	]);
+
+	const chain = [
+		a,
+		at('20:02', { peakPercent: 80 }),
+		at('20:04', { peakPercent: 90 }),
+		at('20:06', { peakPercent: 95 })
+	];
+	const expected = [
+		[A, '2026-11-14T20:00:00.000Z', 80],
+		[null, '2026-11-14T20:04:00.000Z', 95]
+	];
+	assert.deepEqual(shape(mergeLimits(chain)), expected);
+	assert.deepEqual(shape(mergeLimits([...chain].reverse())), expected);
+	assert.deepEqual(shape(mergeLimits(mergeLimits(chain), [chain[3]])), expected);
+});

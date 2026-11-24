@@ -25,7 +25,7 @@ type Tagged = { window: LimitWindow; deviceId?: string };
  * are one instance, so another account's window can never split or join it. A report without an
  * account (a log line names none, and older collectors sent none) joins the account whose reset
  * is nearest within RESET_SLACK_MS, so it is never counted as a second instance; the rest group
- * among themselves. The first member of a group carries the earliest reset.
+ * among themselves.
  */
 function groupWindows(items: Tagged[]): Tagged[][] {
 	const byWindow = new Map<string, Tagged[]>();
@@ -40,21 +40,26 @@ function groupWindows(items: Tagged[]): Tagged[][] {
 	const groups: Tagged[][] = [];
 	for (const list of byWindow.values()) {
 		const accounted = clusterByReset(list.filter((m) => m.window.account));
+		// Distances are to accounted reports only, so attaching one record never moves the next.
+		const attached = accounted.map((group) => [...group]);
 		const loose: Tagged[] = [];
 		for (const item of list.filter((m) => !m.window.account)) {
 			const ms = resetMs(item);
-			let best: Tagged[] | undefined;
+			let best = -1;
 			let bestGap = Infinity;
-			for (const group of accounted) {
+			for (const [i, group] of accounted.entries()) {
 				const gap = Math.min(...group.map((m) => Math.abs(resetMs(m) - ms)));
-				if (gap < bestGap) [best, bestGap] = [group, gap];
+				if (gap < bestGap) [best, bestGap] = [i, gap];
 			}
-			if (best && bestGap <= RESET_SLACK_MS) best.push(item);
+			if (best !== -1 && bestGap <= RESET_SLACK_MS) attached[best].push(item);
 			else loose.push(item);
 		}
-		groups.push(...accounted, ...clusterByReset(loose));
+		groups.push(...attached, ...clusterByReset(loose));
 	}
-	for (const group of groups) group.sort((a, b) => resetMs(a) - resetMs(b));
+	// The first member carries the group's reset: its earliest accounted report when it has one,
+	// so a window without an account never moves the reset of the account it joined.
+	const rank = (m: Tagged) => (m.window.account ? 0 : 1);
+	for (const group of groups) group.sort((a, b) => rank(a) - rank(b) || resetMs(a) - resetMs(b));
 	return groups;
 }
 
@@ -88,7 +93,7 @@ const byTime = (a: string, b: string) => Date.parse(a) - Date.parse(b);
 
 /**
  * Merges window lists into one record per window instance (see groupWindows), which keeps the
- * earliest reset. A group keeps the highest peak and the earliest hit, so merging is idempotent
+ * earliest reset, or the earliest of the account's own reports. A group keeps the highest peak and the earliest hit, so merging is idempotent
  * and one account's window reported by two devices counts once, while two accounts' windows stay
  * apart. Sorted by reset time; past the cap the oldest are dropped.
  */
