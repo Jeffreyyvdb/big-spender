@@ -302,20 +302,42 @@ function addLimit(state, w) {
 	if (!plausibleTime(resetsAtMs) || !/^[a-z0-9_]{1,40}$/.test(window)) return;
 	if (w.hitMs !== undefined && !plausibleTime(w.hitMs)) return;
 	state.limits ??= {};
-	const near = Object.entries(state.limits)
-		.map(([key, l]) => ({ key, l, gap: Math.abs(Date.parse(l.resetsAt) - resetsAtMs) }))
-		.filter(
-			({ l, gap }) => l.provider === w.provider && l.window === window && gap <= RESET_SLACK_MS
-		)
+	const sameWindow = Object.entries(state.limits)
+		.filter(([, l]) => l.provider === w.provider && l.window === window)
+		.map(([key, l]) => ({ key, l, ms: Date.parse(l.resetsAt) }));
+	const near = sameWindow
+		.map((r) => ({ ...r, gap: Math.abs(r.ms - resetsAtMs) }))
+		.filter((r) => r.gap <= RESET_SLACK_MS)
 		.sort((a, b) => a.gap - b.gap || (a.l.account ?? '').localeCompare(b.l.account ?? ''));
-	let account = w.account;
-	if (!account) account = near.find(({ l }) => l.account)?.l.account;
-	const same = near.filter(({ l }) => !l.account || l.account === account);
+	let same;
+	if (w.account) {
+		const host = near.find(({ l }) => l.account === w.account);
+		const kept = Math.min(resetsAtMs, host?.ms ?? Infinity);
+		// A record without an account joins this one unless another account's is nearer to it
+		// (a tie goes to the account first in sort order), as groupWindows on the server decides.
+		const others = sameWindow.filter(({ l }) => l.account && l.account !== w.account);
+		const ours = (r) => {
+			const gap = Math.abs(r.ms - kept);
+			return (
+				gap <= RESET_SLACK_MS &&
+				!others.some((o) => {
+					const other = Math.abs(o.ms - r.ms);
+					return other < gap || (other === gap && o.l.account < w.account);
+				})
+			);
+		};
+		same = [...(host ? [host] : []), ...sameWindow.filter((r) => !r.l.account && ours(r))];
+	} else {
+		// One host: the nearest accounted record, else the nearest record without an account.
+		const host = near.find(({ l }) => l.account) ?? near[0];
+		same = host ? [host] : [];
+	}
+	const account = w.account ?? same[0]?.l.account;
 	for (const { key } of same) delete state.limits[key];
 	// A record without an account never moves the reset of the account it joins.
 	const resets = [
 		{ account: w.account, ms: resetsAtMs },
-		...same.map(({ l }) => ({ account: l.account, ms: Date.parse(l.resetsAt) }))
+		...same.map(({ l, ms }) => ({ account: l.account, ms }))
 	];
 	const accounted = resets.filter((r) => r.account);
 	resetsAtMs = Math.min(...(accounted.length ? accounted : resets).map((r) => r.ms));

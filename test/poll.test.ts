@@ -1451,3 +1451,69 @@ test("a refusal in the logs joins its account's polled window without moving its
 		});
 	});
 });
+
+// Seeds state with limit records, then reads one logged Fable refusal with the given reset.
+async function refusalAgainst(box: Sandbox, url: string, records: Win[], refusalReset: number) {
+	const off = { BIG_SPENDER_POLL_LIMITS: 'off' };
+	assert.equal((await collect(box, url, off)).code, 0);
+	const statePath = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
+	const state = JSON.parse(await readFile(statePath, 'utf8'));
+	state.limits = Object.fromEntries(records.map((r, i) => [`seed-${i}`, r]));
+	await writeFile(statePath, JSON.stringify(state));
+	await writeClaudeLog(box, [refusedClaudeWeekly(NEXT_HOUR - 3 * HOUR, refusalReset)]);
+	const res = await collect(box, url, off);
+	assert.equal(res.code, 0, res.stderr);
+	return (res.snap.limits as Win[])
+		.map((w) => [w.account ?? null, w.resetsAt, w.peakPercent, w.hitAt ?? null])
+		.sort((x, y) => String(x[1]).localeCompare(String(y[1])));
+}
+
+const ACCT = 'accountAAAAAAAAA';
+const fable = (resetMs: number, extra: Partial<Win> = {}): Win => ({
+	provider: 'claude',
+	window: 'seven_day_fable',
+	resetsAt: iso(resetMs),
+	peakPercent: 40,
+	...extra
+});
+
+test('a logged refusal joins only the nearest accounted window, not a loose one beside it', async () => {
+	await withSandbox(async (box) => {
+		await withUsageApi(async (_api, _seen, url) => {
+			const looseHit = iso(NEXT_HOUR - 10 * HOUR);
+			const limits = await refusalAgainst(
+				box,
+				url,
+				[
+					fable(weeklyResetsAt, { account: ACCT }),
+					fable(weeklyResetsAt + 4 * 60_000, { peakPercent: 90, hitAt: looseHit })
+				],
+				weeklyResetsAt + 2 * 60_000
+			);
+			assert.deepEqual(limits, [
+				[ACCT, iso(weeklyResetsAt), 100, iso(NEXT_HOUR - 3 * HOUR)],
+				[null, iso(weeklyResetsAt + 4 * 60_000), 90, looseHit]
+			]);
+		});
+	});
+});
+
+test("a logged refusal between two of one account's windows joins the nearer one only", async () => {
+	await withSandbox(async (box) => {
+		await withUsageApi(async (_api, _seen, url) => {
+			const limits = await refusalAgainst(
+				box,
+				url,
+				[
+					fable(weeklyResetsAt, { account: ACCT }),
+					fable(weeklyResetsAt + 3 * 60_000, { account: ACCT, peakPercent: 50 })
+				],
+				weeklyResetsAt + 2 * 60_000
+			);
+			assert.deepEqual(limits, [
+				[ACCT, iso(weeklyResetsAt), 40, null],
+				[ACCT, iso(weeklyResetsAt + 3 * 60_000), 100, iso(NEXT_HOUR - 3 * HOUR)]
+			]);
+		});
+	});
+});
