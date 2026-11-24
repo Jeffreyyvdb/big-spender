@@ -304,3 +304,106 @@ test('limitHits keeps the earliest hit and highest peak when one device reports 
 		{ deviceId: 'mac', hitAt: '2026-11-14T17:30:00.000Z', peakPercent: 100 }
 	]);
 });
+
+// Accounts
+
+const A = 'accountAAAAAAAAA';
+const B = 'accountBBBBBBBBB';
+
+test('two accounts whose windows reset in the same minute stay two instances', () => {
+	const merged = mergeLimits([win({ account: A })], [win({ account: B, peakPercent: 30 })]);
+	assert.deepEqual(
+		merged.map((w) => [w.account, w.peakPercent]),
+		[
+			[A, 100],
+			[B, 30]
+		]
+	);
+	assert.deepEqual(mergeLimits(merged, merged), merged);
+});
+
+test('a window without an account joins the account whose reset is nearest', () => {
+	const log = win({ hitAt: '2026-11-14T17:00:00.000Z', resetsAt: '2026-11-14T20:01:00.000Z' });
+	const a = win({
+		account: A,
+		hitAt: undefined,
+		peakPercent: 60,
+		resetsAt: '2026-11-14T20:00:00.000Z'
+	});
+	const b = win({
+		account: B,
+		hitAt: undefined,
+		peakPercent: 20,
+		resetsAt: '2026-11-14T20:02:00.000Z'
+	});
+	const merged = mergeLimits([a, b], [log]);
+	assert.deepEqual(
+		merged.map((w) => [w.account, w.peakPercent, w.hitAt]),
+		[
+			[A, 100, '2026-11-14T17:00:00.000Z'],
+			[B, 20, undefined]
+		]
+	);
+	assert.deepEqual(mergeLimits(merged, [log]), merged);
+});
+
+test('windows without an account from an older collector join the accounted one, so the upgrade counts once', async () => {
+	const { limits } = await limitsOf({
+		mac: [win()],
+		pc: [win({ account: A, hitAt: '2026-11-14T17:31:00.000Z' })]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 1);
+	assert.equal(w.hit, 1);
+});
+
+test("limits() counts a second account blocked during the first one's lockout as its own hit", async () => {
+	const { limits } = await limitsOf({
+		mac: [
+			win({ account: A, hitAt: '2026-11-14T17:00:00.000Z', resetsAt: '2026-11-14T20:00:00.000Z' }),
+			win({ account: B, hitAt: '2026-11-14T18:00:00.000Z', resetsAt: '2026-11-14T21:00:00.000Z' })
+		]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 2);
+	assert.equal(w.hit, 2);
+	assert.equal(w.lockedHours, 6);
+});
+
+test('limits() lets a refusal without an account extend the one lockout running then', async () => {
+	// The poll saw A blocked until 00:20; a later refusal says the reset moved to 01:40.
+	const { limits } = await limitsOf(
+		{
+			mac: [
+				win({
+					account: A,
+					hitAt: '2026-11-13T20:46:00.000Z',
+					resetsAt: '2026-11-14T00:20:00.000Z'
+				}),
+				win({ hitAt: '2026-11-13T22:23:00.000Z', resetsAt: '2026-11-14T01:40:00.000Z' })
+			]
+		},
+		Date.parse('2026-11-14T22:30:00Z')
+	);
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.hit, 1);
+	assert.equal(w.lockedHours, 4.9);
+});
+
+test('limitHits names the account of each instance and the schema takes only a hash', () => {
+	const report = limitHits(
+		[withLimits('mac', [win({ account: A })]), withLimits('pc', [win({ account: B })])],
+		Date.parse('2026-11-15T00:00:00Z')
+	);
+	assert.deepEqual(
+		report.hits.map((h) => h.account),
+		[A, B]
+	);
+	const bad = { ...snapshot('mac'), limits: [win({ account: 'someone@example.com' })] };
+	assert.equal(usageSnapshotSchema.safeParse(bad).success, false);
+});
+
+test('the public limits summary names no account', async () => {
+	const { limits } = await limitsOf({ mac: [win({ account: A })] });
+	assert.ok(!JSON.stringify(limits).includes(A));
+});

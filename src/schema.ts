@@ -54,9 +54,16 @@ export const usageRowSchema = z.strictObject({
 export const MAX_LIMIT_WINDOWS = 5_000;
 
 // One subscription usage window (the 5-hour session, the weekly cap, ...) as it was observed.
-// A window instance is identified by (provider, window, resetsAt rounded down to the minute).
+// A window instance is identified by (provider, account, window, resetsAt rounded down to the
+// minute). A record without an account came from a log line, which names none, or from an older
+// collector; it belongs to the account whose instance it falls in (see mergeLimits).
 export const limitWindowSchema = z.strictObject({
 	provider: z.enum(PROVIDERS),
+	// The account the window belongs to, hashed on the device; never published.
+	account: z
+		.string()
+		.regex(/^[A-Za-z0-9_-]{16}$/)
+		.optional(),
 	// five_hour, seven_day, seven_day_opus, ...; Codex windows are named from window_minutes
 	// (300 -> five_hour, 10080 -> seven_day, otherwise `${minutes}m`).
 	window: z.string().regex(/^[a-z0-9_]{1,40}$/),
