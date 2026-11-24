@@ -933,10 +933,10 @@ test('a T3 Code Claude home signed in to another account is polled too, and its 
 
 test('one account in two homes is polled once, through the login that has a live token', async () => {
 	await withSandbox(async (box) => {
-		await writeClaudeHome(join(box.home, '.claude'), 'stale', Date.now() - 1000);
+		await writeClaudeHome(join(box.home, '.claude'), 'live');
 		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
 		const other = join(box.home, 'claude-other');
-		await writeClaudeHome(other, 'live');
+		await writeClaudeHome(other, 'stale', Date.now() - 1000);
 		await writeClaudeAccount(other, '.claude.json', 'account-a');
 		await withUsageApi(async (api, seen, url) => {
 			api.claude.body = { five_hour: { utilization: 40, resets_at: iso(NEXT_HOUR) } };
@@ -1315,5 +1315,123 @@ test('idle placeholders an older version stored are not sent', async () => {
 				['five_hour', iso(NEXT_HOUR + 2 * HOUR), 40, false]
 			]);
 		});
+	});
+});
+
+test('a lockout missed between runs is still placed when the poll finds the five-hour window idle', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLogWithWeekly());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = {
+				rate_limit: {
+					primary_window: {
+						used_percent: 0,
+						limit_window_seconds: 18000,
+						reset_after_seconds: 18000,
+						reset_at: Math.floor(Date.now() / 1000) + 18000
+					},
+					secondary_window: polledWindow(50, 604800, WEEKLY)
+				}
+			};
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(hitsOf(res.snap).sort(), [
+				['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)],
+				['seven_day', iso(WEEKLY), 50, undefined]
+			]);
+		});
+	});
+});
+
+test('a second Codex account whose windows are idle still blocks blaming a refusal', async () => {
+	await withSandbox(async (box) => {
+		const seat = (user: string) =>
+			jwt({
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				'https://api.openai.com/auth': { chatgpt_account_user_id: user }
+			});
+		await writeCodexLogin(box, seat('user-a'));
+		const other = join(box.home, 'codex-b');
+		await mkdir(other, { recursive: true });
+		await writeFile(
+			join(other, 'auth.json'),
+			JSON.stringify({ tokens: { access_token: seat('user-b'), account_id: CODEX_ACCOUNT } })
+		);
+		await writeT3Settings(box, { b: { driver: 'codex', config: { homePath: other } } });
+		const fullAt = REFUSED_AT + 30 * 60_000;
+		await writeCodexLog(box, [
+			sharingRefusal(REFUSED_AT),
+			codexTokenCount(fullAt, 300, 100, OLD_FIVE_HOUR)
+		]);
+		const idle = (seconds: number) => ({
+			used_percent: 0,
+			limit_window_seconds: seconds,
+			reset_after_seconds: seconds,
+			reset_at: Math.floor(Date.now() / 1000) + seconds
+		});
+		await withUsageApi(async (api, seen, url) => {
+			api.codex.body = {
+				rate_limit: { primary_window: idle(18000), secondary_window: idle(604800) }
+			};
+			const res = await collect(box, url);
+			assert.equal(seen.length, 2);
+			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 100, iso(fullAt)]]);
+		});
+	});
+});
+
+test('CLAUDE_CONFIG_DIR with a trailing slash still finds the account beside ~/.claude', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = claudeBody();
+			const res = await collect(box, url, { CLAUDE_CONFIG_DIR: `${join(box.home, '.claude')}/` });
+			assert.equal(seen.length, 1);
+			assert.ok(
+				res.snap.limits.every((w: Win) => w.account),
+				JSON.stringify(res.snap.limits)
+			);
+		});
+	});
+});
+
+test('a server that keeps refusing accounts is asked once more, then the push fails', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeT3AntigravityLogin(box, agLogin());
+		let requests = 0;
+		const ingest = createServer(async (req, res) => {
+			for await (const _ of req);
+			requests++;
+			res.statusCode = 422;
+			res.setHeader('content-type', 'application/json');
+			res.end(
+				JSON.stringify({
+					error: 'invalid snapshot',
+					issues: ['limits.0: Unrecognized key: "account"']
+				})
+			);
+		});
+		await new Promise<void>((resolve) => ingest.listen(0, '127.0.0.1', resolve));
+		try {
+			await withUsageApi(async (api, _seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.5, NEXT_HOUR)] }] };
+				const res = await run(COLLECTOR, [], {
+					...box.env,
+					BIG_SPENDER_DEVICE_ID: 'laptop',
+					BIG_SPENDER_INGEST_URL: `http://127.0.0.1:${(ingest.address() as AddressInfo).port}/`,
+					BIG_SPENDER_INGEST_TOKEN: 'tok',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${url}/agProd`
+				});
+				assert.notEqual(res.code, 0);
+				assert.equal(requests, 2);
+			});
+		} finally {
+			ingest.closeAllConnections();
+			await new Promise((resolve) => ingest.close(resolve));
+		}
 	});
 });

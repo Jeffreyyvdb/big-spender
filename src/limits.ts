@@ -20,67 +20,66 @@ const RESET_SLACK_MS = 2 * MINUTE_MS;
 type Tagged = { window: LimitWindow; deviceId?: string };
 
 /**
- * Groups reports into window instances. Reports of one provider and window whose resets are at
- * most RESET_SLACK_MS after the earliest of the cluster (rounded down to the minute) are one
- * instance per account. Each member's `resetsAt` is rounded; the first member of a group carries
- * the earliest.
+ * Groups reports into window instances. Each account's reports of one provider and window whose
+ * resets are at most RESET_SLACK_MS after the earliest of the group (rounded down to the minute)
+ * are one instance, so another account's window can never split or join it. A report without an
+ * account (a log line names none, and older collectors sent none) joins the account whose reset
+ * is nearest within RESET_SLACK_MS, so it is never counted as a second instance; the rest group
+ * among themselves. The first member of a group carries the earliest reset.
  */
 function groupWindows(items: Tagged[]): Tagged[][] {
-	const sorted = items
-		.map(({ window: w, deviceId }): Tagged => ({
+	const byWindow = new Map<string, Tagged[]>();
+	for (const { window: w, deviceId } of items) {
+		const item = {
 			window: { ...w, resetsAt: new Date(minuteOf(w.resetsAt)).toISOString() },
 			deviceId
-		}))
-		.sort(
-			(a, b) =>
-				a.window.provider.localeCompare(b.window.provider) ||
-				a.window.window.localeCompare(b.window.window) ||
-				Date.parse(a.window.resetsAt) - Date.parse(b.window.resetsAt) ||
-				(a.window.account ?? '').localeCompare(b.window.account ?? '')
-		);
+		};
+		const key = `${w.provider}|${w.window}`;
+		byWindow.set(key, [...(byWindow.get(key) ?? []), item]);
+	}
+	const groups: Tagged[][] = [];
+	for (const list of byWindow.values()) {
+		const accounted = clusterByReset(list.filter((m) => m.window.account));
+		const loose: Tagged[] = [];
+		for (const item of list.filter((m) => !m.window.account)) {
+			const ms = resetMs(item);
+			let best: Tagged[] | undefined;
+			let bestGap = Infinity;
+			for (const group of accounted) {
+				const gap = Math.min(...group.map((m) => Math.abs(resetMs(m) - ms)));
+				if (gap < bestGap) [best, bestGap] = [group, gap];
+			}
+			if (best && bestGap <= RESET_SLACK_MS) best.push(item);
+			else loose.push(item);
+		}
+		groups.push(...accounted, ...clusterByReset(loose));
+	}
+	for (const group of groups) group.sort((a, b) => resetMs(a) - resetMs(b));
+	return groups;
+}
+
+const resetMs = (m: Tagged) => Date.parse(m.window.resetsAt);
+
+/** Same account (or none), resets within RESET_SLACK_MS of the group's earliest. */
+function clusterByReset(items: Tagged[]): Tagged[][] {
+	const sorted = [...items].sort(
+		(a, b) =>
+			(a.window.account ?? '').localeCompare(b.window.account ?? '') || resetMs(a) - resetMs(b)
+	);
 	const clusters: Tagged[][] = [];
 	for (const item of sorted) {
 		const cluster = clusters.at(-1);
-		const first = cluster?.[0].window;
 		if (
 			cluster &&
-			first &&
-			first.provider === item.window.provider &&
-			first.window === item.window.window &&
-			Date.parse(item.window.resetsAt) - Date.parse(first.resetsAt) <= RESET_SLACK_MS
+			cluster[0].window.account === item.window.account &&
+			resetMs(item) - resetMs(cluster[0]) <= RESET_SLACK_MS
 		) {
 			cluster.push(item);
 		} else {
 			clusters.push([item]);
 		}
 	}
-	return clusters.flatMap(splitByAccount);
-}
-
-/**
- * One group per account in a cluster. A report without an account (a log line names none, and
- * older collectors sent none) joins the account whose reset is nearest, so it is never counted
- * as a second instance; with no account in the cluster, those reports are one group.
- */
-function splitByAccount(cluster: Tagged[]): Tagged[][] {
-	const byAccount = new Map<string, Tagged[]>();
-	for (const item of cluster) {
-		const { account } = item.window;
-		if (account) byAccount.set(account, [...(byAccount.get(account) ?? []), item]);
-	}
-	if (!byAccount.size) return [cluster];
-	const groups = [...byAccount.values()];
-	const gap = (group: Tagged[], ms: number) =>
-		Math.min(...group.map((m) => Math.abs(Date.parse(m.window.resetsAt) - ms)));
-	for (const item of cluster) {
-		if (item.window.account) continue;
-		const ms = Date.parse(item.window.resetsAt);
-		groups.reduce((best, g) => (gap(g, ms) < gap(best, ms) ? g : best)).push(item);
-	}
-	for (const group of groups) {
-		group.sort((a, b) => Date.parse(a.window.resetsAt) - Date.parse(b.window.resetsAt));
-	}
-	return groups;
+	return clusters;
 }
 
 const accountOf = (group: Tagged[]) => group.find((m) => m.window.account)?.window.account;

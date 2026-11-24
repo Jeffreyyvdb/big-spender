@@ -163,7 +163,10 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		} catch (err) {
 			const message = err instanceof Error ? err.message : '';
 			if (!sending.limits || !/^HTTP 422\b/.test(message)) throw err;
-			if (/limits\.\d+: Unrecognized key.{0,5}account/.test(message)) {
+			if (
+				/limits\.\d+: Unrecognized key.{0,5}account/.test(message) &&
+				sending.limits.some((w) => 'account' in w)
+			) {
 				ctx.err(
 					'warning: the server is too old to tell accounts apart; sending limits without them'
 				);

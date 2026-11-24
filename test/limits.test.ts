@@ -323,7 +323,7 @@ test('two accounts whose windows reset in the same minute stay two instances', (
 });
 
 test('a window without an account joins the account whose reset is nearest', () => {
-	const log = win({ hitAt: '2026-11-14T17:00:00.000Z', resetsAt: '2026-11-14T20:01:00.000Z' });
+	const log = win({ hitAt: '2026-11-14T17:00:00.000Z', resetsAt: '2026-11-14T20:02:00.000Z' });
 	const a = win({
 		account: A,
 		hitAt: undefined,
@@ -340,8 +340,8 @@ test('a window without an account joins the account whose reset is nearest', () 
 	assert.deepEqual(
 		merged.map((w) => [w.account, w.peakPercent, w.hitAt]),
 		[
-			[A, 100, '2026-11-14T17:00:00.000Z'],
-			[B, 20, undefined]
+			[A, 60, undefined],
+			[B, 100, '2026-11-14T17:00:00.000Z']
 		]
 	);
 	assert.deepEqual(mergeLimits(merged, [log]), merged);
@@ -421,4 +421,29 @@ test('limits() does not count windows that were never used, as older collectors 
 	const [w] = limits.providers[0].windows;
 	assert.equal(w.observed, 1);
 	assert.equal(w.hit, 1);
+});
+
+test("one account's drifting reports are never split by another account's nearby window", () => {
+	const a = win({
+		account: A,
+		hitAt: undefined,
+		peakPercent: 40,
+		resetsAt: '2026-11-14T20:00:00.000Z'
+	});
+	const b1 = win({
+		account: B,
+		hitAt: undefined,
+		peakPercent: 50,
+		resetsAt: '2026-11-14T20:02:00.000Z'
+	});
+	const b2 = win({ account: B, resetsAt: '2026-11-14T20:03:00.000Z' });
+	const expected = [
+		[A, '2026-11-14T20:00:00.000Z', 40],
+		[B, '2026-11-14T20:02:00.000Z', 100]
+	];
+	const shape = (list: LimitWindow[]) => list.map((w) => [w.account, w.resetsAt, w.peakPercent]);
+	assert.deepEqual(shape(mergeLimits([a, b1], [b2])), expected);
+	assert.deepEqual(shape(mergeLimits([b2], [a], [b1])), expected);
+	const log = win({ resetsAt: '2026-11-14T20:03:00.000Z' });
+	assert.deepEqual(shape(mergeLimits([a, b1], [log])), expected);
 });

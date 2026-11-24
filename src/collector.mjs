@@ -306,7 +306,7 @@ function addLimit(state, w) {
 		.filter(
 			({ l, gap }) => l.provider === w.provider && l.window === window && gap <= RESET_SLACK_MS
 		)
-		.sort((a, b) => a.gap - b.gap);
+		.sort((a, b) => a.gap - b.gap || (a.l.account ?? '').localeCompare(b.l.account ?? ''));
 	let account = w.account;
 	if (!account) account = near.find(({ l }) => l.account)?.l.account;
 	const same = near.filter(({ l }) => !l.account || l.account === account);
@@ -589,12 +589,14 @@ function t3InstanceHomes(driver) {
 }
 
 const DEFAULT_CLAUDE_HOME = join(HOME, '.claude');
+const envHome = (name) =>
+	process.env[name]?.trim() ? resolve(HOME, expandHome(process.env[name].trim())) : undefined;
 
 // Claude Code keeps the signed-in account in .claude.json: inside CLAUDE_CONFIG_DIR, or next to
 // ~/.claude for the default home. Limits belong to the organization's plan, so both ids count.
 function claudeAccount(home) {
 	const files = [join(home, '.claude.json')];
-	if (home === DEFAULT_CLAUDE_HOME) files.push(join(HOME, '.claude.json'));
+	if (realPath(home) === realPath(DEFAULT_CLAUDE_HOME)) files.push(join(HOME, '.claude.json'));
 	for (const file of files) {
 		const a = readJsonQuiet(file)?.oauthAccount;
 		if (typeof a?.accountUuid === 'string' && a.accountUuid) {
@@ -720,7 +722,7 @@ const ANTIGRAVITY_QUOTA = 'v1internal:retrieveUserQuotaSummary';
 const LIMIT_POLLERS = {
 	claude: {
 		logins: () =>
-			[process.env.CLAUDE_CONFIG_DIR, DEFAULT_CLAUDE_HOME, ...t3InstanceHomes('claudeAgent')]
+			[envHome('CLAUDE_CONFIG_DIR'), DEFAULT_CLAUDE_HOME, ...t3InstanceHomes('claudeAgent')]
 				.filter(Boolean)
 				.map((home) => ({
 					source: join(home, '.credentials.json'),
@@ -753,7 +755,7 @@ const LIMIT_POLLERS = {
 	},
 	codex: {
 		logins: () =>
-			[process.env.CODEX_HOME, join(HOME, '.codex'), ...t3InstanceHomes('codex')]
+			[envHome('CODEX_HOME'), join(HOME, '.codex'), ...t3InstanceHomes('codex')]
 				.filter(Boolean)
 				.map((home) => ({
 					source: join(home, 'auth.json'),
@@ -941,7 +943,11 @@ async function pollLimits(state, nowMs) {
 					const windows = await pollLogin(poller, login.creds, nowMs);
 					const seen = [];
 					for (const w of windows) {
+						// An idle window gets no record, but codexRefusal still needs to know it was read.
 						if (isIdle(w, nowMs)) {
+							if (provider === 'codex') {
+								polled.push({ window: w.window, resetsAtMs: w.resetsAtMs, account, percent: 0 });
+							}
 							seen.push(`${w.window} idle`);
 							continue;
 						}
@@ -3092,7 +3098,8 @@ function buildSnapshot(
 			(a, b) =>
 				a.resetsAt.localeCompare(b.resetsAt) ||
 				a.provider.localeCompare(b.provider) ||
-				a.window.localeCompare(b.window)
+				a.window.localeCompare(b.window) ||
+				(a.account ?? '').localeCompare(b.account ?? '')
 		)
 		.slice(-MAX_LIMIT_WINDOWS);
 	if (limits.length) snapshot.limits = limits;
@@ -3374,7 +3381,7 @@ async function post(snapshot) {
 		return await postOnce(snapshot);
 	} catch (err) {
 		if (err.status !== 422 || !snapshot.limits) throw err;
-		if (NO_ACCOUNTS_422.test(err.message)) {
+		if (NO_ACCOUNTS_422.test(err.message) && snapshot.limits.some((w) => 'account' in w)) {
 			log('warning: the server is too old to tell accounts apart; sending limits without them');
 			return await post({ ...snapshot, limits: snapshot.limits.map(({ account, ...w }) => w) });
 		}
