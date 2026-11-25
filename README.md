@@ -305,10 +305,13 @@ their local logs, and it polls their usage endpoints (see [Polling](#polling-usa
   (in each Antigravity data dir and T3 Code profile) as `RESOURCE_EXHAUSTED` with how long until
   the quota resets ("Resets in 1h24m24s"), in local time and without naming the bucket. The
   refusal time plus that wait is the reset of the blocked window, so the refusal starts the
-  lockout of the one Antigravity window on file with that reset, within two minutes. That catches
-  a quota that runs out between two polls, or while the login token has expired, as long as a poll
-  saw the window before. A refusal whose reset matches no window, or several, changes nothing.
-  Polling is the only source of Antigravity's percentages.
+  lockout of the one Antigravity window on file with that reset (within two minutes) that was open
+  at the refusal. A log beside a login file belongs to that login's account and only matches its
+  windows; a log with no login beside it (the CLI keeps its login in the keyring) only counts while
+  the windows on file belong to one account. That catches a quota that runs out between two polls,
+  or while the login token has expired, as long as a poll saw the window before. A refusal whose
+  reset matches no window, or several, changes nothing. Polling is the only source of
+  Antigravity's percentages.
 
 A record is one window instance, identified by provider, account, window name and reset time
 rounded down to the minute. Polls know the account; log lines don't name one, so a logged window
