@@ -427,14 +427,19 @@ function codexWindowMs(window) {
 	return m ? Number(m[1]) * MINUTE_MS : NaN;
 }
 
+// Codex refuses a turn before the window that blocks it reads 100%: on 2026-11-25 a refusal came
+// with the five_hour at 98%.
+const CODEX_REFUSES_AT = 95;
+
 // A refused Codex turn names no window and no reset, so it starts the lockout of every window
 // already seen full that was open at the time. With none seen full, it falls to elimination.
-// Usage within an instance only rises until its reset, so this run's poll reading below 100%
-// (taken after the refusal) proves the instance was not full at ts. That only settles it when
-// the poll read both Codex windows, every limit it reports had an instance on file at ts, and
-// exactly one is not ruled out. polled holds this run's Codex poll readings; it is empty when
-// the poll was off or failed. Runs after the whole scan, once every log reading is on file.
-// A refusal names no account either, so with two Codex accounts open or polled it changes nothing.
+// Usage within an instance only rises until its reset, so this run's poll reading below
+// CODEX_REFUSES_AT (taken after the refusal) proves the instance was not blocking at ts. That
+// only settles it when the poll read both Codex windows, every limit it reports had an instance
+// on file at ts, and exactly one is not ruled out. polled holds this run's Codex poll readings; it
+// is empty when the poll was off or failed. Runs after the whole scan, once every log reading is
+// on file. A refusal names no account either, so with two Codex accounts open or polled it
+// changes nothing.
 function codexRefusal(state, ts, polled) {
 	const open = Object.values(state.limits ?? {}).filter((l) => {
 		const resetsAtMs = Date.parse(l.resetsAt);
@@ -443,10 +448,10 @@ function codexRefusal(state, ts, polled) {
 	const accounts = new Set([...open, ...polled].map((l) => l.account).filter(Boolean));
 	if (accounts.size > 1) return;
 	const full = open.filter((l) => l.peakPercent >= 100);
-	const readBelowFull = (l) =>
+	const ruledOutByPoll = (l) =>
 		polled.some(
 			(r) =>
-				r.percent < 100 &&
+				r.percent < CODEX_REFUSES_AT &&
 				r.window === l.window &&
 				Math.abs(r.resetsAtMs - Date.parse(l.resetsAt)) <= RESET_SLACK_MS
 		);
@@ -456,7 +461,7 @@ function codexRefusal(state, ts, polled) {
 	const accountedFor =
 		Object.values(CODEX_WINDOW_NAMES).every((n) => polledNames.has(n)) &&
 		[...polledNames].every((n) => open.some((l) => l.window === n));
-	const left = accountedFor ? open.filter((l) => !readBelowFull(l)) : [];
+	const left = accountedFor ? open.filter((l) => !ruledOutByPoll(l)) : [];
 	const blockers = full.length ? full : left.length === 1 ? left : [];
 	for (const l of blockers) {
 		addLimit(state, {
@@ -478,6 +483,27 @@ const isCodexRefusal = (p) => {
 		(typeof err.message === 'string' && /usage limit/i.test(err.message))
 	);
 };
+
+// Antigravity's server log says when a refused request's quota resets, not which bucket it was. It
+// is the one Antigravity window on file with that reset; with none or several, nothing changes.
+// Runs after the poll and the whole scan, so this run's readings are on file.
+function antigravityRefusal(state, { ts, resetsAtMs }) {
+	const matches = Object.values(state.limits ?? {}).filter(
+		(l) =>
+			l.provider === 'antigravity' &&
+			Math.abs(Date.parse(l.resetsAt) - resetsAtMs) <= RESET_SLACK_MS
+	);
+	if (matches.length !== 1) return;
+	const [l] = matches;
+	addLimit(state, {
+		provider: 'antigravity',
+		account: l.account,
+		window: l.window,
+		resetsAtMs: Date.parse(l.resetsAt),
+		percent: 100,
+		hitMs: ts
+	});
+}
 
 // ---------------------------------------------------------------------------
 // Limit polling
@@ -2523,9 +2549,45 @@ const agBucketRecord = (provider, group) => ({
 	output: group.totalOutput
 });
 
+// Antigravity's server writes glog lines in local time (`E1125 16:01:35.642032 ...`) to files
+// named for the day the server started (`acp-server-20261125_160048-2753018.log`), in a `log`
+// folder beside `conversations`. A refused request is logged as RESOURCE_EXHAUSTED with
+// "Resets in 1h24m24s".
+const AG_SERVER_LOG = /-(\d{4})(\d{2})\d{2}_\d{6}(?:-\d+)?\.log$/;
+const AG_LOG_TIME = /^[IWEF](\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?\s/;
+const AG_RESETS_IN = /Resets in (?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?\./;
+
+const agLogDirs = (dirs) =>
+	dirs.map((dir) =>
+		basename(dir) === 'conversations' ? join(dirname(dir), 'log') : join(dir, 'log')
+	);
+
+const readAgServerLogs = jsonlReader(
+	(ctx, _file, path) => {
+		const [, year, month] = AG_SERVER_LOG.exec(basename(path)) ?? [];
+		return (line) => {
+			if (!year || !line.includes('RESOURCE_EXHAUSTED')) return;
+			const t = AG_LOG_TIME.exec(line);
+			const r = AG_RESETS_IN.exec(line);
+			if (!t || !r || !(r[1] || r[2] || r[3] || r[4])) return;
+			// A server started in December can log a refusal in January.
+			const y = Number(year) + (Number(t[1]) < Number(month) ? 1 : 0);
+			const ms = Number((t[6] ?? '').padEnd(3, '0').slice(0, 3));
+			const ts = new Date(y, t[1] - 1, Number(t[2]), Number(t[3]), Number(t[4]), Number(t[5]), ms);
+			const [d, h, m, s] = r.slice(1).map((n) => Number(n ?? 0));
+			const resetsInMs = (((d * 24 + h) * 60 + m) * 60 + s) * 1000;
+			if (Number.isFinite(ts.getTime())) {
+				ctx.antigravityRefusals.push({ ts: ts.getTime(), resetsAtMs: ts.getTime() + resetsInMs });
+			}
+		};
+	},
+	(dir) => walk(dir, (name) => AG_SERVER_LOG.test(name))
+);
+
 /** @type {Source['read']} */
 async function readAntigravity(dirs, ctx, provider) {
 	const { state } = ctx;
+	await readAgServerLogs(agLogDirs(dirs), ctx, provider);
 	/** @type {AgEvent[]} */
 	const events = [];
 	const read = new Set();
@@ -3013,7 +3075,7 @@ async function readVibe(paths, ctx, provider) {
 }
 
 /**
- * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, codexRefusals: number[], seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
+ * @typedef {{ state: State, resolvePrice: (provider: string, model: string) => any, cutoffMs: number, codexRefusals: number[], antigravityRefusals: { ts: number, resetsAtMs: number }[], seenPaths: Set<string>, filesRead: number, parsedBytes: number }} ReadContext
  * @typedef {{
  *   paths: string[],
  *   envPaths: () => string[],
@@ -3169,6 +3231,7 @@ async function scan(state, resolvePrice, cutoffMs, sources, polled) {
 		resolvePrice,
 		cutoffMs,
 		codexRefusals: [],
+		antigravityRefusals: [],
 		seenPaths: new Set(),
 		filesRead: 0,
 		parsedBytes: 0
@@ -3177,6 +3240,7 @@ async function scan(state, resolvePrice, cutoffMs, sources, polled) {
 	for (const [provider, source] of sources) await source.read(source.envPaths(), ctx, provider);
 	// After every file: a full reading of the refused window can come later in the logs.
 	for (const ts of ctx.codexRefusals) codexRefusal(state, ts, polled);
+	for (const refusal of ctx.antigravityRefusals) antigravityRefusal(state, refusal);
 	for (const path of Object.keys(state.files)) {
 		if (!ctx.seenPaths.has(path)) delete state.files[path];
 	}

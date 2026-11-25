@@ -285,17 +285,30 @@ their local logs, and it polls their usage endpoints (see [Polling](#polling-usa
   alone say nothing about utilisation below 100%; polling fills that in.
 - **Codex.** `token_count` events carry `rate_limits` with the used percentage and reset time of the
   5-hour window (`five_hour`, 300 minutes) and the weekly window (`seven_day`, 10080 minutes). A
-  window counts as hit when its share reaches 100%. A refused turn is logged too, but names no
-  window and no reset. It starts the lockout of each Codex window seen full (by a poll or any log
-  line) that was open at that moment, so the lockout begins at the first logged refusal instead of
-  at the next poll. When no open window was seen full, a lockout that began and
-  ended between two runs can still be placed by elimination. Usage in a window instance only rises
-  until it resets, so a poll that read an instance below 100% after the refusal proves it was not
-  the one blocking. This needs a successful poll in the same run that read both Codex windows, and
-  every limit it reports must have an instance on file that was open at the refusal. If exactly one open window is then left,
-  it gets the hit at the refusal. The gap that remains is a refusal whose window no reading ever
-  saw, one where several windows stay possible, and any refusal read while polling is off or
-  failing. These change nothing.
+  reading alone counts as a hit only at 100%. A refused turn is logged too, but names no window
+  and no reset. It starts the lockout of each Codex window seen full (by a poll or any log line)
+  that was open at that moment, so the lockout begins at the first logged refusal instead of at the
+  next poll. When no open window was seen full, the blocked window can still be found by
+  elimination, whether the lockout is still running or began and ended between two runs. Codex
+  refuses before a window reads 100%: one refusal came with the 5-hour window at 98%, while the
+  endpoint still answered `allowed: true` and `limit_reached: false`. Usage in a window instance
+  only rises until it resets, so a poll that read an instance below 95% after the refusal proves
+  it was not the one blocking. This needs a successful poll in the same run that read both Codex
+  windows, and every limit it reports must have an instance on file that was open at the refusal.
+  If exactly one open window is then left, it gets the hit at the refusal, and its peak becomes
+  100%. The gap that remains is a refusal whose window no reading ever saw, one where several
+  windows stay possible (both at 95% or more), any refusal read while polling is off or failing,
+  and a window polled at 95–99% on a machine whose own logs hold no refusal. These change nothing.
+  A refusal from a limit the endpoint does not report would be blamed on a window that reads 95%
+  or more, if it is the only one.
+- **Antigravity.** Its server logs a refused request in the `log` folder beside `conversations`
+  (in each Antigravity data dir and T3 Code profile) as `RESOURCE_EXHAUSTED` with how long until
+  the quota resets ("Resets in 1h24m24s"), in local time and without naming the bucket. The
+  refusal time plus that wait is the reset of the blocked window, so the refusal starts the
+  lockout of the one Antigravity window on file with that reset, within two minutes. That catches
+  a quota that runs out between two polls, or while the login token has expired, as long as a poll
+  saw the window before. A refusal whose reset matches no window, or several, changes nothing.
+  Polling is the only source of Antigravity's percentages.
 
 A record is one window instance, identified by provider, account, window name and reset time
 rounded down to the minute. Polls know the account; log lines don't name one, so a logged window

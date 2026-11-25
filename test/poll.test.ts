@@ -699,7 +699,7 @@ const missedLockoutLogWithWeekly = () => [
 const missedLockoutBody = (extra: Record<string, unknown> = {}) => ({
 	rate_limit: {
 		primary_window: polledWindow(5, 18000, NEXT_HOUR + 3 * HOUR),
-		secondary_window: polledWindow(95, 604800, WEEKLY)
+		secondary_window: polledWindow(90, 604800, WEEKLY)
 	},
 	...extra
 });
@@ -717,7 +717,7 @@ test('a refusal is blamed on the one open window the poll did not read', async (
 			assert.deepEqual(hitsOf(res.snap).sort(), [
 				['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)],
 				['five_hour', iso(NEXT_HOUR + 3 * HOUR), 5, undefined],
-				['seven_day', iso(WEEKLY), 95, undefined]
+				['seven_day', iso(WEEKLY), 90, undefined]
 			]);
 		});
 	});
@@ -764,16 +764,57 @@ test('a refusal with two open windows the poll did not read is not attributed', 
 	});
 });
 
-test('a poll that reads the open window below 100% rules it out', async () => {
+// The poll reads the weekly too, so elimination runs; only readings below 95% rule a window out.
+for (const [fiveHour, weekly, blamed] of [
+	[40, 23, undefined],
+	[94, 23, undefined],
+	[95, 23, 'five_hour'],
+	[98, 96, undefined]
+] as const) {
+	test(`a poll that reads the open five_hour at ${fiveHour}% and the weekly at ${weekly}% blames ${blamed ?? 'neither'}`, async () => {
+		await withSandbox(async (box) => {
+			await writeCodexLogin(box, liveCodexToken());
+			await writeCodexLog(box, missedLockoutLog());
+			await withUsageApi(async (api, _seen, url) => {
+				api.codex.body = {
+					rate_limit: {
+						primary_window: polledWindow(fiveHour, 18000, OLD_FIVE_HOUR),
+						secondary_window: polledWindow(weekly, 604800, WEEKLY)
+					}
+				};
+				const res = await collect(box, url);
+				assert.equal(res.code, 0, res.stderr);
+				assert.deepEqual(hitsOf(res.snap).sort(), [
+					blamed
+						? ['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)]
+						: ['five_hour', iso(OLD_FIVE_HOUR), fiveHour, undefined],
+					['seven_day', iso(WEEKLY), weekly, undefined]
+				]);
+			});
+		});
+	});
+}
+
+// Seen on 2026-11-25: Codex refused at 13:38 UTC, then the poll read the five_hour at 98% and
+// the weekly at 23%. Codex refuses before used_percent reaches 100.
+test('a refusal is blamed on the open window the poll reads at 98%', async () => {
 	await withSandbox(async (box) => {
 		await writeCodexLogin(box, liveCodexToken());
-		await writeCodexLog(box, missedLockoutLog());
+		const refusedAt = fiveHourResetsAt - 4 * HOUR;
+		await writeCodexLog(box, [sharingRefusal(refusedAt)]);
 		await withUsageApi(async (api, _seen, url) => {
 			api.codex.body = {
-				rate_limit: { primary_window: polledWindow(40, 18000, OLD_FIVE_HOUR) }
+				rate_limit: {
+					primary_window: polledWindow(98, 18000, fiveHourResetsAt),
+					secondary_window: polledWindow(23, 604800, WEEKLY)
+				}
 			};
 			const res = await collect(box, url);
-			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 40, undefined]]);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(hitsOf(res.snap).sort(), [
+				['five_hour', iso(fiveHourResetsAt), 100, iso(refusedAt)],
+				['seven_day', iso(WEEKLY), 23, undefined]
+			]);
 		});
 	});
 });
@@ -1157,6 +1198,94 @@ test('an expired Antigravity login sends nothing and warns once', async () => {
 			assert.equal(res.code, 0, res.stderr);
 			assert.deepEqual(seen, []);
 			assert.match(res.stderr, /antigravity usage not polled: the login token expired/);
+		});
+	});
+});
+
+// Antigravity's server logs a refused request in glog format, in local time, with how long until
+// the quota resets. The collector runs these tests with TZ=Etc/GMT-1 (UTC+1, no DST).
+const AG_TZ = { TZ: 'Etc/GMT-1' };
+const AG_UTC_OFFSET = HOUR;
+const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+const agLocal = (ms: number) => new Date(ms + AG_UTC_OFFSET);
+const agLogTime = (ms: number) => {
+	const d = agLocal(ms);
+	return `${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.${pad(d.getUTCMilliseconds(), 3)}000`;
+};
+const AG_QUOTA =
+	'Individual quota reached. Please upgrade your subscription to increase your limits.';
+const agRefusalLines = (ms: number, resetsIn: string) => [
+	`E${agLogTime(ms)}     404 errorreport.go:282] agent executor error: generating and executing: transport error (ResourceExhausted, HTTP 429): ${AG_QUOTA} Resets in ${resetsIn}.: RESOURCE_EXHAUSTED (code 429): ${AG_QUOTA} Resets in ${resetsIn}.`,
+	`E${agLogTime(ms + 2)}     404 errorreport.go:282] generating and executing: transport error (ResourceExhausted, HTTP 429): ${AG_QUOTA} Resets in ${resetsIn}.: RESOURCE_EXHAUSTED (code 429): ${AG_QUOTA} Resets in ${resetsIn}.`
+];
+
+async function writeAgServerLog(box: Sandbox, startedMs: number, lines: string[], profile = 'p1') {
+	const dir = join(
+		box.home,
+		'.t3',
+		'userdata',
+		'providers',
+		'antigravity',
+		profile,
+		'antigravity-acp',
+		'log'
+	);
+	await mkdir(dir, { recursive: true });
+	const d = agLocal(startedMs);
+	const name = `acp-server-${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}_${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}-2753018.log`;
+	const startup = `I${agLogTime(startedMs)}     101 server_oauth.go:221] applyAuthResult: authMethod=consumer`;
+	await writeFile(join(dir, name), [startup, ...lines].join('\n') + '\n');
+}
+
+// Seen on 2026-11-25: the poll read gemini-5h at 99.37% at 15:01:20 UTC, Antigravity refused at
+// 15:01:35 with "Resets in 1h24m24s", and the next poll could not run before the 16:26 reset.
+test('an Antigravity refusal in the server log starts the lockout at the refusal', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - (HOUR + 24 * 60_000 + 24_000) - 360;
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '1h24m24s'));
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-5h', '5h', 0.0063116, resetsAt),
+							agBucket('gemini-weekly', 'weekly', 0.34, NEXT_HOUR + 48 * HOUR)
+						]
+					}
+				]
+			};
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(
+				res.snap.limits
+					.filter((w: Win) => w.provider === 'antigravity')
+					.map((w: Win) => [w.window, w.resetsAt, w.peakPercent, w.hitAt])
+					.sort(),
+				[
+					['five_hour_gemini', iso(resetsAt), 100, iso(refusedAt)],
+					['seven_day_gemini', iso(NEXT_HOUR + 48 * HOUR), 66, undefined]
+				]
+			);
+		});
+	});
+});
+
+test('an Antigravity refusal whose reset matches no window on file records nothing', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - 2 * HOUR;
+		// Resets an hour away from the only polled window: not that window.
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '1h0m0s'));
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.4, resetsAt)] }] };
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'antigravity'), [
+				['five_hour_gemini', iso(resetsAt), 60, false]
+			]);
 		});
 	});
 });
