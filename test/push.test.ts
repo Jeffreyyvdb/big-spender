@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { createHmac } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
@@ -476,6 +477,36 @@ test('push says when limits were not polled for want of an ingest token', async 
 			});
 			assert.equal(await main(['push', 'laptop', '--dry-run'], ctx), 0, err.join('\n'));
 			assert.match(err.join('\n'), /limits not polled: BIG_SPENDER_INGEST_TOKEN is not set/);
+		});
+	});
+});
+
+test('the account hash is keyed with the very token push sends, whichever source names it', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeLog(box, 'claude-test-model');
+		await writeAntigravityLogin(box);
+		const envFile = join(box.home, 'custom.env');
+		await writeFile(envFile, 'BIG_SPENDER_INGEST_TOKEN=token-in-env-file\n', { mode: 0o600 });
+		await withQuotaAndIngest(async (base, bodies) => {
+			const { ctx, err } = harness(box, {
+				answers: ['y', `${base}/ingest`],
+				env: {
+					BIG_SPENDER_ENV_FILE: envFile,
+					USAGE_INGEST_TOKEN: 'legacy-token-in-env',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${base}/quota`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${base}/quota`
+				}
+			});
+			assert.equal(await main(['push', 'laptop'], ctx), 0, err.join('\n'));
+			const keyed = createHmac('sha256', 'legacy-token-in-env')
+				.update('antigravity-account\0a@example.com')
+				.digest('base64url')
+				.slice(0, 16);
+			assert.deepEqual(
+				bodies[0].limits?.map((w) => (w as { account?: string }).account),
+				[keyed]
+			);
 		});
 	});
 });
