@@ -2938,10 +2938,18 @@ async function readVibeSession(dir, id) {
 	const runtimeFile = stateFile(manifest.runtime_state, 'runtime-state.json');
 	const runtime = await readJsonFile(join(genDir, runtimeFile));
 	const meta = await readJsonFile(join(dir, 'meta.json'));
-	const model = [meta?.config?.active_model, runtime?.session_metadata?.active_model].find(
-		(m) => typeof m === 'string' && m
-	);
-	const root = [runtime?.session_metadata?.root_session_id, session.rootSessionId].find(
+	const metadata = runtime?.session_metadata;
+	const catalogue = metadata?.completion_catalogue;
+	// Vibe can switch a session's selected model back to its default without a new turn, while the
+	// completion catalogue keeps the model it last ran.
+	const model = [
+		(typeof catalogue === 'string' ? parseJson(catalogue) : catalogue)?.model,
+		meta?.config?.active_model,
+		metadata?.active_model
+	]
+		.map(nonEmpty)
+		.find(Boolean);
+	const root = [metadata?.root_session_id, session.rootSessionId].find(
 		(r) => typeof r === 'string' && r
 	);
 	return {

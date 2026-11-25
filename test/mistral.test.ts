@@ -32,6 +32,7 @@ type Fixture = {
 	usage?: Usage | null;
 	metaModel?: string;
 	runtimeModel?: string;
+	catalogueModel?: string;
 	root?: string;
 	journal?: string;
 	current?: string;
@@ -84,6 +85,12 @@ async function writeSession(store: string, f: Fixture) {
 		JSON.stringify({
 			session_metadata: {
 				active_model: f.runtimeModel ?? null,
+				completion_catalogue: f.catalogueModel
+					? JSON.stringify({
+							model: f.catalogueModel,
+							endpoint: 'https://api.mistral.ai/v1/models'
+						})
+					: null,
 				root_session_id: f.root ?? f.id
 			}
 		})
@@ -430,5 +437,28 @@ test('--reset does not count Vibe usage again in a later hour', async () => {
 		assert.deepEqual(rebuilt.hourly, [], 'nothing counted twice');
 		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(170, 0, 0) });
 		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 20, 'growth after reset');
+	});
+});
+
+test('the model the last completion used wins over a selected model Vibe switched back', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const store = await setup(home);
+		await writeSession(store, {
+			id: 'switched',
+			metaModel: LARGE,
+			runtimeModel: LARGE,
+			catalogueModel: 'deepseek-v4-1-flash-1017',
+			usage: usage(100, 0, 10)
+		});
+		await writeSession(store, {
+			id: 'blank',
+			metaModel: '   ',
+			runtimeModel: LARGE,
+			usage: usage(30, 0, 3)
+		});
+		const models = byModel((await collect(env)).snapshot);
+		assert.deepEqual(Object.keys(models).sort(), ['deepseek-v4-1-flash-1017', LARGE]);
+		assert.equal(models['deepseek-v4-1-flash-1017'].input, 100);
+		assert.equal(models[LARGE].input, 30);
 	});
 });
