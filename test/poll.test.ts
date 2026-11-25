@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { run, seedPricing, withSandbox, type Sandbox } from './helpers.ts';
 
@@ -14,15 +16,17 @@ const iso = (ms: number) => new Date(ms).toISOString();
 
 type Seen = { path: string; headers: IncomingHttpHeaders };
 type Reply = { status: number; body: unknown };
-type Stub = { claude: Reply; codex: Reply };
+type Stub = { claude: Reply; codex: Reply; agDaily: Reply; agProd: Reply };
 
 /** Both usage endpoints on one loopback server; each test sets what they answer. */
 async function withUsageApi(fn: (api: Stub, seen: Seen[], url: string) => Promise<void>) {
-	const api: Stub = { claude: { status: 200, body: {} }, codex: { status: 200, body: {} } };
+	const ok = () => ({ status: 200, body: {} });
+	const api: Stub = { claude: ok(), codex: ok(), agDaily: ok(), agProd: ok() };
 	const seen: Seen[] = [];
 	const server = createServer((req, res) => {
 		seen.push({ path: String(req.url), headers: req.headers });
-		const reply = req.url?.startsWith('/claude') ? api.claude : api.codex;
+		const route = /^\/(claude|codex|agDaily|agProd)/.exec(String(req.url))?.[1] as keyof Stub;
+		const reply = api[route] ?? api.codex;
 		res.writeHead(reply.status, { 'content-type': 'application/json' });
 		res.end(JSON.stringify(reply.body));
 	});
@@ -50,13 +54,18 @@ const validClaude = (extra: Record<string, unknown> = {}) => ({
 	...extra
 });
 
+const INGEST_TOKEN = 'ingest-token-for-tests';
+
 async function collect(box: Sandbox, url: string, extra: Record<string, string> = {}) {
 	await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
 	const res = await run(COLLECTOR, ['--dry-run'], {
 		...box.env,
 		BIG_SPENDER_DEVICE_ID: 'laptop',
+		BIG_SPENDER_INGEST_TOKEN: INGEST_TOKEN,
 		BIG_SPENDER_CLAUDE_USAGE_URL: `${url}/claude`,
 		BIG_SPENDER_CODEX_USAGE_URL: `${url}/codex`,
+		BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
+		BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${url}/agProd`,
 		...extra
 	});
 	return { ...res, snap: res.code === 0 ? JSON.parse(res.stdout) : null };
@@ -64,6 +73,7 @@ async function collect(box: Sandbox, url: string, extra: Record<string, string> 
 
 type Win = {
 	provider: string;
+	account?: string;
 	window: string;
 	resetsAt: string;
 	peakPercent: number;
@@ -865,6 +875,689 @@ test('a weekly the poll reports as null is not ruled out', async () => {
 			const res = await collect(box, url);
 			assert.equal(res.code, 0, res.stderr);
 			assert.ok(res.snap.limits.every((w: Win) => w.hitAt === undefined));
+		});
+	});
+});
+
+// Accounts: each login is polled once per account, wherever it is kept.
+
+async function writeClaudeAccount(dir: string, file: string, accountUuid: string) {
+	await mkdir(dir, { recursive: true });
+	await writeFile(
+		join(dir, file),
+		JSON.stringify({ oauthAccount: { accountUuid, organizationUuid: 'org-1', emailAddress: 'x' } })
+	);
+}
+
+async function writeT3Settings(box: Sandbox, instances: Record<string, unknown>) {
+	await mkdir(join(box.home, '.t3', 'userdata'), { recursive: true });
+	await writeFile(
+		join(box.home, '.t3', 'userdata', 'settings.json'),
+		JSON.stringify({ providerInstances: instances })
+	);
+}
+
+async function writeClaudeHome(dir: string, token: string, expiresAt = Date.now() + HOUR) {
+	await mkdir(dir, { recursive: true });
+	await writeFile(
+		join(dir, '.credentials.json'),
+		JSON.stringify({ claudeAiOauth: validClaude({ accessToken: token, expiresAt }) })
+	);
+}
+
+const accountsOf = (snap: { limits?: Win[] }, provider: string) =>
+	new Set((snap.limits ?? []).filter((w) => w.provider === provider).map((w) => w.account));
+
+test('a T3 Code Claude home signed in to another account is polled too, and its windows stay apart', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeHome(join(box.home, '.claude'), 'token-a');
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const work = join(box.home, 'claude-work');
+		await writeClaudeHome(work, 'token-b');
+		await writeClaudeAccount(work, '.claude.json', 'account-b');
+		await writeT3Settings(box, {
+			claudeWork: { driver: 'claudeAgent', config: { homePath: '~/claude-work' } }
+		});
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = { five_hour: { utilization: 40, resets_at: iso(NEXT_HOUR) } };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(seen.map((s) => s.headers.authorization).sort(), [
+				'Bearer token-a',
+				'Bearer token-b'
+			]);
+			const fiveHours = res.snap.limits.filter((w: Win) => w.window === 'five_hour');
+			assert.equal(fiveHours.length, 2);
+			assert.equal(accountsOf(res.snap, 'claude').size, 2);
+			for (const w of fiveHours) assert.match(w.account, /^[A-Za-z0-9_-]{16}$/);
+			assert.ok(!JSON.stringify(res.snap).includes('account-a'));
+		});
+	});
+});
+
+test('one account in two homes is polled once, through the login that has a live token', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeHome(join(box.home, '.claude'), 'live');
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const other = join(box.home, 'claude-other');
+		await writeClaudeHome(other, 'stale', Date.now() - 1000);
+		await writeClaudeAccount(other, '.claude.json', 'account-a');
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = { five_hour: { utilization: 40, resets_at: iso(NEXT_HOUR) } };
+			const res = await collect(box, url, { CLAUDE_CONFIG_DIR: other });
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(
+				seen.map((s) => s.headers.authorization),
+				['Bearer live']
+			);
+			assert.equal(warnings(res.stderr), 0, res.stderr);
+			assert.equal(res.snap.limits.length, 1);
+		});
+	});
+});
+
+test('CLAUDE_CONFIG_DIR naming the default home reads its login once', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = claudeBody();
+			const res = await collect(box, url, { CLAUDE_CONFIG_DIR: join(box.home, '.claude') });
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 1);
+		});
+	});
+});
+
+test('a T3 Code Codex shadow home with another ChatGPT seat is polled as its own account', async () => {
+	await withSandbox(async (box) => {
+		const seat = (user: string) =>
+			jwt({
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				'https://api.openai.com/auth': { chatgpt_account_user_id: `${user}__acct-123` }
+			});
+		const tokenA = seat('user-a');
+		const tokenB = seat('user-b');
+		await writeCodexLogin(box, tokenA);
+		const shadow = join(box.home, '.codex-t3', 'work');
+		await mkdir(shadow, { recursive: true });
+		await writeFile(
+			join(shadow, 'auth.json'),
+			JSON.stringify({ tokens: { access_token: tokenB, account_id: CODEX_ACCOUNT } })
+		);
+		await writeT3Settings(box, {
+			codexWork: { driver: 'codex', config: { shadowHomePath: '~/.codex-t3/work' } }
+		});
+		await withUsageApi(async (api, seen, url) => {
+			api.codex.body = codexFiveHour(30, NEXT_HOUR + 2 * HOUR);
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 2);
+			assert.equal(res.snap.limits.length, 2);
+			assert.equal(accountsOf(res.snap, 'codex').size, 2);
+			assert.match(res.stderr, /polled codex usage \(account [A-Za-z0-9_-]{6}\): five_hour 30%/);
+		});
+	});
+});
+
+test('a Claude refusal in the logs joins the polled window of its account', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const hitMs = NEXT_HOUR - 3 * HOUR;
+		await writeClaudeLog(box, [refusedClaudeWeekly(hitMs, weeklyResetsAt)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = { limits: [fableWeekly(100)] };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(res.snap.limits.length, 1);
+			assert.equal(res.snap.limits[0].hitAt, iso(hitMs));
+			assert.match(res.snap.limits[0].account, /^[A-Za-z0-9_-]{16}$/);
+		});
+	});
+});
+
+test('a Codex refusal with two accounts open is not blamed on either', async () => {
+	await withSandbox(async (box) => {
+		const seat = (user: string) =>
+			jwt({
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				'https://api.openai.com/auth': { chatgpt_account_user_id: user }
+			});
+		await writeCodexLogin(box, seat('user-a'));
+		const other = join(box.home, 'codex-b');
+		await mkdir(other, { recursive: true });
+		await writeFile(
+			join(other, 'auth.json'),
+			JSON.stringify({ tokens: { access_token: seat('user-b'), account_id: CODEX_ACCOUNT } })
+		);
+		await writeT3Settings(box, {
+			b: { driver: 'codex', environment: [{ name: 'CODEX_HOME', value: other, sensitive: false }] }
+		});
+		await writeCodexLog(box, [sharingRefusal(fiveHourResetsAt - 4 * HOUR)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(100, fiveHourResetsAt);
+			const before = Date.now();
+			const res = await collect(box, url);
+			assert.equal(res.snap.limits.length, 2);
+			for (const w of res.snap.limits) assert.ok(Date.parse(w.hitAt) >= before, w.hitAt);
+		});
+	});
+});
+
+// Antigravity
+
+const AG_TOKEN = 'ya29.antigravity-secret';
+
+const agLogin = (extra: Record<string, unknown> = {}) =>
+	JSON.stringify({
+		token: {
+			access_token: AG_TOKEN,
+			token_type: 'Bearer',
+			refresh_token: 'ag-refresh-secret',
+			expiry: iso(Date.now() + HOUR),
+			...extra
+		},
+		auth_method: 'consumer',
+		id_token_email: 'Someone@Example.com'
+	});
+
+async function writeT3AntigravityLogin(box: Sandbox, text: string, profile = 'p1') {
+	const dir = join(
+		box.home,
+		'.t3',
+		'userdata',
+		'providers',
+		'antigravity',
+		profile,
+		'antigravity-acp'
+	);
+	await mkdir(dir, { recursive: true });
+	await writeFile(join(dir, 'antigravity-oauth-token'), text);
+}
+
+const agBucket = (id: string, window: string, remaining: number | undefined, resetMs: number) => ({
+	bucketId: id,
+	window,
+	resetTime: iso(resetMs),
+	...(remaining === undefined ? {} : { remainingFraction: remaining })
+});
+
+const nowWindow = (minutes: number) => Date.now() + minutes * 60_000;
+
+test('Antigravity quota buckets are polled from both endpoints, the live reading winning', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		await withUsageApi(async (api, seen, url) => {
+			api.agDaily.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-weekly', 'weekly', 0.75, NEXT_HOUR + 48 * HOUR),
+							agBucket('gemini-5h', '5h', undefined, NEXT_HOUR + 2 * HOUR)
+						]
+					}
+				]
+			};
+			api.agProd.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-5h', '5h', 1, nowWindow(300)),
+							agBucket('3p-weekly', 'weekly', 1, nowWindow(10080)),
+							agBucket('3p-5h', '5h', 0.9, NEXT_HOUR + 3 * HOUR)
+						]
+					}
+				]
+			};
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'antigravity'), [
+				['five_hour_3p', iso(NEXT_HOUR + 3 * HOUR), 10, false],
+				['five_hour_gemini', iso(NEXT_HOUR + 2 * HOUR), 100, true],
+				['seven_day_gemini', iso(NEXT_HOUR + 48 * HOUR), 25, false]
+			]);
+			assert.equal(accountsOf(res.snap, 'antigravity').size, 1);
+			assert.deepEqual(seen.map((s) => s.path).sort(), ['/agDaily', '/agProd']);
+			for (const s of seen) {
+				assert.equal(s.headers.authorization, `Bearer ${AG_TOKEN}`);
+				assert.match(String(s.headers['user-agent']), /^antigravity\/hub\/[\d.]+ \(aidev_client;/);
+			}
+			const state = await readFile(
+				join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'),
+				'utf8'
+			);
+			for (const secret of [AG_TOKEN, 'ag-refresh-secret', 'someone@example.com']) {
+				assert.ok(
+					!res.stdout.includes(secret) && !res.stderr.includes(secret) && !state.includes(secret)
+				);
+			}
+		});
+	});
+});
+
+test('two T3 profiles signed in to one Google account are polled once', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin(), 'p1');
+		await writeT3AntigravityLogin(box, agLogin(), 'p2');
+		await withUsageApi(async (api, seen, url) => {
+			api.agDaily.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.5, NEXT_HOUR)] }] };
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 2, 'one request per endpoint');
+			assert.equal(res.snap.limits.length, 1);
+		});
+	});
+});
+
+test('an expired Antigravity login sends nothing and warns once', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin({ expiry: iso(Date.now() - 1000) }));
+		await withUsageApi(async (_api, seen, url) => {
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(seen, []);
+			assert.match(res.stderr, /antigravity usage not polled: the login token expired/);
+		});
+	});
+});
+
+test('one Antigravity endpoint failing still records the other', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily = { status: 503, body: {} };
+			api.agProd.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.5, NEXT_HOUR)] }] };
+			const res = await collect(box, url);
+			assert.equal(warnings(res.stderr), 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'antigravity'), [
+				['five_hour_gemini', iso(NEXT_HOUR), 50, false]
+			]);
+		});
+	});
+});
+
+test(
+	'on Linux the Antigravity CLI login is read from the keyring',
+	{ skip: process.platform !== 'linux' },
+	async () => {
+		await withSandbox(async (box) => {
+			const bin = join(box.home, 'bin');
+			await mkdir(bin, { recursive: true });
+			const login = join(box.home, 'keyring-login.json');
+			await writeFile(login, agLogin());
+			await writeFile(
+				join(bin, 'secret-tool'),
+				`#!/bin/sh\n[ "$*" = "lookup service gemini username antigravity" ] && exec cat '${login}'\nexit 1\n`,
+				{ mode: 0o755 }
+			);
+			await withUsageApi(async (api, seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.8, NEXT_HOUR)] }] };
+				const res = await collect(box, url, { PATH: `${bin}:/usr/bin:/bin` });
+				assert.equal(res.code, 0, res.stderr);
+				assert.equal(seen.length, 2);
+				assert.deepEqual(windows(res.snap, 'antigravity'), [
+					['five_hour_3p', iso(NEXT_HOUR), 20, false]
+				]);
+			});
+		});
+	}
+);
+
+test('a server too old for accounts gets the limits again without them', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeT3AntigravityLogin(box, agLogin());
+		const bodies: { limits?: Win[] }[] = [];
+		const ingest = createServer(async (req, res) => {
+			const chunks: Buffer[] = [];
+			for await (const c of req) chunks.push(c as Buffer);
+			const body = JSON.parse(gunzipSync(Buffer.concat(chunks)).toString());
+			bodies.push(body);
+			res.setHeader('content-type', 'application/json');
+			if (body.limits?.some((w: Win) => 'account' in w)) {
+				res.statusCode = 422;
+				res.end(
+					JSON.stringify({
+						error: 'invalid snapshot',
+						issues: ['limits.0: Unrecognized key: "account"']
+					})
+				);
+			} else res.end('{"ok":true}');
+		});
+		await new Promise<void>((resolve) => ingest.listen(0, '127.0.0.1', resolve));
+		try {
+			await withUsageApi(async (api, _seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.5, NEXT_HOUR)] }] };
+				const res = await run(COLLECTOR, [], {
+					...box.env,
+					BIG_SPENDER_DEVICE_ID: 'laptop',
+					BIG_SPENDER_INGEST_URL: `http://127.0.0.1:${(ingest.address() as AddressInfo).port}/`,
+					BIG_SPENDER_INGEST_TOKEN: 'tok',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${url}/agProd`
+				});
+				assert.equal(res.code, 0, res.stderr);
+				assert.match(res.stderr, /too old to tell accounts apart/);
+				assert.equal(bodies.length, 2);
+				assert.deepEqual(
+					bodies[1].limits?.map((w) => [w.provider, w.window, 'account' in w]),
+					[['antigravity', 'five_hour_3p', false]]
+				);
+			});
+		} finally {
+			ingest.closeAllConnections();
+			await new Promise((resolve) => ingest.close(resolve));
+		}
+	});
+});
+
+// An idle window: the endpoint reports 0% and a reset one window length from now, on every poll.
+const idleCodexBody = (nowMs: number) => ({
+	rate_limit: {
+		primary_window: {
+			used_percent: 0,
+			limit_window_seconds: 18000,
+			reset_after_seconds: 18000,
+			reset_at: Math.floor(nowMs / 1000) + 18000
+		},
+		secondary_window: {
+			used_percent: 100,
+			limit_window_seconds: 604800,
+			reset_after_seconds: 51976,
+			reset_at: (NEXT_HOUR + 14 * HOUR) / 1000
+		}
+	}
+});
+
+test('an idle Codex window polled every hour records no window instances', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			for (let run = 0; run < 3; run++) {
+				api.codex.body = idleCodexBody(Date.now());
+				const res = await collect(box, url);
+				assert.equal(res.code, 0, res.stderr);
+				assert.deepEqual(windows(res.snap, 'codex'), [
+					['seven_day', iso(NEXT_HOUR + 14 * HOUR), 100, true]
+				]);
+			}
+		});
+	});
+});
+
+test('a Codex window opened ten minutes ago at 0% is read as in use, not idle', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(0, Date.now() + 5 * HOUR - 10 * 60_000);
+			const res = await collect(box, url);
+			assert.match(res.stderr, /polled codex usage: five_hour 0%/);
+		});
+	});
+});
+
+test('idle placeholders an older version stored are not sent', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = codexFiveHour(40, NEXT_HOUR + 2 * HOUR);
+			assert.equal((await collect(box, url)).code, 0);
+			const statePath = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
+			const state = JSON.parse(await readFile(statePath, 'utf8'));
+			for (const hours of [1, 2, 3]) {
+				const resetsAt = iso(NEXT_HOUR - hours * HOUR + 60_000);
+				state.limits[`codex|five_hour|${Date.parse(resetsAt)}`] = {
+					provider: 'codex',
+					window: 'five_hour',
+					resetsAt,
+					peakPercent: 0
+				};
+			}
+			await writeFile(statePath, JSON.stringify(state));
+			const res = await collect(box, url);
+			assert.deepEqual(windows(res.snap, 'codex'), [
+				['five_hour', iso(NEXT_HOUR + 2 * HOUR), 40, false]
+			]);
+		});
+	});
+});
+
+test('a lockout missed between runs is still placed when the poll finds the five-hour window idle', async () => {
+	await withSandbox(async (box) => {
+		await writeCodexLogin(box, liveCodexToken());
+		await writeCodexLog(box, missedLockoutLogWithWeekly());
+		await withUsageApi(async (api, _seen, url) => {
+			api.codex.body = {
+				rate_limit: {
+					primary_window: {
+						used_percent: 0,
+						limit_window_seconds: 18000,
+						reset_after_seconds: 18000,
+						reset_at: Math.floor(Date.now() / 1000) + 18000
+					},
+					secondary_window: polledWindow(50, 604800, WEEKLY)
+				}
+			};
+			const res = await collect(box, url);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(hitsOf(res.snap).sort(), [
+				['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)],
+				['seven_day', iso(WEEKLY), 50, undefined]
+			]);
+		});
+	});
+});
+
+test('a second Codex account whose windows are idle still blocks blaming a refusal', async () => {
+	await withSandbox(async (box) => {
+		const seat = (user: string) =>
+			jwt({
+				exp: Math.floor(Date.now() / 1000) + 3600,
+				'https://api.openai.com/auth': { chatgpt_account_user_id: user }
+			});
+		await writeCodexLogin(box, seat('user-a'));
+		const other = join(box.home, 'codex-b');
+		await mkdir(other, { recursive: true });
+		await writeFile(
+			join(other, 'auth.json'),
+			JSON.stringify({ tokens: { access_token: seat('user-b'), account_id: CODEX_ACCOUNT } })
+		);
+		await writeT3Settings(box, { b: { driver: 'codex', config: { homePath: other } } });
+		const fullAt = REFUSED_AT + 30 * 60_000;
+		await writeCodexLog(box, [
+			sharingRefusal(REFUSED_AT),
+			codexTokenCount(fullAt, 300, 100, OLD_FIVE_HOUR)
+		]);
+		const idle = (seconds: number) => ({
+			used_percent: 0,
+			limit_window_seconds: seconds,
+			reset_after_seconds: seconds,
+			reset_at: Math.floor(Date.now() / 1000) + seconds
+		});
+		await withUsageApi(async (api, seen, url) => {
+			api.codex.body = {
+				rate_limit: { primary_window: idle(18000), secondary_window: idle(604800) }
+			};
+			const res = await collect(box, url);
+			assert.equal(seen.length, 2);
+			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 100, iso(fullAt)]]);
+		});
+	});
+});
+
+test('CLAUDE_CONFIG_DIR with a trailing slash still finds the account beside ~/.claude', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = claudeBody();
+			const res = await collect(box, url, { CLAUDE_CONFIG_DIR: `${join(box.home, '.claude')}/` });
+			assert.equal(seen.length, 1);
+			assert.ok(
+				res.snap.limits.every((w: Win) => w.account),
+				JSON.stringify(res.snap.limits)
+			);
+		});
+	});
+});
+
+test('a server that keeps refusing accounts is asked once more, then the push fails', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeT3AntigravityLogin(box, agLogin());
+		let requests = 0;
+		const ingest = createServer(async (req, res) => {
+			for await (const _ of req);
+			requests++;
+			res.statusCode = 422;
+			res.setHeader('content-type', 'application/json');
+			res.end(
+				JSON.stringify({
+					error: 'invalid snapshot',
+					issues: ['limits.0: Unrecognized key: "account"']
+				})
+			);
+		});
+		await new Promise<void>((resolve) => ingest.listen(0, '127.0.0.1', resolve));
+		try {
+			await withUsageApi(async (api, _seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.5, NEXT_HOUR)] }] };
+				const res = await run(COLLECTOR, [], {
+					...box.env,
+					BIG_SPENDER_DEVICE_ID: 'laptop',
+					BIG_SPENDER_INGEST_URL: `http://127.0.0.1:${(ingest.address() as AddressInfo).port}/`,
+					BIG_SPENDER_INGEST_TOKEN: 'tok',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${url}/agProd`
+				});
+				assert.notEqual(res.code, 0);
+				assert.equal(requests, 2);
+			});
+		} finally {
+			ingest.closeAllConnections();
+			await new Promise((resolve) => ingest.close(resolve));
+		}
+	});
+});
+
+test("a refusal in the logs joins its account's polled window without moving its reset", async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		const hitMs = NEXT_HOUR - 3 * HOUR;
+		await writeClaudeLog(box, [refusedClaudeWeekly(hitMs, weeklyResetsAt - 60_000)]);
+		await withUsageApi(async (api, _seen, url) => {
+			api.claude.body = { limits: [fableWeekly(100)] };
+			const res = await collect(box, url);
+			assert.deepEqual(hitsOf(res.snap), [
+				['seven_day_fable', iso(weeklyResetsAt), 100, iso(hitMs)]
+			]);
+		});
+	});
+});
+
+// Seeds state with limit records, then reads one logged Fable refusal with the given reset.
+async function refusalAgainst(box: Sandbox, url: string, records: Win[], refusalReset: number) {
+	const off = { BIG_SPENDER_POLL_LIMITS: 'off' };
+	assert.equal((await collect(box, url, off)).code, 0);
+	const statePath = join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json');
+	const state = JSON.parse(await readFile(statePath, 'utf8'));
+	state.limits = Object.fromEntries(records.map((r, i) => [`seed-${i}`, r]));
+	await writeFile(statePath, JSON.stringify(state));
+	await writeClaudeLog(box, [refusedClaudeWeekly(NEXT_HOUR - 3 * HOUR, refusalReset)]);
+	const res = await collect(box, url, off);
+	assert.equal(res.code, 0, res.stderr);
+	return (res.snap.limits as Win[])
+		.map((w) => [w.account ?? null, w.resetsAt, w.peakPercent, w.hitAt ?? null])
+		.sort((x, y) => String(x[1]).localeCompare(String(y[1])));
+}
+
+const ACCT = 'accountAAAAAAAAA';
+const fable = (resetMs: number, extra: Partial<Win> = {}): Win => ({
+	provider: 'claude',
+	window: 'seven_day_fable',
+	resetsAt: iso(resetMs),
+	peakPercent: 40,
+	...extra
+});
+
+test('a logged refusal joins only the nearest accounted window, not a loose one beside it', async () => {
+	await withSandbox(async (box) => {
+		await withUsageApi(async (_api, _seen, url) => {
+			const looseHit = iso(NEXT_HOUR - 10 * HOUR);
+			const limits = await refusalAgainst(
+				box,
+				url,
+				[
+					fable(weeklyResetsAt, { account: ACCT }),
+					fable(weeklyResetsAt + 4 * 60_000, { peakPercent: 90, hitAt: looseHit })
+				],
+				weeklyResetsAt + 2 * 60_000
+			);
+			assert.deepEqual(limits, [
+				[ACCT, iso(weeklyResetsAt), 100, iso(NEXT_HOUR - 3 * HOUR)],
+				[null, iso(weeklyResetsAt + 4 * 60_000), 90, looseHit]
+			]);
+		});
+	});
+});
+
+test("a logged refusal between two of one account's windows joins the nearer one only", async () => {
+	await withSandbox(async (box) => {
+		await withUsageApi(async (_api, _seen, url) => {
+			const limits = await refusalAgainst(
+				box,
+				url,
+				[
+					fable(weeklyResetsAt, { account: ACCT }),
+					fable(weeklyResetsAt + 3 * 60_000, { account: ACCT, peakPercent: 50 })
+				],
+				weeklyResetsAt + 2 * 60_000
+			);
+			assert.deepEqual(limits, [
+				[ACCT, iso(weeklyResetsAt), 40, null],
+				[ACCT, iso(weeklyResetsAt + 3 * 60_000), 100, iso(NEXT_HOUR - 3 * HOUR)]
+			]);
+		});
+	});
+});
+
+// The account hash is keyed with the ingest token, so a leaked data file can't be matched
+// against known account ids or emails, nor against another tool's plain hash of the same id.
+
+const keyedHash = (token: string, id: string) =>
+	createHmac('sha256', token).update(id).digest('base64url').slice(0, 16);
+const plainHash = (id: string) => createHash('sha256').update(id).digest('base64url').slice(0, 16);
+
+test('the account hash is an HMAC of the account id keyed with the ingest token', async () => {
+	const accounts: (string | undefined)[][] = [];
+	for (const token of ['token-one', 'token-two']) {
+		await withSandbox(async (box) => {
+			await writeT3AntigravityLogin(box, agLogin());
+			await withUsageApi(async (api, _seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.5, NEXT_HOUR)] }] };
+				const res = await collect(box, url, { BIG_SPENDER_INGEST_TOKEN: token });
+				assert.equal(res.code, 0, res.stderr);
+				accounts.push(res.snap.limits.map((w: Win) => w.account));
+			});
+		});
+	}
+	const id = 'antigravity-account\0someone@example.com';
+	assert.deepEqual(accounts, [[keyedHash('token-one', id)], [keyedHash('token-two', id)]]);
+	assert.notEqual(accounts[0][0], plainHash(id));
+});
+
+test('without an ingest token no usage endpoint is asked and nothing is stored from a poll', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = claudeBody();
+			const res = await collect(box, url, { BIG_SPENDER_INGEST_TOKEN: '' });
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 0);
+			assert.deepEqual(res.snap.limits ?? [], []);
+			assert.match(res.stderr, /limits not polled: BIG_SPENDER_INGEST_TOKEN is not set/);
 		});
 	});
 });

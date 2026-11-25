@@ -304,3 +304,199 @@ test('limitHits keeps the earliest hit and highest peak when one device reports 
 		{ deviceId: 'mac', hitAt: '2026-11-14T17:30:00.000Z', peakPercent: 100 }
 	]);
 });
+
+// Accounts
+
+const A = 'accountAAAAAAAAA';
+const B = 'accountBBBBBBBBB';
+
+test('two accounts whose windows reset in the same minute stay two instances', () => {
+	const merged = mergeLimits([win({ account: A })], [win({ account: B, peakPercent: 30 })]);
+	assert.deepEqual(
+		merged.map((w) => [w.account, w.peakPercent]),
+		[
+			[A, 100],
+			[B, 30]
+		]
+	);
+	assert.deepEqual(mergeLimits(merged, merged), merged);
+});
+
+test('a window without an account joins the account whose reset is nearest', () => {
+	const log = win({ hitAt: '2026-11-14T17:00:00.000Z', resetsAt: '2026-11-14T20:02:00.000Z' });
+	const a = win({
+		account: A,
+		hitAt: undefined,
+		peakPercent: 60,
+		resetsAt: '2026-11-14T20:00:00.000Z'
+	});
+	const b = win({
+		account: B,
+		hitAt: undefined,
+		peakPercent: 20,
+		resetsAt: '2026-11-14T20:02:00.000Z'
+	});
+	const merged = mergeLimits([a, b], [log]);
+	assert.deepEqual(
+		merged.map((w) => [w.account, w.peakPercent, w.hitAt]),
+		[
+			[A, 60, undefined],
+			[B, 100, '2026-11-14T17:00:00.000Z']
+		]
+	);
+	assert.deepEqual(mergeLimits(merged, [log]), merged);
+});
+
+test('windows without an account from an older collector join the accounted one, so the upgrade counts once', async () => {
+	const { limits } = await limitsOf({
+		mac: [win()],
+		pc: [win({ account: A, hitAt: '2026-11-14T17:31:00.000Z' })]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 1);
+	assert.equal(w.hit, 1);
+});
+
+test("limits() counts a second account blocked during the first one's lockout as its own hit", async () => {
+	const { limits } = await limitsOf({
+		mac: [
+			win({ account: A, hitAt: '2026-11-14T17:00:00.000Z', resetsAt: '2026-11-14T20:00:00.000Z' }),
+			win({ account: B, hitAt: '2026-11-14T18:00:00.000Z', resetsAt: '2026-11-14T21:00:00.000Z' })
+		]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 2);
+	assert.equal(w.hit, 2);
+	assert.equal(w.lockedHours, 6);
+});
+
+test('limits() lets a refusal without an account extend the one lockout running then', async () => {
+	// The poll saw A blocked until 00:20; a later refusal says the reset moved to 01:40.
+	const { limits } = await limitsOf(
+		{
+			mac: [
+				win({
+					account: A,
+					hitAt: '2026-11-13T20:46:00.000Z',
+					resetsAt: '2026-11-14T00:20:00.000Z'
+				}),
+				win({ hitAt: '2026-11-13T22:23:00.000Z', resetsAt: '2026-11-14T01:40:00.000Z' })
+			]
+		},
+		Date.parse('2026-11-14T22:30:00Z')
+	);
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.hit, 1);
+	assert.equal(w.lockedHours, 4.9);
+});
+
+test('limitHits names the account of each instance and the schema takes only a hash', () => {
+	const report = limitHits(
+		[withLimits('mac', [win({ account: A })]), withLimits('pc', [win({ account: B })])],
+		Date.parse('2026-11-15T00:00:00Z')
+	);
+	assert.deepEqual(
+		report.hits.map((h) => h.account),
+		[A, B]
+	);
+	const bad = { ...snapshot('mac'), limits: [win({ account: 'someone@example.com' })] };
+	assert.equal(usageSnapshotSchema.safeParse(bad).success, false);
+});
+
+test('the public limits summary names no account', async () => {
+	const { limits } = await limitsOf({ mac: [win({ account: A })] });
+	assert.ok(!JSON.stringify(limits).includes(A));
+});
+
+test('limits() does not count windows that were never used, as older collectors stored them', async () => {
+	const idle = (resetsAt: string) =>
+		win({ window: 'five_hour', resetsAt, peakPercent: 0, hitAt: undefined });
+	const { limits } = await limitsOf({
+		mac: [
+			idle('2026-11-14T10:01:00.000Z'),
+			idle('2026-11-14T11:02:00.000Z'),
+			win({ resetsAt: '2026-11-14T20:00:00.000Z' })
+		]
+	});
+	const [w] = limits.providers[0].windows;
+	assert.equal(w.observed, 1);
+	assert.equal(w.hit, 1);
+});
+
+test("one account's drifting reports are never split by another account's nearby window", () => {
+	const a = win({
+		account: A,
+		hitAt: undefined,
+		peakPercent: 40,
+		resetsAt: '2026-11-14T20:00:00.000Z'
+	});
+	const b1 = win({
+		account: B,
+		hitAt: undefined,
+		peakPercent: 50,
+		resetsAt: '2026-11-14T20:02:00.000Z'
+	});
+	const b2 = win({ account: B, resetsAt: '2026-11-14T20:03:00.000Z' });
+	const expected = [
+		[A, '2026-11-14T20:00:00.000Z', 40],
+		[B, '2026-11-14T20:02:00.000Z', 100]
+	];
+	const shape = (list: LimitWindow[]) => list.map((w) => [w.account, w.resetsAt, w.peakPercent]);
+	assert.deepEqual(shape(mergeLimits([a, b1], [b2])), expected);
+	assert.deepEqual(shape(mergeLimits([b2], [a], [b1])), expected);
+	const log = win({ resetsAt: '2026-11-14T20:03:00.000Z' });
+	assert.deepEqual(shape(mergeLimits([a, b1], [log])), expected);
+});
+
+test('windows without an account attach by distance to accounted reports only, in any order', () => {
+	const at = (t: string, extra: Partial<LimitWindow> = {}) =>
+		win({ hitAt: undefined, peakPercent: 10, resetsAt: `2026-11-14T${t}:00.000Z`, ...extra });
+	const shape = (list: LimitWindow[]) =>
+		list.map((w) => [w.account ?? null, w.resetsAt, w.peakPercent]);
+	const a = at('20:00', { account: A, peakPercent: 40 });
+	const b = at('20:04', { account: B, peakPercent: 50 });
+	const u1 = at('20:02', { peakPercent: 60 });
+	const u2 = at('20:03', { peakPercent: 70 });
+	assert.deepEqual(shape(mergeLimits([a, b, u1, u2])), shape(mergeLimits([a, b, u2, u1])));
+	assert.deepEqual(shape(mergeLimits([a, b, u1, u2])), [
+		[A, '2026-11-14T20:00:00.000Z', 60],
+		[B, '2026-11-14T20:04:00.000Z', 70]
+	]);
+
+	const chain = [
+		a,
+		at('20:02', { peakPercent: 80 }),
+		at('20:04', { peakPercent: 90 }),
+		at('20:06', { peakPercent: 95 })
+	];
+	const expected = [
+		[A, '2026-11-14T20:00:00.000Z', 80],
+		[null, '2026-11-14T20:04:00.000Z', 95]
+	];
+	assert.deepEqual(shape(mergeLimits(chain)), expected);
+	assert.deepEqual(shape(mergeLimits([...chain].reverse())), expected);
+	assert.deepEqual(shape(mergeLimits(mergeLimits(chain), [chain[3]])), expected);
+});
+
+test('merging again with reports already merged changes nothing, and one refusal hits one account', () => {
+	const at = (t: string, extra: Partial<LimitWindow> = {}) =>
+		win({ hitAt: undefined, peakPercent: 10, resetsAt: `2026-11-14T${t}:00.000Z`, ...extra });
+	const shape = (list: LimitWindow[]) =>
+		list.map((w) => [w.account ?? null, w.resetsAt, w.peakPercent, w.hitAt ?? null]);
+	const a1 = at('20:00', { account: A, peakPercent: 40 });
+	const a2 = at('20:02', { account: A, peakPercent: 50 });
+	const b = at('20:05', { account: B, peakPercent: 30 });
+	const u = at('20:03', { peakPercent: 100, hitAt: '2026-11-14T17:00:00.000Z' });
+	for (const reports of [
+		[a1, a2, u],
+		[a1, a2, b, u]
+	]) {
+		const once = mergeLimits(reports);
+		assert.deepEqual(shape(mergeLimits(once, [u])), shape(once));
+		assert.deepEqual(
+			shape(mergeLimits(mergeLimits(reports.filter((r) => r !== u)), [u])),
+			shape(once)
+		);
+		assert.equal(once.filter((w) => w.hitAt).length, 1);
+	}
+});

@@ -20,59 +20,96 @@ const RESET_SLACK_MS = 2 * MINUTE_MS;
 type Tagged = { window: LimitWindow; deviceId?: string };
 
 /**
- * Groups reports into window instances: same provider and window, with resets at most
- * RESET_SLACK_MS after the earliest reset of the group (rounded down to the minute). Each member's
- * `resetsAt` is rounded; the first member of a group carries the earliest.
+ * Groups reports into window instances. Each account's reports of one provider and window whose
+ * resets are at most RESET_SLACK_MS after the earliest of the group (rounded down to the minute)
+ * are one instance, so another account's window can never split or join it. A report without an
+ * account (a log line names none, and older collectors sent none) joins the account whose kept
+ * reset is nearest within RESET_SLACK_MS (ties go to the first account in sort order), so it is never counted as a second instance; the rest group
+ * among themselves.
  */
 function groupWindows(items: Tagged[]): Tagged[][] {
-	const sorted = items
-		.map(({ window: w, deviceId }): Tagged => ({
+	const byWindow = new Map<string, Tagged[]>();
+	for (const { window: w, deviceId } of items) {
+		const item = {
 			window: { ...w, resetsAt: new Date(minuteOf(w.resetsAt)).toISOString() },
 			deviceId
-		}))
-		.sort(
-			(a, b) =>
-				a.window.provider.localeCompare(b.window.provider) ||
-				a.window.window.localeCompare(b.window.window) ||
-				Date.parse(a.window.resetsAt) - Date.parse(b.window.resetsAt)
-		);
-	const groups: Tagged[][] = [];
-	for (const item of sorted) {
-		const group = groups.at(-1);
-		const first = group?.[0].window;
-		if (
-			group &&
-			first &&
-			first.provider === item.window.provider &&
-			first.window === item.window.window &&
-			Date.parse(item.window.resetsAt) - Date.parse(first.resetsAt) <= RESET_SLACK_MS
-		) {
-			group.push(item);
-		} else {
-			groups.push([item]);
-		}
+		};
+		const key = `${w.provider}|${w.window}`;
+		byWindow.set(key, [...(byWindow.get(key) ?? []), item]);
 	}
+	const groups: Tagged[][] = [];
+	for (const list of byWindow.values()) {
+		const accounted = clusterByReset(list.filter((m) => m.window.account));
+		// Distances are to accounted reports only, so attaching one record never moves the next.
+		const attached = accounted.map((group) => [...group]);
+		const loose: Tagged[] = [];
+		for (const item of list.filter((m) => !m.window.account)) {
+			const ms = resetMs(item);
+			let best = -1;
+			let bestGap = Infinity;
+			for (const [i, group] of accounted.entries()) {
+				// To the reset the group keeps, so merging the result again attaches it the same way.
+				const gap = Math.abs(resetMs(group[0]) - ms);
+				if (gap < bestGap) [best, bestGap] = [i, gap];
+			}
+			if (best !== -1 && bestGap <= RESET_SLACK_MS) attached[best].push(item);
+			else loose.push(item);
+		}
+		groups.push(...attached, ...clusterByReset(loose));
+	}
+	// The first member carries the group's reset: its earliest accounted report when it has one,
+	// so a window without an account never moves the reset of the account it joined.
+	const rank = (m: Tagged) => (m.window.account ? 0 : 1);
+	for (const group of groups) group.sort((a, b) => rank(a) - rank(b) || resetMs(a) - resetMs(b));
 	return groups;
 }
+
+const resetMs = (m: Tagged) => Date.parse(m.window.resetsAt);
+
+/** Same account (or none), resets within RESET_SLACK_MS of the group's earliest. */
+function clusterByReset(items: Tagged[]): Tagged[][] {
+	const sorted = [...items].sort(
+		(a, b) =>
+			(a.window.account ?? '').localeCompare(b.window.account ?? '') || resetMs(a) - resetMs(b)
+	);
+	const clusters: Tagged[][] = [];
+	for (const item of sorted) {
+		const cluster = clusters.at(-1);
+		if (
+			cluster &&
+			cluster[0].window.account === item.window.account &&
+			resetMs(item) - resetMs(cluster[0]) <= RESET_SLACK_MS
+		) {
+			cluster.push(item);
+		} else {
+			clusters.push([item]);
+		}
+	}
+	return clusters;
+}
+
+const accountOf = (group: Tagged[]) => group.find((m) => m.window.account)?.window.account;
 
 const byTime = (a: string, b: string) => Date.parse(a) - Date.parse(b);
 
 /**
  * Merges window lists into one record per window instance (see groupWindows), which keeps the
- * earliest reset. A group keeps the highest peak and the earliest hit, so merging is idempotent
- * and one account's window reported by two devices counts once. Sorted by reset time; past the
- * cap the oldest are dropped.
+ * earliest reset, or the earliest of the account's own reports. A group keeps the highest peak and the earliest hit, so merging is idempotent
+ * and one account's window reported by two devices counts once, while two accounts' windows stay
+ * apart. Sorted by reset time; past the cap the oldest are dropped.
  */
 export function mergeLimits(...lists: (LimitWindow[] | undefined)[]): LimitWindow[] {
 	const groups = groupWindows(lists.flatMap((list) => list ?? []).map((window) => ({ window })));
 	const merged = groups.map((group): LimitWindow => {
 		const { provider, window, resetsAt } = group[0].window;
+		const account = accountOf(group);
 		const hitAt = group
 			.map((m) => m.window.hitAt)
 			.filter((t): t is string => t !== undefined)
 			.sort(byTime)[0];
 		return {
 			provider,
+			...(account ? { account } : {}),
 			window,
 			resetsAt,
 			peakPercent: Math.max(...group.map((m) => m.window.peakPercent)),
@@ -83,7 +120,8 @@ export function mergeLimits(...lists: (LimitWindow[] | undefined)[]): LimitWindo
 		(a, b) =>
 			Date.parse(a.resetsAt) - Date.parse(b.resetsAt) ||
 			a.provider.localeCompare(b.provider) ||
-			a.window.localeCompare(b.window)
+			a.window.localeCompare(b.window) ||
+			(a.account ?? '').localeCompare(b.account ?? '')
 	);
 	return sorted.slice(Math.max(0, sorted.length - MAX_LIMIT_WINDOWS));
 }
@@ -92,6 +130,8 @@ export type LimitHitDevice = { deviceId: string; hitAt: string; peakPercent: num
 
 export type LimitHit = {
 	provider: UsageProvider;
+	/** The hashed account, when a report of the instance named one. */
+	account?: string;
 	window: string;
 	/** Earliest reset of the window instance, as mergeLimits keeps it. */
 	resetsAt: string;
@@ -127,14 +167,25 @@ export function limitHits(snapshots: UsageSnapshot[], now: number): LimitHitsRep
 		);
 		if (!devices.length) return [];
 		const { provider, window, resetsAt } = group[0].window;
-		return [{ provider, window, resetsAt, hitAt: devices[0].hitAt, devices }];
+		const account = accountOf(group);
+		return [
+			{
+				provider,
+				...(account ? { account } : {}),
+				window,
+				resetsAt,
+				hitAt: devices[0].hitAt,
+				devices
+			}
+		];
 	});
 	hits.sort(
 		(a, b) =>
 			byTime(a.hitAt, b.hitAt) ||
 			a.provider.localeCompare(b.provider) ||
 			a.window.localeCompare(b.window) ||
-			byTime(a.resetsAt, b.resetsAt)
+			byTime(a.resetsAt, b.resetsAt) ||
+			(a.account ?? '').localeCompare(b.account ?? '')
 	);
 	return { generatedAt: new Date(now).toISOString(), hits };
 }
@@ -181,6 +232,30 @@ const rank = (w: string) => {
 const tenth = (n: number) => Math.round(n * 10) / 10;
 
 /**
+ * The lockout a hit at hitMs extends: its account's, if still running. A window without an
+ * account may be any account's, so it extends the one lockout running then, and an account takes
+ * over a running lockout that windows without one started.
+ */
+function lockoutAt(
+	lockouts: Map<string, { day: number; endMs: number }>,
+	account: string,
+	hitMs: number
+) {
+	const own = lockouts.get(account);
+	if (own && hitMs < own.endMs) return own;
+	const running = [...lockouts].filter(
+		([key, l]) => key !== account && hitMs < l.endMs && (account === '' || key === '')
+	);
+	if (running.length !== 1) return undefined;
+	const [key, lockout] = running[0];
+	if (key === '') {
+		lockouts.delete('');
+		lockouts.set(account, lockout);
+	}
+	return lockout;
+}
+
+/**
  * Limit hits over the last 90 UTC days, ending at the end of today (the 90d range window).
  * Nothing finer than a UTC day is published and no device is named.
  */
@@ -194,6 +269,8 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 		const byWindow = new Map<string, LimitWindow[]>();
 		for (const w of windows) {
 			if (w.provider !== provider) continue;
+			// Never used: older collectors stored an idle window's placeholder from every poll.
+			if (w.peakPercent === 0 && !w.hitAt) continue;
 			if (anchor(w) < from || anchor(w) >= to) continue;
 			byWindow.set(w.window, [...(byWindow.get(w.window) ?? []), w]);
 		}
@@ -209,8 +286,9 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 				let hit = 0;
 				let locked = 0;
 				let absorbed = 0;
-				// The lockout in progress: its day, and when it ends so far.
-				let lockout: { day: number; endMs: number } | undefined;
+				// Each account's lockout in progress (key '' for windows without one): its day, and
+				// when it ends so far.
+				const lockouts = new Map<string, { day: number; endMs: number }>();
 				const byHit = list.sort(
 					(a, b) => Date.parse(a.hitAt ?? a.resetsAt) - Date.parse(b.hitAt ?? b.resetsAt)
 				);
@@ -224,7 +302,8 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 					// A provider can move the reset of a window while it is blocked (Claude does: a
 					// refusal at 20:46 said 00:20, one at 22:23 said 01:40). A hit before the current
 					// lockout ends is that lockout running longer, not a second one.
-					if (lockout && hitMs < lockout.endMs) {
+					const lockout = lockoutAt(lockouts, w.account ?? '', hitMs);
+					if (lockout) {
 						absorbed++;
 						const extra = Math.max(0, resetMs - lockout.endMs) / HOUR_MS;
 						lockout.endMs = Math.max(lockout.endMs, resetMs);
@@ -233,7 +312,7 @@ export function summarizeLimits(snapshots: UsageSnapshot[], now: number): Limits
 						continue;
 					}
 					const hours = Math.max(0, resetMs - hitMs) / HOUR_MS;
-					lockout = { day, endMs: resetMs };
+					lockouts.set(w.account ?? '', { day, endMs: resetMs });
 					hit++;
 					locked += hours;
 					series.hits[day]++;
