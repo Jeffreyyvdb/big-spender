@@ -162,7 +162,9 @@ async function acquireLock() {
  * @typedef {number | [number, number] | [number, string] | [number, number, string, ...(number | string)[]] | [number, Record<string, any>] | (number | string)[]} Seen
  * One subscription usage window instance; see limitWindowSchema in src/schema.ts.
  * @typedef {{ provider: string, account?: string, window: string, resetsAt: string, peakPercent: number, hitAt?: string }} Limit
- * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[] }} State
+ * vibe holds, per hashed Mistral Vibe session id, [latest update, uncached input, cached input,
+ * output]: the running totals already counted; see readVibe.
+ * @typedef {{ version: number, files: Record<string, FileState>, seen: Record<string, Seen>, buckets: Record<string, Bucket>, limits?: Record<string, Limit>, fixes?: string[], rescan?: string[], cursorBackfills?: string[], vibe?: Record<string, number[]> }} State
  * cursorBackfills holds a hash of each ingest URL and Cursor API key pair whose server stored the
  * account's full history. Hashed, because an ingest URL can carry a credential.
  */
@@ -185,7 +187,12 @@ async function loadState() {
 		limits: {},
 		fixes: [FIX_CLAUDE_OUTPUT, FIX_LIMITS, FIX_CODEX_REFUSALS]
 	};
-	if (RESET) return empty;
+	if (RESET) {
+		// The server keeps the Vibe usage already sent, in the hours it was first seen. Recounting
+		// it from running totals would book it again in a later hour, so --reset keeps state.vibe.
+		const vibe = parseJson(await readFile(STATE_PATH, 'utf8').catch(() => ''))?.vibe;
+		return isObject(vibe) ? { ...empty, vibe } : empty;
+	}
 	try {
 		const s = JSON.parse(await readFile(STATE_PATH, 'utf8'));
 		if (s?.version !== STATE_VERSION) return empty;
@@ -2871,6 +2878,7 @@ async function readOpenCode(paths, ctx, provider) {
 const VIBE_ID = /^[A-Za-z0-9_-]{1,100}$/;
 const VIBE_STATE_FILE = /^[A-Za-z0-9_-]+\.json$/;
 const VIBE_JOURNAL = /^journal\/\d{16}\.jsonl$/;
+const VIBE_MAX_TOKENS = 1e15;
 
 async function readJsonFile(path) {
 	try {
@@ -2921,9 +2929,11 @@ async function readVibeSession(dir, id) {
 
 	const usage = session.tokenUsage;
 	const updatedAt = session.updatedAt;
-	if (!isObject(usage) || typeof updatedAt !== 'number' || !Number.isFinite(updatedAt)) return null;
-	const input = num(usage.inputTokens);
-	const cached = Math.min(num(usage.cachedInputTokens), input);
+	if (!isObject(usage) || !plausibleTime(updatedAt) || updatedAt > Date.now() + DAY_MS) return null;
+	const counts = [usage.inputTokens, usage.cachedInputTokens ?? 0, usage.outputTokens];
+	if (!counts.every((n) => Number.isSafeInteger(n) && n >= 0 && n <= VIBE_MAX_TOKENS)) return null;
+	const [input, cachedInput, output] = counts;
+	const cached = Math.min(cachedInput, input);
 
 	const runtimeFile = stateFile(manifest.runtime_state, 'runtime-state.json');
 	const runtime = await readJsonFile(join(genDir, runtimeFile));
@@ -2941,29 +2951,40 @@ async function readVibeSession(dir, id) {
 		updatedAt,
 		uncached: input - cached,
 		cached,
-		output: num(usage.outputTokens)
+		output
 	};
 }
 
+const vibeTotal = (s) => s.uncached + s.cached + s.output;
+
+/**
+ * Reads every store in one call, so a session found in two of them counts once, at its larger
+ * total. Its counted totals live in `state.vibe`, which pruneState and --reset leave alone: a
+ * session resumed after the window, or rebuilt in a later hour, would otherwise count again.
+ */
 async function readVibe(paths, ctx, provider) {
+	if (!paths.length) return;
 	/** @type {Map<string, VibeSession>} */
 	const sessions = new Map();
 	for (const dir of new Set(paths.map((p) => resolve(p)))) {
-		for (const id of await readdir(dir).catch(() => [])) {
-			if (!VIBE_ID.test(id) || sessions.has(id)) continue;
-			const s = await readVibeSession(join(dir, id), id).catch(() => null);
-			if (s) sessions.set(id, s);
+		for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+			if (!entry.isDirectory() || !VIBE_ID.test(entry.name)) continue;
+			const s = await readVibeSession(join(dir, entry.name), entry.name).catch(() => null);
+			const held = sessions.get(entry.name);
+			if (s && (!held || vibeTotal(s) > vibeTotal(held))) sessions.set(entry.name, s);
 		}
 	}
+	const counted = (ctx.state.vibe ??= {});
+	const onDisk = new Set();
 	for (const s of sessions.values()) {
-		if (s.updatedAt < ctx.cutoffMs) continue;
-		const key = `m:${shortHash(s.id)}`;
-		const prev = Array.isArray(ctx.state.seen[key]) ? ctx.state.seen[key] : [0, 0, 0, 0];
-		const grew = (i, now) => Math.max(0, now - prev[i]);
-		const input = grew(1, s.uncached);
-		const cacheRead = grew(2, s.cached);
-		const output = grew(3, s.output);
-		if (input || cacheRead || output) {
+		const key = shortHash(s.id);
+		onDisk.add(key);
+		const prev = counted[key] ?? [s.updatedAt, 0, 0, 0];
+		if (s.updatedAt < ctx.cutoffMs && !counted[key]) continue;
+		const now = [s.uncached, s.cached, s.output];
+		const [input, cacheRead, output] = now.map((n, i) => Math.max(0, n - prev[i + 1]));
+		counted[key] = [Math.max(prev[0], s.updatedAt), ...now.map((n, i) => Math.max(n, prev[i + 1]))];
+		if (s.updatedAt >= ctx.cutoffMs && (input || cacheRead || output)) {
 			addRecord(ctx.state, {
 				ts: s.updatedAt,
 				provider,
@@ -2977,7 +2998,9 @@ async function readVibe(paths, ctx, provider) {
 				output
 			});
 		}
-		ctx.state.seen[key] = [s.updatedAt, s.uncached, s.cached, s.output];
+	}
+	for (const [key, [updatedAt]] of Object.entries(counted)) {
+		if (!onDisk.has(key) && updatedAt < ctx.cutoffMs) delete counted[key];
 	}
 }
 
@@ -3119,8 +3142,12 @@ const SOURCES = {
 		priceKeys: opencodePriceKeys
 	},
 	mistral: {
-		paths: [join(HOME, '.vibe', 'logs', 'session', 'unified')],
-		envPaths: () => fromEnv('VIBE_HOME', 'logs', 'session', 'unified'),
+		// readVibe needs every store in one call, so the default comes from envPaths too.
+		paths: [],
+		envPaths: () => [
+			join(HOME, '.vibe', 'logs', 'session', 'unified'),
+			...fromEnv('VIBE_HOME', 'logs', 'session', 'unified')
+		],
 		read: readVibe,
 		priceKeys: (model) => [`mistral/${model}`, model]
 	}

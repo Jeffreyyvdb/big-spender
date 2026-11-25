@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { usageSnapshotSchema, type UsageSnapshot } from '../src/schema.ts';
@@ -224,16 +224,18 @@ test('a later run adds only what the session total grew by, in the hour of its l
 	});
 });
 
-test('a total that went down books nothing, and later growth counts from the lower total', async () => {
+test('a total that went down books nothing, and only growth past the counted total counts', async () => {
 	await withSandbox(async ({ env, home }) => {
 		const store = await setup(home);
 		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(1000, 0, 200) });
 		await collect(env);
 		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(400, 0, 50) });
 		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 1000, 'after the drop');
-		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(500, 0, 80) });
+		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(1000, 0, 200) });
+		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 1000, 'back to the total');
+		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(1100, 0, 230) });
 		const total = byModel((await collect(env)).snapshot)[LARGE];
-		assert.deepEqual([total.input, total.output], [1100, 230], 'after regrowth');
+		assert.deepEqual([total.input, total.output], [1100, 230], 'after growth');
 	});
 });
 
@@ -338,5 +340,95 @@ test('a model id that is a file path leaves only its file name', async () => {
 			usage: usage(10, 0, 1)
 		});
 		assert.deepEqual(Object.keys(byModel((await collect(env)).snapshot)), ['devstral.gguf']);
+	});
+});
+
+test('a session with an implausible time or fractional tokens is skipped and the snapshot stays valid', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const store = await setup(home);
+		await writeSession(store, {
+			id: 'future',
+			metaModel: LARGE,
+			updatedAt: 1e16,
+			usage: usage(5, 0, 5)
+		});
+		await writeSession(store, { id: 'fraction', metaModel: LARGE, usage: usage(1.5, 0, 1) });
+		await writeSession(store, { id: 'good', metaModel: LARGE, usage: usage(100, 0, 10) });
+		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 100, 'first run');
+		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 100, 'second run');
+	});
+});
+
+test('two stores holding one session at different totals count the larger total once', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const store = await setup(home);
+		const elsewhere = join(home, 'elsewhere');
+		const other = join(elsewhere, 'logs', 'session', 'unified');
+		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(100, 0, 0) });
+		await writeSession(other, { id: 's1', metaModel: LARGE, usage: usage(200, 0, 0) });
+		for (const run of ['first', 'second', 'third']) {
+			const { snapshot } = await collect({ ...env, VIBE_HOME: elsewhere });
+			assert.equal(byModel(snapshot)[LARGE].input, 200, `${run} run`);
+		}
+	});
+});
+
+test('a symlinked session directory is not read', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const store = await setup(home);
+		const outside = join(home, 'outside');
+		await writeSession(outside, { id: 'linked', metaModel: LARGE, usage: usage(90, 0, 0) });
+		await symlink(join(outside, 'linked'), join(store, 'linked'));
+		await writeSession(store, { id: 'good', metaModel: LARGE, usage: usage(10, 0, 0) });
+		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 10);
+	});
+});
+
+const LATER_MS = 3 * DAY_MS;
+
+/** Runs the collector with its clock LATER_MS ahead. Pricing is seeded to stay fresh then. */
+async function collectLater(env: Record<string, string>, home: string) {
+	await writeFile(
+		join(home, '.cache', 'big-spender', 'litellm-prices.json'),
+		JSON.stringify({ fetchedAt: Date.now() + 2 * LATER_MS, models: PRICES })
+	);
+	const clock = `const now = Date.now; Date.now = () => now() + ${LATER_MS};`;
+	const shift = `--import=data:text/javascript,${encodeURIComponent(clock)}`;
+	return collect({ ...env, NODE_OPTIONS: shift });
+}
+
+test('a session idle past the 90-day window adds only its growth when it resumes', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const store = await setup(home);
+		const idle = { id: 's1', metaModel: LARGE, updatedAt: NOW_HOUR - 88 * DAY_MS };
+		await writeSession(store, { ...idle, usage: usage(1000, 0, 0) });
+		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 1000, 'counted');
+		assert.equal((await collectLater(env, home)).snapshot.hourly.length, 0, 'aged out');
+		await writeSession(store, { ...idle, updatedAt: NOW_HOUR - HOUR_MS, usage: usage(1100, 0, 0) });
+		assert.equal(byModel((await collectLater(env, home)).snapshot)[LARGE].input, 100, 'resumed');
+	});
+});
+
+test('--reset does not count Vibe usage again in a later hour', async () => {
+	await withSandbox(async ({ env, home }) => {
+		const store = await setup(home);
+		await writeSession(store, {
+			id: 's1',
+			metaModel: LARGE,
+			updatedAt: NOW_HOUR - 9 * DAY_MS,
+			usage: usage(100, 0, 0)
+		});
+		await collect(env);
+		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(150, 0, 0) });
+		await collect(env);
+		const reset = await run(COLLECTOR, ['--dry-run', '--reset'], {
+			...env,
+			BIG_SPENDER_DEVICE_ID: 'laptop'
+		});
+		assert.equal(reset.code, 0, reset.stderr);
+		const rebuilt = usageSnapshotSchema.parse(JSON.parse(reset.stdout));
+		assert.deepEqual(rebuilt.hourly, [], 'nothing counted twice');
+		await writeSession(store, { id: 's1', metaModel: LARGE, usage: usage(170, 0, 0) });
+		assert.equal(byModel((await collect(env)).snapshot)[LARGE].input, 20, 'growth after reset');
 	});
 });
