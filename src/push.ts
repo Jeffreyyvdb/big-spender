@@ -96,9 +96,18 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		throw new UsageError(`the device id "${CURSOR_DEVICE_ID}" is reserved for Cursor usage`);
 	}
 
+	// The collector keys each account hash with the ingest token. It is handed the token push would
+	// send without asking, so both agree on it whichever variable or file names it.
+	const saved = parseEnv(await readFile(ctx.paths.collectorEnvFile, 'utf8').catch(() => ''));
+	const keyedWith = (setting(ctx.env, 'INGEST_TOKEN') || setting(saved, 'INGEST_TOKEN')).trim();
 	const built = await runCollector(
 		ctx,
-		{ BIG_SPENDER_DEVICE_ID: deviceId, BIG_SPENDER_CURSOR_API_KEY: '' },
+		{
+			BIG_SPENDER_DEVICE_ID: deviceId,
+			BIG_SPENDER_CURSOR_API_KEY: '',
+			BIG_SPENDER_INGEST_TOKEN: keyedWith,
+			USAGE_INGEST_TOKEN: keyedWith
+		},
 		['--dry-run']
 	);
 	if (built.code !== 0) {
@@ -131,7 +140,6 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 		return 0;
 	}
 
-	const saved = parseEnv(await readFile(ctx.paths.collectorEnvFile, 'utf8').catch(() => ''));
 	const url =
 		values.url ??
 		(setting(ctx.env, 'INGEST_URL') ||
@@ -155,6 +163,14 @@ export async function push(args: string[], ctx: Context): Promise<number> {
 	// bug and must not silently drop the windows.
 	let sending = snapshot;
 	let sent = body;
+	// A token typed at the prompt is another server's, which could not match those hashes.
+	if (token !== keyedWith && sending.limits?.some((w) => 'account' in w)) {
+		ctx.err(
+			'warning: this token differs from the one that keyed the account hashes; sending limits without accounts'
+		);
+		sending = { ...sending, limits: sending.limits.map(({ account: _, ...w }) => w) };
+		sent = gzipSync(JSON.stringify(sending));
+	}
 	let result: string;
 	for (;;) {
 		try {

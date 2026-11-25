@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { createHmac } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
@@ -381,5 +382,131 @@ test('a server that keeps refusing accounts fails the push after one retry', asy
 			server.closeAllConnections();
 			await new Promise((resolve) => server.close(resolve));
 		}
+	});
+});
+
+// The collector keys each account hash with the ingest token it finds. push asks for its token
+// only after that run, so a different token there means hashes another server can't match.
+
+async function writeAntigravityLogin(box: Sandbox) {
+	const profile = join(
+		box.home,
+		'.t3',
+		'userdata',
+		'providers',
+		'antigravity',
+		'p1',
+		'antigravity-acp'
+	);
+	await mkdir(profile, { recursive: true });
+	const expiry = new Date(Date.now() + 3_600_000).toISOString();
+	await writeFile(
+		join(profile, 'antigravity-oauth-token'),
+		JSON.stringify({ token: { access_token: 'ag', expiry }, id_token_email: 'a@example.com' })
+	);
+}
+
+async function withQuotaAndIngest(
+	fn: (base: string, bodies: { limits?: object[] }[]) => Promise<void>
+) {
+	const resetTime = new Date(Date.now() + 3_600_000).toISOString();
+	const bodies: { limits?: object[] }[] = [];
+	const server = createServer(async (req, res) => {
+		res.setHeader('content-type', 'application/json');
+		if (req.url?.startsWith('/quota')) {
+			res.end(
+				JSON.stringify({
+					buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.5, resetTime }]
+				})
+			);
+			return;
+		}
+		const chunks: Buffer[] = [];
+		for await (const c of req) chunks.push(c as Buffer);
+		bodies.push(JSON.parse(gunzipSync(Buffer.concat(chunks)).toString()));
+		res.end('{"ok":true}');
+	});
+	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+	try {
+		await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, bodies);
+	} finally {
+		server.closeAllConnections();
+		await new Promise((resolve) => server.close(resolve));
+	}
+}
+
+test('a token typed at the prompt that differs from the env file sends the limits without accounts', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeLog(box, 'claude-test-model');
+		await writeAntigravityLogin(box);
+		const envFile = join(box.home, 'custom.env');
+		await writeFile(envFile, 'BIG_SPENDER_INGEST_TOKEN=token-in-env-file\n', { mode: 0o600 });
+		await withQuotaAndIngest(async (base, bodies) => {
+			const { ctx, err } = harness(box, {
+				answers: ['y', `${base}/ingest`, 'token-typed-at-prompt'],
+				env: {
+					BIG_SPENDER_ENV_FILE: envFile,
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${base}/quota`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${base}/quota`
+				}
+			});
+			assert.equal(await main(['push', 'laptop'], ctx), 0, err.join('\n'));
+			assert.equal(bodies.length, 1);
+			assert.equal(bodies[0].limits?.length, 1);
+			assert.deepEqual(
+				bodies[0].limits?.filter((w) => 'account' in w),
+				[]
+			);
+			assert.match(err.join('\n'), /warning: .*sending limits without accounts/);
+		});
+	});
+});
+
+test('push says when limits were not polled for want of an ingest token', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeLog(box, 'claude-test-model');
+		await writeAntigravityLogin(box);
+		await withQuotaAndIngest(async (base) => {
+			const { ctx, err } = harness(box, {
+				env: {
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${base}/quota`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${base}/quota`
+				}
+			});
+			assert.equal(await main(['push', 'laptop', '--dry-run'], ctx), 0, err.join('\n'));
+			assert.match(err.join('\n'), /limits not polled: BIG_SPENDER_INGEST_TOKEN is not set/);
+		});
+	});
+});
+
+test('the account hash is keyed with the very token push sends, whichever source names it', async () => {
+	await withSandbox(async (box) => {
+		await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
+		await writeClaudeLog(box, 'claude-test-model');
+		await writeAntigravityLogin(box);
+		const envFile = join(box.home, 'custom.env');
+		await writeFile(envFile, 'BIG_SPENDER_INGEST_TOKEN=token-in-env-file\n', { mode: 0o600 });
+		await withQuotaAndIngest(async (base, bodies) => {
+			const { ctx, err } = harness(box, {
+				answers: ['y', `${base}/ingest`],
+				env: {
+					BIG_SPENDER_ENV_FILE: envFile,
+					USAGE_INGEST_TOKEN: 'legacy-token-in-env',
+					BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${base}/quota`,
+					BIG_SPENDER_ANTIGRAVITY_USAGE_URL: `${base}/quota`
+				}
+			});
+			assert.equal(await main(['push', 'laptop'], ctx), 0, err.join('\n'));
+			const keyed = createHmac('sha256', 'legacy-token-in-env')
+				.update('antigravity-account\0a@example.com')
+				.digest('base64url')
+				.slice(0, 16);
+			assert.deepEqual(
+				bodies[0].limits?.map((w) => (w as { account?: string }).account),
+				[keyed]
+			);
+		});
 	});
 });

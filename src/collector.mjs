@@ -15,7 +15,7 @@
 // BIG_SPENDER_CURSOR_API_KEY and BIG_SPENDER_POLL_LIMITS=off (see templates/env.example).
 // The older USAGE_* names are still read when the new one is unset.
 
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
 	createReadStream,
@@ -930,8 +930,11 @@ const realPath = (path) => {
 /**
  * Every login of one provider, grouped by account: a login whose account is unknown is a group
  * of its own. A login listed twice (CLAUDE_CONFIG_DIR set to ~/.claude, say) is read once.
+ * The account id leaves the machine only as an HMAC keyed with the ingest token, which every
+ * collector of one server shares: a leaked data file can't be matched against known ids or
+ * emails without the token, nor against another tool's plain hash of the same id.
  */
-function loginsByAccount(provider, poller) {
+function loginsByAccount(provider, poller, accountKey) {
 	const groups = new Map();
 	const sources = new Set();
 	for (const { source, load } of poller.logins()) {
@@ -945,7 +948,12 @@ function loginsByAccount(provider, poller) {
 			login = { error: err };
 		}
 		if (!login) continue;
-		const account = login.account ? shortHash(`${provider}-account\0${login.account}`) : undefined;
+		const account = login.account
+			? createHmac('sha256', accountKey)
+					.update(`${provider}-account\0${login.account}`)
+					.digest('base64url')
+					.slice(0, 16)
+			: undefined;
 		const key = account ?? `login:${path}`;
 		groups.set(key, [...(groups.get(key) ?? []), { ...login, account }]);
 	}
@@ -960,8 +968,17 @@ async function pollLimits(state, nowMs) {
 	/** @type {{ window: string, resetsAtMs: number, account?: string, percent: number }[]} */
 	const polled = [];
 	if (['off', '0', 'false', 'no'].includes(setting('POLL_LIMITS').toLowerCase())) return polled;
+	// Without the key, a reading could only be stored under no account or an unkeyed hash, and
+	// either would later mix with the keyed records in state. So there is no poll.
+	const accountKey = setting('INGEST_TOKEN').trim();
+	if (!accountKey) {
+		log(
+			'warning: limits not polled: BIG_SPENDER_INGEST_TOKEN is not set, and it keys the account hash'
+		);
+		return polled;
+	}
 	for (const [provider, poller] of Object.entries(LIMIT_POLLERS)) {
-		const groups = loginsByAccount(provider, poller);
+		const groups = loginsByAccount(provider, poller, accountKey);
 		for (const logins of groups) {
 			const { account } = logins[0];
 			const label = groups.length > 1 && account ? ` (account ${account.slice(0, 6)})` : '';

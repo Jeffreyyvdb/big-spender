@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash, createHmac } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -53,11 +54,14 @@ const validClaude = (extra: Record<string, unknown> = {}) => ({
 	...extra
 });
 
+const INGEST_TOKEN = 'ingest-token-for-tests';
+
 async function collect(box: Sandbox, url: string, extra: Record<string, string> = {}) {
 	await seedPricing(join(box.env.XDG_CACHE_HOME, 'big-spender'));
 	const res = await run(COLLECTOR, ['--dry-run'], {
 		...box.env,
 		BIG_SPENDER_DEVICE_ID: 'laptop',
+		BIG_SPENDER_INGEST_TOKEN: INGEST_TOKEN,
 		BIG_SPENDER_CLAUDE_USAGE_URL: `${url}/claude`,
 		BIG_SPENDER_CODEX_USAGE_URL: `${url}/codex`,
 		BIG_SPENDER_ANTIGRAVITY_DAILY_URL: `${url}/agDaily`,
@@ -1514,6 +1518,46 @@ test("a logged refusal between two of one account's windows joins the nearer one
 				[ACCT, iso(weeklyResetsAt), 40, null],
 				[ACCT, iso(weeklyResetsAt + 3 * 60_000), 100, iso(NEXT_HOUR - 3 * HOUR)]
 			]);
+		});
+	});
+});
+
+// The account hash is keyed with the ingest token, so a leaked data file can't be matched
+// against known account ids or emails, nor against another tool's plain hash of the same id.
+
+const keyedHash = (token: string, id: string) =>
+	createHmac('sha256', token).update(id).digest('base64url').slice(0, 16);
+const plainHash = (id: string) => createHash('sha256').update(id).digest('base64url').slice(0, 16);
+
+test('the account hash is an HMAC of the account id keyed with the ingest token', async () => {
+	const accounts: (string | undefined)[][] = [];
+	for (const token of ['token-one', 'token-two']) {
+		await withSandbox(async (box) => {
+			await writeT3AntigravityLogin(box, agLogin());
+			await withUsageApi(async (api, _seen, url) => {
+				api.agDaily.body = { groups: [{ buckets: [agBucket('3p-5h', '5h', 0.5, NEXT_HOUR)] }] };
+				const res = await collect(box, url, { BIG_SPENDER_INGEST_TOKEN: token });
+				assert.equal(res.code, 0, res.stderr);
+				accounts.push(res.snap.limits.map((w: Win) => w.account));
+			});
+		});
+	}
+	const id = 'antigravity-account\0someone@example.com';
+	assert.deepEqual(accounts, [[keyedHash('token-one', id)], [keyedHash('token-two', id)]]);
+	assert.notEqual(accounts[0][0], plainHash(id));
+});
+
+test('without an ingest token no usage endpoint is asked and nothing is stored from a poll', async () => {
+	await withSandbox(async (box) => {
+		await writeClaudeLogin(box, validClaude());
+		await writeClaudeAccount(box.home, '.claude.json', 'account-a');
+		await withUsageApi(async (api, seen, url) => {
+			api.claude.body = claudeBody();
+			const res = await collect(box, url, { BIG_SPENDER_INGEST_TOKEN: '' });
+			assert.equal(res.code, 0, res.stderr);
+			assert.equal(seen.length, 0);
+			assert.deepEqual(res.snap.limits ?? [], []);
+			assert.match(res.stderr, /limits not polled: BIG_SPENDER_INGEST_TOKEN is not set/);
 		});
 	});
 });
