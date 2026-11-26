@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -699,7 +699,7 @@ const missedLockoutLogWithWeekly = () => [
 const missedLockoutBody = (extra: Record<string, unknown> = {}) => ({
 	rate_limit: {
 		primary_window: polledWindow(5, 18000, NEXT_HOUR + 3 * HOUR),
-		secondary_window: polledWindow(95, 604800, WEEKLY)
+		secondary_window: polledWindow(90, 604800, WEEKLY)
 	},
 	...extra
 });
@@ -717,7 +717,7 @@ test('a refusal is blamed on the one open window the poll did not read', async (
 			assert.deepEqual(hitsOf(res.snap).sort(), [
 				['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)],
 				['five_hour', iso(NEXT_HOUR + 3 * HOUR), 5, undefined],
-				['seven_day', iso(WEEKLY), 95, undefined]
+				['seven_day', iso(WEEKLY), 90, undefined]
 			]);
 		});
 	});
@@ -764,16 +764,57 @@ test('a refusal with two open windows the poll did not read is not attributed', 
 	});
 });
 
-test('a poll that reads the open window below 100% rules it out', async () => {
+// The poll reads the weekly too, so elimination runs; only readings below 95% rule a window out.
+for (const [fiveHour, weekly, blamed] of [
+	[40, 23, undefined],
+	[94, 23, undefined],
+	[95, 23, 'five_hour'],
+	[98, 96, undefined]
+] as const) {
+	test(`a poll that reads the open five_hour at ${fiveHour}% and the weekly at ${weekly}% blames ${blamed ?? 'neither'}`, async () => {
+		await withSandbox(async (box) => {
+			await writeCodexLogin(box, liveCodexToken());
+			await writeCodexLog(box, missedLockoutLog());
+			await withUsageApi(async (api, _seen, url) => {
+				api.codex.body = {
+					rate_limit: {
+						primary_window: polledWindow(fiveHour, 18000, OLD_FIVE_HOUR),
+						secondary_window: polledWindow(weekly, 604800, WEEKLY)
+					}
+				};
+				const res = await collect(box, url);
+				assert.equal(res.code, 0, res.stderr);
+				assert.deepEqual(hitsOf(res.snap).sort(), [
+					blamed
+						? ['five_hour', iso(OLD_FIVE_HOUR), 100, iso(REFUSED_AT)]
+						: ['five_hour', iso(OLD_FIVE_HOUR), fiveHour, undefined],
+					['seven_day', iso(WEEKLY), weekly, undefined]
+				]);
+			});
+		});
+	});
+}
+
+// Seen on 2026-11-25: Codex refused at 13:38 UTC, then the poll read the five_hour at 98% and
+// the weekly at 23%. Codex refuses before used_percent reaches 100.
+test('a refusal is blamed on the open window the poll reads at 98%', async () => {
 	await withSandbox(async (box) => {
 		await writeCodexLogin(box, liveCodexToken());
-		await writeCodexLog(box, missedLockoutLog());
+		const refusedAt = fiveHourResetsAt - 4 * HOUR;
+		await writeCodexLog(box, [sharingRefusal(refusedAt)]);
 		await withUsageApi(async (api, _seen, url) => {
 			api.codex.body = {
-				rate_limit: { primary_window: polledWindow(40, 18000, OLD_FIVE_HOUR) }
+				rate_limit: {
+					primary_window: polledWindow(98, 18000, fiveHourResetsAt),
+					secondary_window: polledWindow(23, 604800, WEEKLY)
+				}
 			};
 			const res = await collect(box, url);
-			assert.deepEqual(hitsOf(res.snap), [['five_hour', iso(OLD_FIVE_HOUR), 40, undefined]]);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(hitsOf(res.snap).sort(), [
+				['five_hour', iso(fiveHourResetsAt), 100, iso(refusedAt)],
+				['seven_day', iso(WEEKLY), 23, undefined]
+			]);
 		});
 	});
 });
@@ -1157,6 +1198,324 @@ test('an expired Antigravity login sends nothing and warns once', async () => {
 			assert.equal(res.code, 0, res.stderr);
 			assert.deepEqual(seen, []);
 			assert.match(res.stderr, /antigravity usage not polled: the login token expired/);
+		});
+	});
+});
+
+// Antigravity's server logs a refused request in glog format, in local time, with how long until
+// the quota resets. The collector runs these tests with TZ=Etc/GMT-1 (UTC+1, no DST).
+const AG_TZ = { TZ: 'Etc/GMT-1' };
+const AG_UTC_OFFSET = HOUR;
+const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+const agLocal = (ms: number) => new Date(ms + AG_UTC_OFFSET);
+const agLogTime = (ms: number) => {
+	const d = agLocal(ms);
+	return `${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.${pad(d.getUTCMilliseconds(), 3)}000`;
+};
+const AG_QUOTA =
+	'Individual quota reached. Please upgrade your subscription to increase your limits.';
+// `logTime` is the glog time after the level letter: `MMDD hh:mm:ss.micros`.
+const agRefusalLine = (logTime: string, resetsIn: string, prefix = 'agent executor error: ') =>
+	`E${logTime}     404 errorreport.go:282] ${prefix}generating and executing: transport error (ResourceExhausted, HTTP 429): ${AG_QUOTA} Resets in ${resetsIn}.: RESOURCE_EXHAUSTED (code 429): ${AG_QUOTA} Resets in ${resetsIn}.`;
+const agRefusalLines = (ms: number, resetsIn: string) => [
+	agRefusalLine(agLogTime(ms), resetsIn),
+	agRefusalLine(agLogTime(ms + 2), resetsIn, '')
+];
+
+const agProfileDir = (box: Sandbox, profile = 'p1') =>
+	join(box.home, '.t3', 'userdata', 'providers', 'antigravity', profile, 'antigravity-acp');
+const agStamp = (ms: number) => {
+	const d = agLocal(ms);
+	return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}_${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;
+};
+
+// Writes (or appends to) an Antigravity server log; returns its path.
+async function writeAgLog(dir: string, name: string, lines: string[], flag = 'w') {
+	await mkdir(dir, { recursive: true });
+	await writeFile(join(dir, name), lines.join('\n') + '\n', { flag });
+	return join(dir, name);
+}
+
+async function writeAgServerLog(box: Sandbox, startedMs: number, lines: string[], profile = 'p1') {
+	const startup = `I${agLogTime(startedMs)}     101 server_oauth.go:221] applyAuthResult: authMethod=consumer`;
+	return writeAgLog(
+		join(agProfileDir(box, profile), 'log'),
+		`acp-server-${agStamp(startedMs)}-2753018.log`,
+		[startup, ...lines]
+	);
+}
+
+// State from an earlier run that polled the window; polling is then off.
+async function seedAgWindow(box: Sandbox, window: string, resetsAtMs: number, peakPercent: number) {
+	const dir = join(box.env.XDG_CACHE_HOME, 'big-spender');
+	await mkdir(dir, { recursive: true });
+	await writeFile(
+		join(dir, 'state.json'),
+		JSON.stringify({
+			version: 1,
+			files: {},
+			seen: {},
+			buckets: {},
+			limits: {
+				[`antigravity|${window}|${resetsAtMs}`]: {
+					provider: 'antigravity',
+					window,
+					resetsAt: iso(resetsAtMs),
+					peakPercent
+				}
+			},
+			fixes: ['claude-final-output', 'usage-limits', 'codex-refusals']
+		})
+	);
+}
+
+const agHits = (snap: { limits?: Win[] }) =>
+	(snap.limits ?? [])
+		.filter((w) => w.provider === 'antigravity')
+		.map((w) => [w.window, w.resetsAt, w.peakPercent, w.hitAt])
+		.sort();
+
+// Seen on 2026-11-25: the poll read gemini-5h at 99.37% at 15:01:20 UTC, Antigravity refused at
+// 15:01:35 with "Resets in 1h24m24s", and the next poll could not run before the 16:26 reset.
+test('an Antigravity refusal in the server log starts the lockout at the refusal', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - (HOUR + 24 * 60_000 + 24_000) - 360;
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '1h24m24s'));
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-5h', '5h', 0.0063116, resetsAt),
+							agBucket('gemini-weekly', 'weekly', 0.34, NEXT_HOUR + 48 * HOUR)
+						]
+					}
+				]
+			};
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(
+				res.snap.limits
+					.filter((w: Win) => w.provider === 'antigravity')
+					.map((w: Win) => [w.window, w.resetsAt, w.peakPercent, w.hitAt])
+					.sort(),
+				[
+					['five_hour_gemini', iso(resetsAt), 100, iso(refusedAt)],
+					['seven_day_gemini', iso(NEXT_HOUR + 48 * HOUR), 66, undefined]
+				]
+			);
+		});
+	});
+});
+
+test('an Antigravity refusal whose reset matches no window on file records nothing', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - 2 * HOUR;
+		// Resets an hour away from the only polled window: not that window.
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '1h0m0s'));
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.4, resetsAt)] }] };
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(windows(res.snap, 'antigravity'), [
+				['five_hour_gemini', iso(resetsAt), 60, false]
+			]);
+		});
+	});
+});
+
+test('an Antigravity refusal goes to the window it falls in, not one with the same reset', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - 48 * HOUR;
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '2d0h0m0s'));
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-5h', '5h', 0.5, resetsAt),
+							agBucket('gemini-weekly', 'weekly', 0.01, resetsAt)
+						]
+					}
+				]
+			};
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(agHits(res.snap), [
+				['five_hour_gemini', iso(resetsAt), 50, undefined],
+				['seven_day_gemini', iso(resetsAt), 100, iso(refusedAt)]
+			]);
+		});
+	});
+});
+
+test("an Antigravity refusal in one Google account's log is not blamed on another's window", async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin(), 'p1');
+		const other = JSON.parse(agLogin({ expiry: iso(Date.now() - HOUR) }));
+		other.id_token_email = 'other@example.com';
+		await writeT3AntigravityLogin(box, JSON.stringify(other), 'p2');
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - HOUR;
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '1h0m0s'), 'p2');
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.6, resetsAt)] }] };
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(agHits(res.snap), [['five_hour_gemini', iso(resetsAt), 40, undefined]]);
+		});
+	});
+});
+
+test('an Antigravity refusal whose reset two windows share records nothing', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - HOUR;
+		await writeAgServerLog(box, refusedAt - 60_000, agRefusalLines(refusedAt, '1h0m0s'));
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = {
+				groups: [
+					{
+						buckets: [
+							agBucket('gemini-5h', '5h', 0.02, resetsAt),
+							agBucket('3p-5h', '5h', 0.5, resetsAt)
+						]
+					}
+				]
+			};
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(agHits(res.snap), [
+				['five_hour_3p', iso(resetsAt), 50, undefined],
+				['five_hour_gemini', iso(resetsAt), 98, undefined]
+			]);
+		});
+	});
+});
+
+test('an Antigravity refusal logged after the last poll counts while the login is expired', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - (HOUR + 24 * 60_000 + 24_000) - 360;
+		const log = await writeAgServerLog(box, refusedAt - 60 * 60_000, []);
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = {
+				groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.0063116, resetsAt)] }]
+			};
+			const first = await collect(box, url, AG_TZ);
+			assert.deepEqual(agHits(first.snap), [
+				['five_hour_gemini', iso(resetsAt), 99.3688, undefined]
+			]);
+
+			await writeT3AntigravityLogin(box, agLogin({ expiry: iso(Date.now() - 60_000) }));
+			await writeFile(log, agRefusalLines(refusedAt, '1h24m24s').join('\n') + '\n', {
+				flag: 'a'
+			});
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.match(res.stderr, /antigravity usage not polled/);
+			assert.deepEqual(agHits(res.snap), [
+				['five_hour_gemini', iso(resetsAt), 100, iso(refusedAt)]
+			]);
+		});
+	});
+});
+
+test('an Antigravity CLI refusal is blamed when one account is on file', async () => {
+	await withSandbox(async (box) => {
+		await writeT3AntigravityLogin(box, agLogin());
+		const resetsAt = NEXT_HOUR;
+		const refusedAt = resetsAt - HOUR;
+		await writeAgLog(
+			join(box.home, '.gemini', 'antigravity-cli', 'log'),
+			`cli-${agStamp(refusedAt - 60_000)}.log`,
+			agRefusalLines(refusedAt, '1h0m0s')
+		);
+		await withUsageApi(async (api, _seen, url) => {
+			api.agDaily.body = { groups: [{ buckets: [agBucket('gemini-5h', '5h', 0.03, resetsAt)] }] };
+			const res = await collect(box, url, AG_TZ);
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(agHits(res.snap), [
+				['five_hour_gemini', iso(resetsAt), 100, iso(refusedAt)]
+			]);
+		});
+	});
+});
+
+test('an Antigravity refusal on 1 January in a log started on 31 December is in the new year', async () => {
+	await withSandbox(async (box) => {
+		const year = new Date().getUTCFullYear();
+		// UTC+1: 00:30 local on 1 January is 23:30 UTC on 31 December.
+		const refusedAt = Date.UTC(year, 11, 31, 23, 30);
+		const resetsAt = Date.UTC(year + 1, 0, 1, 1, 0);
+		await seedAgWindow(box, 'five_hour_gemini', resetsAt, 98);
+		await writeAgLog(
+			join(box.home, '.gemini', 'antigravity-cli', 'log'),
+			`cli-${year}1231_230000.log`,
+			[agRefusalLine('0101 00:30:00.000000', '1h30m0s')]
+		);
+		await withUsageApi(async (_api, _seen, url) => {
+			const res = await collect(box, url, { ...AG_TZ, BIG_SPENDER_POLL_LIMITS: 'off' });
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(agHits(res.snap), [
+				['five_hour_gemini', iso(resetsAt), 100, iso(refusedAt)]
+			]);
+		});
+	});
+});
+
+test('an Antigravity refusal in the hour repeated when summer time ends is placed', async () => {
+	await withSandbox(async (box) => {
+		// Europe/Amsterdam goes from 03:00 CEST back to 02:00 CET at 01:00 UTC on the last Sunday
+		// of October, so 02:30 local happens at 00:30 and again at 01:30 UTC.
+		const year = new Date().getUTCFullYear() + 1;
+		const day = 31 - new Date(Date.UTC(year, 9, 31)).getUTCDay();
+		const refusedAt = Date.UTC(year, 9, day, 1, 30);
+		const resetsAt = Date.UTC(year, 9, day, 3, 0);
+		await seedAgWindow(box, 'five_hour_gemini', resetsAt, 98);
+		await writeAgLog(
+			join(box.home, '.gemini', 'antigravity-cli', 'log'),
+			`cli-${year}10${pad(day)}_020000.log`,
+			[agRefusalLine(`10${pad(day)} 02:30:00.000000`, '1h30m0s')]
+		);
+		await withUsageApi(async (_api, _seen, url) => {
+			const res = await collect(box, url, {
+				TZ: 'Europe/Amsterdam',
+				BIG_SPENDER_POLL_LIMITS: 'off'
+			});
+			assert.equal(res.code, 0, res.stderr);
+			assert.deepEqual(agHits(res.snap), [
+				['five_hour_gemini', iso(resetsAt), 100, iso(refusedAt)]
+			]);
+		});
+	});
+});
+
+test('Antigravity server logs reached through a linked ANTIGRAVITY_DATA_DIR are read once', async () => {
+	await withSandbox(async (box) => {
+		const root = join(box.home, '.gemini', 'antigravity');
+		await writeAgLog(join(root, 'log'), `cli-${agStamp(Date.now() - HOUR)}.log`, ['I1125 x']);
+		const linked = join(box.home, 'linked-ag');
+		await symlink(root, linked);
+		await withUsageApi(async (_api, _seen, url) => {
+			const res = await collect(box, url, {
+				...AG_TZ,
+				ANTIGRAVITY_DATA_DIR: linked,
+				BIG_SPENDER_POLL_LIMITS: 'off'
+			});
+			assert.equal(res.code, 0, res.stderr);
+			const state = JSON.parse(
+				await readFile(join(box.env.XDG_CACHE_HOME, 'big-spender', 'state.json'), 'utf8')
+			);
+			assert.equal(Object.keys(state.files).filter((f) => f.endsWith('.log')).length, 1);
 		});
 	});
 });
